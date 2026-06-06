@@ -1,0 +1,14 @@
+{
+  "name": "opencode-supervisor",
+  "version": "0.1.0",
+  "description": "OpenCode supervisor plugin — catches premature agent stops on session.idle and re-prompts the agent to finish. Tools: supervisor, set_supervisor, supervisor_train.",
+  "type": "module",
+  "main": "supervisor.ts",
+  "exports": { ".": "./supervisor.ts" },
+  "license": "MIT",
+  "author": "dzianisv",
+  "repository": { "type": "git", "url": "https://github.com/dzianisv/agents-supervisor" },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}

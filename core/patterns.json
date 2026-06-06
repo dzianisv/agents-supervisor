@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "meta": {
+    "dataset_size": 227,
+    "premature_pct": 78,
+    "source": "mined real agent stops where the user replied",
+    "note": "Shipped defaults. User-local overrides at .supervisor/patterns.json or ~/.config/agents-supervisor/patterns.json take precedence. /supervisor:train writes the user-local file ONLY — never this file."
+  },
+  "categories": [
+    {
+      "name": "complete",
+      "inject": false,
+      "description": "task is done; assistant delivered the answer or finished the requested work WITH evidence."
+    },
+    {
+      "name": "waiting_for_user_legitimate",
+      "inject": false,
+      "description": "assistant asks a question that ONLY the user can answer (OAuth/2FA/captcha/credential retrieval, or a genuine preference the user must supply)."
+    },
+    {
+      "name": "tool_available_punt",
+      "inject": true,
+      "description": "assistant punts to the user about something the available tools could resolve. The assistant has tools like Bash, WebFetch, browser MCP, etc., yet asks the user instead of trying."
+    },
+    {
+      "name": "summary_drift_stop",
+      "inject": true,
+      "description": "assistant wrote a summary/plan with a \"next step\" and STOPPED before doing it. e.g., \"I've created the file. Next step: run the tests.\" (without running them.)"
+    },
+    {
+      "name": "genuinely_stuck",
+      "inject": true,
+      "description": "assistant stopped mid-thought or without clear conclusion; no question, no summary, just halted. Often a short response."
+    },
+    {
+      "name": "working",
+      "inject": false,
+      "description": "rarely a stop; only assign if the final turn is clearly mid-action (e.g., \"Running tests now...\") with no closure."
+    }
+  ],
+  "antipatterns": [
+    {
+      "name": "permission_seeking",
+      "weight_pct": 40,
+      "maps_to": "tool_available_punt",
+      "rule": "PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — \"Want me to…?\", \"Would you like me to…?\", \"Should I…?\", \"Shall I proceed?\", or \"Try running it now\"/\"Please run X and confirm\" (deferring a check the agent could run itself). DECISIVE TEST: if the final turn is a yes/no or \"want me to X?\" question AND X is something the agent can do with its own tools AND X carries no irreversible risk → classify as tool_available_punt. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message) → classify as waiting_for_user_legitimate."
+    },
+    {
+      "name": "stopped_with_todos",
+      "weight_pct": 30,
+      "maps_to": "summary_drift_stop",
+      "rule": "STOPPED-WITH-TODOS (~30%): the response lists \"Remaining Tasks\"/\"Next steps\"/\"Still TODO\"/\"What I did NOT do\" or names a verify/run/check/create-PR step as \"next\" — then stops without doing it. Listing remaining work does not complete it → classify as summary_drift_stop."
+    },
+    {
+      "name": "false_complete",
+      "maps_to": "summary_drift_stop",
+      "rule": "FALSE-COMPLETE: claims \"done\"/\"complete\"/\"ready\"/\"all tasks complete\" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response on an action task is NEVER complete. For an \"add a <feature>\" task, writing files is not enough — code must be wired in AND verified (test/build/run); \"ready to use\" with no integration is incomplete → classify as summary_drift_stop (not complete)."
+    },
+    {
+      "name": "legitimate_stop",
+      "maps_to": "waiting_for_user_legitimate",
+      "rule": "LEGITIMATE STOP (do NOT flag as premature): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → waiting_for_user_legitimate. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → complete; do not invent missing work."
+    }
+  ],
+  "feedback": {
+    "max_inject_attempt": 3,
+    "inject_categories": ["summary_drift_stop", "tool_available_punt", "genuinely_stuck"],
+    "templates": {
+      "summary_drift_stop": {
+        "reasons": [
+          "summary_drift: plan written but not executed",
+          "summary_drift: second inject — still not executing",
+          "summary_drift: final inject before session close"
+        ],
+        "messages": [
+          "You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands.",
+          "Second time triggering this. You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands. Stop narrating. Start doing.",
+          "Third inject. You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands. If this approach is not working, try a different one. No more plans — next response must be a tool call or code. Session closes after this."
+        ]
+      },
+      "tool_available_punt": {
+        "reasons": [
+          "tool_available_punt: agent deferred to user instead of using tools",
+          "tool_available_punt: second inject — still deferring",
+          "tool_available_punt: final inject before session close"
+        ],
+        "messages": [
+          "You have these tools: {toolList}. Use them yourself instead of asking the user. If you can answer with a tool, answer. Do not ask the user before trying.",
+          "We did this once. You still have those tools: {toolList}. Use them now. Do not ask — act.",
+          "Third inject. Tools available: {toolList}. If this approach keeps failing, try a different tool or strategy. Otherwise the session will close. Make a tool call in your next response."
+        ]
+      },
+      "genuinely_stuck": {
+        "reasons": [
+          "genuinely_stuck: agent stopped without explicit blocker or action",
+          "genuinely_stuck: second inject — still no action or stated blocker",
+          "genuinely_stuck: final inject before session close"
+        ],
+        "messages": [
+          "You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence.",
+          "Second time. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If you are blocked, say exactly what is blocking you and what you already tried. If you are not blocked, make a tool call.",
+          "Third inject. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If this approach is not working, try a completely different strategy. Next response must be a tool call, code, or an explicit blocker statement. Session closes after this."
+        ]
+      }
+    }
+  }
+}

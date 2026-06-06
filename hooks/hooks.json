@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/on-stop.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

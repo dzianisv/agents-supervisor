@@ -1,0 +1,15 @@
+{
+  "name": "agents-supervisor",
+  "owner": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
+  "plugins": [
+    {
+      "name": "supervisor",
+      "source": ".",
+      "description": "Catches premature agent stops and re-prompts to finish. Dataset-backed Stop-hook supervisor with /supervisor:train and /supervisor:status.",
+      "version": "0.1.0",
+      "author": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
+      "category": "workflow",
+      "tags": ["agent", "supervisor", "reflection", "stop-hook", "autonomy"]
+    }
+  ]
+}

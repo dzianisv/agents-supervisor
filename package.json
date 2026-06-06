@@ -1,0 +1,18 @@
+{
+  "name": "agents-supervisor",
+  "version": "0.1.0",
+  "description": "Dataset-backed supervisor that catches premature agent stops and re-prompts the agent to finish — for Claude Code (Stop hook) and OpenCode (session.idle). Includes /supervisor:train to learn from your sessions.",
+  "type": "module",
+  "license": "MIT",
+  "author": "dzianisv",
+  "repository": { "type": "git", "url": "https://github.com/dzianisv/agents-supervisor" },
+  "scripts": {
+    "test": "node --test test/",
+    "test:cc": "node test/e2e-cc.mjs",
+    "eval": "node scripts/run-promptfoo.mjs || promptfoo eval -c evals/promptfooconfig.yaml",
+    "train": "node train/run-train.mjs"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^0.5.0"
+  }
+}
