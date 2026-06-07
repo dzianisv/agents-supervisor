@@ -7,9 +7,9 @@
   "author": "dzianisv",
   "repository": { "type": "git", "url": "https://github.com/dzianisv/agents-supervisor" },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test test/*.test.mjs",
     "test:cc": "node test/e2e-cc.mjs",
-    "eval": "node scripts/run-promptfoo.mjs || promptfoo eval -c evals/promptfooconfig.yaml",
+    "eval": "node evals/judge-eval.mjs",
     "train": "node train/run-train.mjs"
   },
   "devDependencies": {

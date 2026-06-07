@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Unit tests (core + hook + train derivation)
+        run: node --test test/*.test.mjs
+      - name: Claude Code hook e2e (fake judge, no creds)
+        run: node test/e2e-cc.mjs
+      - name: Judge eval (skips without ANTHROPIC creds)
+        run: node evals/judge-eval.mjs
+      - name: OpenCode plugin syntax check
+        run: node --experimental-strip-types --check opencode/supervisor.ts
+      - name: Privacy guard — no mined data committed
+        run: |
+          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v '\.example\.jsonl$'; then
+            echo "ERROR: private data tracked in git"; exit 1
+          fi
+          echo "OK: no private data tracked"
