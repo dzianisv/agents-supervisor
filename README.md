@@ -17,6 +17,44 @@ The classification taxonomy (6 categories + mined anti-patterns) and its feedbac
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
 so both runtimes — and the trainer — share one brain.
 
+## Quickstart (1 minute)
+
+### Claude Code
+```
+/plugin marketplace add dzianisv/agents-supervisor
+/plugin install supervisor
+```
+Done — the `Stop` hook is active immediately. Then:
+- `/supervisor:status` — show effective patterns + recent verdicts
+- `/supervisor:train` — learn from your sessions (updates your local patterns)
+
+**Switch off / on:**
+```
+# whole plugin (all sessions)
+claude plugin disable supervisor@agents-supervisor
+claude plugin enable  supervisor@agents-supervisor
+
+# this session only
+echo "$(cat .supervisor/current_session)" >> .supervisor/disabled          # off
+grep -v "$(cat .supervisor/current_session)" .supervisor/disabled > .supervisor/disabled.tmp && mv .supervisor/disabled.tmp .supervisor/disabled   # on
+```
+(Local dev install: `/plugin marketplace add /path/to/agents-supervisor` instead of the GitHub slug.)
+
+### OpenCode
+Add to `opencode.json`:
+```json
+{ "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
+```
+or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
+- `/supervisor` — status · `/supervisor:train` — learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
+
+**Switch off / on:**
+```
+/supervisor off     # disable for this session
+/supervisor on      # re-enable
+```
+Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
+
 ## How it decides
 
 A judge LLM classifies each stop into one of:
@@ -26,29 +64,6 @@ continuation nudge (escalating over up to 3 attempts); the rest are left alone.
 The anti-pattern rules that sharpen these (permission-seeking, stopped-with-todos,
 false-complete, legitimate-stop) were mined from real agent stops where the user
 had to reply.
-
-## Install — Claude Code
-
-```
-/plugin marketplace add dzianisv/agents-supervisor
-/plugin install supervisor
-```
-
-The `Stop` hook activates automatically. Disable for one session:
-```
-echo "$(cat .supervisor/current_session)" >> .supervisor/disabled
-```
-
-## Install — OpenCode
-
-Add the plugin to your `opencode.json`:
-```json
-{ "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
-```
-or drop `opencode/supervisor.ts` into `~/.config/opencode/plugins/`. The
-`/supervisor` and `/supervisor:train` commands work in the TUI; in the web app use
-the `supervisor` / `supervisor_train` tools (file-based slash commands don't expand
-in the OpenCode web app).
 
 ## `/supervisor:train` — learn from your sessions
 
