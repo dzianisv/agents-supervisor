@@ -94,6 +94,10 @@ export function buildPrompt(ctx, patterns) {
   const names = cats.map((c) => c.name);
   const catLines = cats.map((c) => `- ${c.name}: ${c.description}`).join('\n');
   const antipatternBlock = (patterns?.antipatterns ?? []).map((a) => `- ${a.rule}`).join('\n\n');
+  const evidenceRules = patterns?.evidence_rules ?? [];
+  const evidenceBlock = evidenceRules.length
+    ? `\nEVIDENCE RULES (avoid over-demanding proof):\n${evidenceRules.map((r) => `- ${r}`).join('\n')}\n`
+    : '';
   const meta = patterns?.meta ?? {};
 
   const userMsgs = (ctx.user_messages ?? [])
@@ -122,7 +126,7 @@ ${finalText}
 ${provenance}
 
 ${antipatternBlock}
-
+${evidenceBlock}
 Respond ONLY with a JSON object on a single line, no markdown fence, no prose:
 {"category": "<one of: ${names.join(' | ')}>", "reason": "<one short sentence citing the specific antipattern or evidence>", "confidence": <0.0-1.0>}`;
 }

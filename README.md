@@ -11,7 +11,7 @@ Works on two runtimes from one shared core:
 | Runtime | Mechanism | Surface |
 |---|---|---|
 | **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status` |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train` + `/supervisor` commands |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry` + `/supervisor`, `/supervisor:train`, `/supervisor:goal`, `/supervisor:retry` |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -54,6 +54,28 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
 /supervisor on      # re-enable
 ```
 Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
+
+## Supervisor mode — goal loop (OpenCode)
+
+Beyond catching premature stops, the OpenCode side can be pointed at a **goal** it
+must demonstrably meet before it lets the agent stop — it keeps re-prompting (up to
+a retry budget) until the goal's met or the budget runs out.
+
+```
+/supervisor:goal all tests in test/auth pass and the PR is open with green CI
+/supervisor:goal              # check status (condition, attempts, last reason)
+/supervisor:goal clear        # clear (aliases: stop, off, reset, none, cancel)
+/supervisor:retry 24          # set this session's retry budget (1–100, default 16)
+```
+The goal is injected as a **mandatory completion requirement** on top of the normal
+rubric; the judge only reports complete when the applicable gates pass **and** the
+goal is met. State is per-session at `.supervisor/goals/<sessionId>.json` (mode 0600);
+budget is only spent when a continuation actually fires. (Web app: call the
+`supervisor_goal` / `supervisor_retry` tools.)
+
+**Configurable rubric:** drop a `.supervisor/rubric.md` (or `~/.config/opencode/supervisor/rubric.md`)
+with `## Patterns` / `## Antipatterns` sections to override the judge's rubric; otherwise
+the shipped default is used.
 
 ## How it decides
 

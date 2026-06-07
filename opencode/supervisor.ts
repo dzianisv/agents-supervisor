@@ -7,7 +7,7 @@
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { readFile, writeFile, mkdir, stat, appendFile } from "fs/promises"
+import { readFile, writeFile, mkdir, stat, appendFile, readdir, chmod } from "fs/promises"
 import { join, dirname } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "url"
@@ -24,7 +24,329 @@ async function reportError(err: unknown, context?: Record<string, string>): Prom
 
 const SELF_ASSESSMENT_MARKER = "## Supervisor Self-Assessment"
 const FEEDBACK_MARKER = "## Supervisor:"
-const MAX_ATTEMPTS = 3
+const DEFAULT_MAX_ATTEMPTS = 16
+const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000
+
+/**
+ * Pure function: resolve the effective max attempts from opts (no I/O).
+ * Priority: sessionOverride > config > DEFAULT_MAX_ATTEMPTS (16).
+ * Result is clamped to [1, 100]. Non-finite values (NaN, Infinity) are ignored.
+ */
+export function resolveMaxAttempts(opts: { sessionOverride?: number; config?: number }): number {
+  const candidates = [opts.sessionOverride, opts.config, DEFAULT_MAX_ATTEMPTS]
+  for (const candidate of candidates) {
+    if (candidate !== undefined && Number.isFinite(candidate)) {
+      return Math.min(100, Math.max(1, Math.floor(candidate)))
+    }
+  }
+  return DEFAULT_MAX_ATTEMPTS
+}
+
+/**
+ * Read the top-level `maxAttempts:` integer from ~/.config/opencode/supervisor.yaml.
+ * Returns undefined if the file is missing, the key is absent, or the value is invalid.
+ */
+async function loadConfiguredMaxAttempts(): Promise<number | undefined> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith("#")) continue
+      const match = line.match(/^maxAttempts\s*:\s*(\S+)/)
+      if (match) {
+        const raw = match[1].trim()
+        if (/^\d+$/.test(raw)) {
+          const value = parseInt(raw, 10)
+          if (Number.isFinite(value)) return value
+        }
+      }
+    }
+  } catch {}
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor per-session persistence (supervisorStore)
+//
+// Stores goal + retry state at <directory>/.supervisor/goals/<sessionId>.json
+// so supervisor decisions survive across tool invocations within a session.
+// ---------------------------------------------------------------------------
+
+export interface SupervisorGoal {
+  condition: string
+  status: "active" | "paused" | "achieved" | "cleared" | "exhausted"
+  attempts: number
+  tokenBaseline: number
+  startedAt: number
+  deadline: number
+  lastReason: string
+}
+
+export interface SupervisorState {
+  maxAttempts?: number       // /supervisor:retry override (optional)
+  goal?: SupervisorGoal
+}
+
+function supervisorDir(directory: string): string {
+  return join(directory, ".supervisor", "supervisor")
+}
+
+/** Guard against path-traversal attacks via a malformed sessionId. */
+function assertSafeSessionId(sessionId: string): void {
+  if (!sessionId || sessionId.includes("/") || sessionId.includes("\\") || sessionId.includes("..")) {
+    throw new Error(`Invalid sessionId: ${JSON.stringify(sessionId)}`)
+  }
+}
+
+function supervisorPath(directory: string, sessionId: string): string {
+  return join(supervisorDir(directory), `${sessionId}.json`)
+}
+
+export const supervisorStore = {
+  async load(directory: string, sessionId: string): Promise<SupervisorState> {
+    try {
+      const content = await readFile(supervisorPath(directory, sessionId), "utf-8")
+      return JSON.parse(content) as SupervisorState
+    } catch {
+      return {}
+    }
+  },
+
+  async save(directory: string, sessionId: string, state: SupervisorState): Promise<void> {
+    assertSafeSessionId(sessionId)
+    const dir = supervisorDir(directory)
+    await mkdir(dir, { recursive: true })
+    const filePath = supervisorPath(directory, sessionId)
+    await writeFile(filePath, JSON.stringify(state, null, 2), { mode: 0o600 })
+    await chmod(filePath, 0o600)
+  },
+
+  async setGoal(
+    directory: string,
+    sessionId: string,
+    condition: string,
+    opts?: { tokenBaseline?: number; now?: number; maxDurationMs?: number }
+  ): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    const now = opts?.now ?? Date.now()
+    const maxDurationMs = opts?.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS
+    state.goal = {
+      condition,
+      status: "active",
+      attempts: 0,
+      tokenBaseline: opts?.tokenBaseline ?? 0,
+      startedAt: now,
+      deadline: now + maxDurationMs,
+      lastReason: "",
+    }
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async clearGoal(directory: string, sessionId: string): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    delete state.goal
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setRetry(directory: string, sessionId: string, n: number): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.maxAttempts = n
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async list(directory: string): Promise<string[]> {
+    try {
+      const dir = supervisorDir(directory)
+      const entries = await readdir(dir, { withFileTypes: true })
+      // Build result in a local array to ensure consistent realm in ESM environments
+      const ids: string[] = []
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith(".json")) ids.push(e.name.slice(0, -".json".length))
+      }
+      return ids
+    } catch {
+      return []
+    }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// parseSupervisorCommand — pure parser for /supervisor:* command names
+//
+// Maps a command name + its argument string to a discriminated action.
+// No I/O. Safe to call from any context.
+// ---------------------------------------------------------------------------
+
+export type SupervisorCommand =
+  | { kind: "goal-set"; condition: string }
+  | { kind: "goal-status" }
+  | { kind: "goal-clear" }
+  | { kind: "retry-set"; n: number }
+  | { kind: "retry-status" }
+  | { kind: "unknown"; name: string }
+
+const GOAL_CLEAR_ALIASES = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
+
+/**
+ * Parse a supervisor slash-command into a typed action.
+ *
+ * @param name - command name, e.g. "goal" or "retry"
+ * @param args - raw argument string (may have leading/trailing whitespace)
+ */
+export function parseSupervisorCommand(name: string, args: string): SupervisorCommand {
+  const trimmed = args.trim()
+
+  if (name === "goal") {
+    if (trimmed === "") return { kind: "goal-status" }
+    if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: "goal-clear" }
+    return { kind: "goal-set", condition: trimmed.slice(0, 4000) }
+  }
+
+  if (name === "retry") {
+    if (trimmed === "") return { kind: "retry-status" }
+    if (/^\d+$/.test(trimmed)) return { kind: "retry-set", n: parseInt(trimmed, 10) }
+    return { kind: "retry-status" }
+  }
+
+  return { kind: "unknown", name }
+}
+
+// ---------------------------------------------------------------------------
+// buildGoalRequirementSection — prompt fragment for active session goals
+//
+// Appended to the judge/self-assessment rubric when a goal is active. Pure,
+// no I/O. Returns an empty string for blank conditions (caller should skip
+// appending in that case).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a prompt fragment that tells the evaluator a user-set goal condition
+ * is a MANDATORY completion requirement, additional to the existing workflow
+ * gates. A claim that the condition is met must be backed by transcript
+ * evidence (commands + output / tests actually run).
+ *
+ * @param condition - the goal condition string (will be trimmed)
+ * @returns a labeled prompt block, or "" if condition is blank
+ */
+export function buildGoalRequirementSection(condition: string): string {
+  const trimmed = condition.trim()
+  if (!trimmed) return ""
+  return `## GOAL (mandatory completion requirement)
+
+MANDATORY: The following user-set goal condition MUST be demonstrably met before the task can be considered complete:
+
+  "${trimmed}"
+
+This is an ADDITIONAL requirement on top of the existing workflow gates (tests, build, PR, CI checks) — it does not replace them. The task is NOT complete until this condition is satisfied AND all normal completion criteria are met.
+
+Evidence rule: a claim that this goal condition is met must be backed by evidence already surfaced in the transcript — commands run and their output, tests actually executed, artefacts produced. A bare assertion that the condition is satisfied does NOT count as evidence.`
+}
+
+// ---------------------------------------------------------------------------
+// decideGoalTransition — pure decision for an active session goal
+//
+// Given the current goal, the judge's verdict, and the budget, decide the next
+// goal state. No I/O; returns a NEW goal object (never mutates the input).
+// Applied in strict order: budget exhaustion FIRST (attempts cap or deadline),
+// then achievement, then continuation (which increments attempts).
+// ---------------------------------------------------------------------------
+
+export type GoalTransition =
+  | { action: "exhausted"; goal: SupervisorGoal }
+  | { action: "achieved"; goal: SupervisorGoal }
+  | { action: "continue"; goal: SupervisorGoal }
+
+export function decideGoalTransition(params: {
+  goal: SupervisorGoal
+  complete: boolean
+  now: number
+  maxAttempts: number
+  reason?: string
+}): GoalTransition {
+  const { goal, complete, now, maxAttempts, reason } = params
+  const lastReason = reason ?? goal.lastReason
+  if (goal.attempts >= maxAttempts || now >= goal.deadline) {
+    return { action: "exhausted", goal: { ...goal, status: "exhausted", lastReason } }
+  }
+  if (complete) {
+    return { action: "achieved", goal: { ...goal, status: "achieved", lastReason } }
+  }
+  return { action: "continue", goal: { ...goal, status: "active", attempts: goal.attempts + 1, lastReason } }
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor rubric (configurable patterns/antipatterns)
+//
+// The judge's positive completion rules ("Patterns") and the mined
+// premature-stop rules ("Antipatterns") were historically hardcoded inline in
+// two prompt builders. They now live in this single embedded default, which
+// users can override with a rubric.md file (see loadRubric). The embedded
+// default keeps the single-file `cp supervisor-3.ts` install working.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_RUBRIC = `## Patterns
+- If coding work is complete, confirm tests ran after the latest changes and passed.
+- If local tests are required, provide the exact commands run in this session.
+- If PR exists, verify CI checks and report status.
+- Tests cannot be skipped or marked as flaky/not important.
+- Direct pushes to main/master are not allowed; require a PR instead.
+- If stuck, propose an alternate approach.
+- If you need user action (auth, 2FA, credentials, access requests, uploads, approvals), list it in needs_user_action.
+- PLANNING LOOP CHECK: If the task requires code changes (fix, implement, add, create, build, refactor, update) but the tool commands show ONLY read operations (read, glob, grep, git log, git status, git diff, webfetch, task/explore) and NO write operations (edit, write, bash with build/test/commit, github_create_pull_request, etc.), then the task is NOT complete. Set status to "in_progress", set stuck to true, and list "Implement the actual code changes" in remaining_work. Analyzing and recommending changes is not the same as making them.
+- If you are repeating the same actions (deploy, test, build) without making progress, set "stuck": true.
+- Do not retry the same failing approach more than twice — try something different or report stuck.
+
+## Antipatterns
+PREMATURE-STOP ANTIPATTERNS (mined from 227 real agent stops where the user replied; 78% were premature — the user said "go"/"continue"/"yes do it" or corrected the agent). If the agent's last response matches one of these AND executable work remains, the task is NOT complete — set status "in_progress", and put the concrete next action in remaining_work and next_steps:
+- PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — "Want me to…?", "Would you like me to…?", "Should I…?", "Shall I proceed?", or "Try running it now"/"Please run X and confirm" (deferring a check it could run itself). DECISIVE TEST: if the final turn is a yes/no or "want me to X?" question AND X is something the agent can do with its own tools AND X carries no irreversible risk, the stop is premature — it should have just done X. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message).
+- STOPPED-WITH-TODOS (~30%): the response lists "Remaining Tasks"/"Next steps"/"Still TODO"/"What I did NOT do" or names a verify/run/check/create-PR step as "next" — then stops without doing it. Listing remaining work does not complete it; a self-contained named step must be DONE before stopping. Set status "in_progress" with that work in remaining_work.
+- FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a <feature/system>" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
+- LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → status "complete"; do not invent missing work.
+- SEVERITY/STUCK: a single recoverable technical snag mid-task (knows the fix) is not "stuck". But a policy/process violation — pushing to main when a PR was required, skipping mandated tests — is a real failure: status "in_progress" with the corrective action in remaining_work, never "complete".`
+
+export interface Rubric {
+  patterns: string
+  antipatterns: string
+}
+
+/** Split a rubric markdown doc into its `## Patterns` and `## Antipatterns` sections. */
+export function parseRubric(md: string): Rubric {
+  const section = (name: string): string => {
+    const re = new RegExp(`##\\s+${name}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, "i")
+    return (md.match(re)?.[1] ?? "").trim()
+  }
+  return { patterns: section("Patterns"), antipatterns: section("Antipatterns") }
+}
+
+/**
+ * Load the active rubric for a project. Precedence (first complete one wins):
+ *   1. project: <directory>/.supervisor/rubric.md      → source "project"
+ *   2. global:  ~/.config/opencode/supervisor/rubric.md → source "global"
+ *   3. embedded DEFAULT_RUBRIC                           → source "default"
+ * An override missing either section falls through to the next source, so the
+ * judge never runs with an empty rubric.
+ */
+export async function loadRubric(
+  directory: string
+): Promise<Rubric & { source: "project" | "global" | "default" }> {
+  const candidates: Array<{ path: string; source: "project" | "global" }> = [
+    { path: join(directory, ".supervisor", "rubric.md"), source: "project" },
+    { path: join(homedir(), ".config", "opencode", "supervisor", "rubric.md"), source: "global" },
+  ]
+  for (const { path, source } of candidates) {
+    try {
+      const md = await readFile(path, "utf-8")
+      const r = parseRubric(md)
+      if (r.patterns && r.antipatterns) return { ...r, source }
+    } catch {
+      /* not present / unreadable — try next */
+    }
+  }
+  return { ...parseRubric(DEFAULT_RUBRIC), source: "default" }
+}
 
 const JUDGE_BLOCKED_PATTERNS = [
   /\bhaiku\b/i,
@@ -380,12 +702,14 @@ export function buildEscalatingFeedback(
   severity: string,
   verdict: { feedback?: string; missing?: string[]; next_actions?: string[] } | undefined | null,
   isPlanningLoop: boolean,
-  isActionLoop?: boolean
+  isActionLoop?: boolean,
+  maxAttempts?: number
 ): string {
   const safeVerdict = verdict ?? {}
   const missingItems = Array.isArray(safeVerdict.missing) ? safeVerdict.missing : []
   const nextActionItems = Array.isArray(safeVerdict.next_actions) ? safeVerdict.next_actions : []
   const feedbackStr = safeVerdict.feedback || ""
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   if (isPlanningLoop) {
     return `${FEEDBACK_MARKER} STOP: Planning Loop Detected
 
@@ -404,7 +728,7 @@ Start coding NOW. No more planning.`
   }
 
   if (isActionLoop) {
-    return `${FEEDBACK_MARKER} STOP: Action Loop Detected (attempt ${attemptCount}/${MAX_ATTEMPTS})
+    return `${FEEDBACK_MARKER} STOP: Action Loop Detected (attempt ${attemptCount}/${effectiveCap})
 
 You are repeating the same commands without making progress. Running the same deploy/test/build cycle again will produce the same result.
 
@@ -416,7 +740,7 @@ STOP and do ONE of these:
 Do NOT re-run the same command hoping for a different result.`
   }
 
-  if (attemptCount <= 2) {
+  if (attemptCount < effectiveCap - 1) {
     const missing = missingItems.length
       ? `\n### Missing\n${missingItems.map((m) => `- ${m}`).join("\n")}`
       : ""
@@ -434,7 +758,7 @@ Please address these issues and continue.`
   const missingBrief = missingItems.length
     ? `Still missing: ${missingItems.slice(0, 3).join(", ")}.`
     : ""
-  return `${FEEDBACK_MARKER} Final Attempt (${attemptCount}/${MAX_ATTEMPTS})
+  return `${FEEDBACK_MARKER} Final Attempt (${attemptCount}/${effectiveCap})
 
 ${missingBrief}
 
@@ -1052,11 +1376,13 @@ function extractLastAssistantText(messages: any[]): string {
   return ""
 }
 
-function buildSelfAssessmentPrompt(
+export function buildSelfAssessmentPrompt(
   context: TaskContext,
   agents: string,
   lastAssistantText?: string,
-  attemptCount?: number
+  attemptCount?: number,
+  rubric?: Rubric,
+  maxAttempts?: number
 ): string {
   const safeContext = {
     ...context,
@@ -1077,9 +1403,11 @@ function buildSelfAssessmentPrompt(
     ? `\n## Agent's Last Response\n${lastAssistantText.slice(0, 4000)}\n`
     : ""
 
+  const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const currentAttempt = attemptCount || 0
   const attemptSection = currentAttempt > 0
-    ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${MAX_ATTEMPTS} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
+    ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
     : ""
   return `SELF-ASSESS SUPERVISOR
 
@@ -1128,23 +1456,9 @@ ${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ""}Return JS
 }
 
 Rules:
-- If coding work is complete, confirm tests ran after the latest changes and passed.
-- If local tests are required, provide the exact commands run in this session.
-- If PR exists, verify CI checks and report status.
-- Tests cannot be skipped or marked as flaky/not important.
-- Direct pushes to main/master are not allowed; require a PR instead.
-- If stuck, propose an alternate approach.
-- If you need user action (auth, 2FA, credentials, access requests, uploads, approvals), list it in needs_user_action.
-- PLANNING LOOP CHECK: If the task requires code changes (fix, implement, add, create, build, refactor, update) but the "Tool Commands Run" section shows ONLY read operations (read, glob, grep, git log, git status, git diff, webfetch, task/explore) and NO write operations (edit, write, bash with build/test/commit, github_create_pull_request, etc.), then the task is NOT complete. Set status to "in_progress", set stuck to true, and list "Implement the actual code changes" in remaining_work. Analyzing and recommending changes is not the same as making them.
-- If you are repeating the same actions (deploy, test, build) without making progress, set "stuck": true.
-- Do not retry the same failing approach more than twice — try something different or report stuck.
+${rb.patterns}
 
-PREMATURE-STOP ANTIPATTERNS (mined from 227 real agent stops where the user replied; 78% were premature — the user said "go"/"continue"/"yes do it" or corrected the agent). If the agent's last response matches one of these AND executable work remains, the task is NOT complete — set status "in_progress", and put the concrete next action in remaining_work and next_steps:
-- PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — "Want me to…?", "Would you like me to…?", "Should I…?", "Shall I proceed?", or "Try running it now"/"Please run X and confirm" (deferring a check it could run itself). DECISIVE TEST: if the final turn is a yes/no or "want me to X?" question AND X is something the agent can do with its own tools AND X carries no irreversible risk, the stop is premature — it should have just done X. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message).
-- STOPPED-WITH-TODOS (~30%): the response lists "Remaining Tasks"/"Next steps"/"Still TODO"/"What I did NOT do" or names a verify/run/check/create-PR step as "next" — then stops without doing it. Listing remaining work does not complete it; a self-contained named step must be DONE before stopping. Set status "in_progress" with that work in remaining_work.
-- FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a <feature/system>" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
-- LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → status "complete"; do not invent missing work.
-- SEVERITY/STUCK: a single recoverable technical snag mid-task (knows the fix) is not "stuck". But a policy/process violation — pushing to main when a PR was required, skipping mandated tests — is a real failure: status "in_progress" with the corrective action in remaining_work, never "complete".`
+${rb.antipatterns}`
 }
 
 function parseSelfAssessmentJson(text: string | null | undefined): SelfAssessment | null {
@@ -1349,23 +1663,14 @@ function evaluateSelfAssessment(assessment: SelfAssessment, context: TaskContext
   }
 }
 
-async function analyzeSelfAssessmentWithLLM(
-  client: any,
-  directory: string,
+export function buildJudgePrompt(
   context: TaskContext,
   selfAssessment: string,
-  judgeSessionIds: Set<string>,
-  toolSupervisorPrompt?: string | null
-): Promise<SupervisorAnalysis | null> {
-  const modelList = await loadSupervisorModelList()
-  const preferredModel = await loadPreferredModelSpec(directory)
-  const attempts = modelList.length
-    ? modelList
-    : preferredModel && !isBlockedJudgeModel(preferredModel)
-      ? [preferredModel]
-      : [""]
-
-  const prompt = `ANALYZE SUPERVISOR
+  toolSupervisorPrompt?: string | null,
+  rubric?: Rubric
+): string {
+  const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
+  return `ANALYZE SUPERVISOR
 
 You are validating an agent's self-assessment against workflow requirements.
 
@@ -1390,21 +1695,9 @@ ${selfAssessment.slice(0, 4000)}
 ${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
 
 Rules:
-- If tests are required, agent must confirm tests ran AFTER latest changes and passed.
-- If local test commands are required, agent must list the exact commands run in this session.
-- If tests were skipped/flaky/not important, task is incomplete.
-- Direct pushes to main/master are not allowed; require PR instead.
-- If PR required, agent must provide PR link.
-- If PR exists, CI checks must be verified and passing.
-- If user action is required (auth/2FA/credentials), set requires_human_action true.
-- If agent is stuck, require alternate approach and continued work.
-- PLANNING LOOP: If the task requires code changes (fix, implement, add, create, build, refactor) but the Tool Signals show ONLY read operations (read, glob, grep, git log/status/diff, webfetch) and NO write operations (edit, write, bash with build/test/commit, PR creation), set complete to false and add "Implement actual code changes" to missing. Analysis alone does not fulfill an implementation task.
-- PREMATURE-STOP ANTIPATTERNS (78% of real agent stops were premature). Set complete false, requires_human_action false, and put the concrete work in next_actions when the agent's response matches:
-  - PERMISSION-SEEKING: ends asking to do work it can already do ("Want me to…?", "Should I…?", "Try running it now", "Please run X and confirm"). DECISIVE TEST: final-turn yes/no question about something the agent can do with its own tools and no irreversible risk = premature; it should have done it. Includes "finished step N, asking which sub-task to do next" when the task named the work. Asking is legitimate only before destructive/irreversible actions, or when the task explicitly scoped the deliverable to just the part already done.
-  - STOPPED-WITH-TODOS: lists "Remaining Tasks"/"Next steps"/"What I did NOT do" or names a verify/run/check step as next, then stops. Listing ≠ doing.
-  - FALSE-COMPLETE: claims done/ready/"all tasks complete" but the core action never happened, a required check was skipped, or no evidence. Empty/no-tool response on an action task is never complete. For an "add a <feature/system>" task, written files alone are not enough — code must be wired in (imported/registered/routed) AND verified; "ready to use" with no integration is incomplete.
-- LEGITIMATE STOP (do NOT penalize): genuine human-only block (OAuth consent, 2FA, credential/API-key retrieval, captcha) → complete false, requires_human_action true. Genuine completion WITH evidence → complete true; do not invent missing work.
-- SEVERITY: a single recoverable technical snag mid-task is LOW/MEDIUM; a repeated retry loop, broken functionality, or red CI is HIGH; a policy/process violation (push to main when a PR was required, skipping mandated tests) is HIGH; a confirmed security/auth/data-loss/prod defect is BLOCKER.
+${rb.patterns}
+
+${rb.antipatterns}
 
 Return JSON only:
 {
@@ -1415,6 +1708,26 @@ Return JSON only:
   "next_actions": ["actions to take"],
   "requires_human_action": true/false
 }`
+}
+
+async function analyzeSelfAssessmentWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  selfAssessment: string,
+  judgeSessionIds: Set<string>,
+  toolSupervisorPrompt?: string | null,
+  rubric?: Rubric
+): Promise<SupervisorAnalysis | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const attempts = modelList.length
+    ? modelList
+    : preferredModel && !isBlockedJudgeModel(preferredModel)
+      ? [preferredModel]
+      : [""]
+
+  const prompt = buildJudgePrompt(context, selfAssessment, toolSupervisorPrompt, rubric)
 
   for (const modelSpec of attempts) {
     let judgeSession: any
@@ -1624,9 +1937,8 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
-  // update USER-LOCAL patterns). Web-app portable (works in TUI, web, and serve,
-  // unlike file-based slash commands which the OpenCode web app does not expand).
-  const supervisorTrainDescription = "Train the supervisor on recent sessions: mine how the agent stopped and how the user followed up, then update the user-local patterns/anti-patterns. Never commits to git; dataset stays private. Args: since (e.g. '14d'), dryRun (preview the pattern diff without writing), pushHf (also push the private dataset to HuggingFace)."
+  // update USER-LOCAL patterns). Web-app portable (works in TUI, web, and serve).
+  const supervisorTrainDescription = "Train the supervisor on recent sessions: mine how the agent stopped and how the user followed up, then update the user-local patterns/anti-patterns. Never commits to git; dataset stays private. Args: since (e.g. '14d'), dryRun (preview only), pushHf (push private dataset to HuggingFace)."
   const executeSupervisorTrain = async (args: { since?: string; dryRun?: boolean; pushHf?: boolean }) => {
     const trainScript = join(dirname(fileURLToPath(import.meta.url)), "..", "train", "run-train.mjs")
     const argv = [trainScript, `--since=${args.since || "14d"}`]
@@ -1641,16 +1953,66 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     })
   }
 
+  // supervisor_goal / supervisor_retry tools — wire the supervisor-mode goal loop
+  // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
+  // this per-session state on the next session.idle.
+  const supervisorGoalDescription = "Set, check, or clear a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear)."
+  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
+    if (args.clear) {
+      await supervisorStore.clearGoal(directory, sid)
+      return `Goal cleared for session ${sid.slice(0, 8)}….`
+    }
+    const condition = (args.condition || "").trim()
+    if (!condition) {
+      const st = await supervisorStore.load(directory, sid)
+      if (!st.goal) return "No goal set for this session."
+      return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+    }
+    await supervisorStore.setGoal(directory, sid, condition, {})
+    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out).`
+  }
+  const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
+  const executeSupervisorRetry = async (args: { n?: number }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then set retry."
+    if (typeof args.n === "number" && Number.isFinite(args.n)) {
+      await supervisorStore.setRetry(directory, sid, args.n)
+      const eff = resolveMaxAttempts({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
+      return `Retry budget set to ${eff} for session ${sid.slice(0, 8)}….`
+    }
+    const st = await supervisorStore.load(directory, sid)
+    return `Retry budget (session override): ${st.maxAttempts ?? "(default)"}.`
+  }
+
   let setSupervisorTool: any = null
   let supervisorToggleTool: any = null
   let supervisorTrainTool: any = null
+  let supervisorGoalTool: any = null
+  let supervisorRetryTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
+    supervisorGoalTool = tool({
+      description: supervisorGoalDescription,
+      args: {
+        condition: tool.schema.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal.")
+      },
+      execute: executeSupervisorGoal as any
+    })
+    supervisorRetryTool = tool({
+      description: supervisorRetryDescription,
+      args: {
+        n: tool.schema.number().optional().describe("Retry budget (1–100). Omit to check current.")
+      },
+      execute: executeSupervisorRetry as any
+    })
     supervisorTrainTool = tool({
       description: supervisorTrainDescription,
       args: {
         since: tool.schema.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
-        dryRun: tool.schema.boolean().optional().describe("Preview the proposed pattern changes without writing the user-local file."),
+        dryRun: tool.schema.boolean().optional().describe("Preview the proposed pattern changes without writing."),
         pushHf: tool.schema.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
       },
       execute: executeSupervisorTrain as any
@@ -1692,15 +2054,32 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         description: supervisorTrainDescription,
         args: {
           since: z.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
-          dryRun: z.boolean().optional().describe("Preview the proposed pattern changes without writing the user-local file."),
+          dryRun: z.boolean().optional().describe("Preview the proposed pattern changes without writing."),
           pushHf: z.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
         },
         execute: executeSupervisorTrain
+      }
+      supervisorGoalTool = {
+        description: supervisorGoalDescription,
+        args: {
+          condition: z.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
+          clear: z.boolean().optional().describe("Set true to clear the current session goal.")
+        },
+        execute: executeSupervisorGoal
+      }
+      supervisorRetryTool = {
+        description: supervisorRetryDescription,
+        args: {
+          n: z.number().optional().describe("Retry budget (1–100). Omit to check current.")
+        },
+        execute: executeSupervisorRetry
       }
     } catch {
       setSupervisorTool = null
       supervisorToggleTool = null
       supervisorTrainTool = null
+      supervisorGoalTool = null
+      supervisorRetryTool = null
     }
   }
 
@@ -1753,19 +2132,46 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         const lastAssistantText = extractLastAssistantText(messages)
         const customPrompt = await loadSupervisorPrompt(directory)
         const agents = await getAgentsFile(directory)
+        const rubric = await loadRubric(directory)
         const currentAttemptCount = attempts.get(attemptKey) || 0
+        // Supervisor goal/retry state. A /supervisor:retry override applies even
+        // without a goal (sessionOverride). An active goal augments the judge
+        // rubric with a mandatory completion requirement and drives the goal loop.
+        const sup = await supervisorStore.load(directory, sessionId)
+        const goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
+        const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
+        // When a goal is active, its condition is the strongest stated intent and
+        // MUST compose with the existing gates: build the DEFAULT rubric prompt
+        // with the goal requirement appended, bypassing file/tool precedence.
+        const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
+        const effRubric: Rubric = goalSection
+          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+          : rubric
         const defaultSupervisorPrompt = buildSelfAssessmentPrompt(
           context,
           agents,
           lastAssistantText,
-          currentAttemptCount
+          currentAttemptCount,
+          effRubric,
+          effectiveMaxAttempts
         )
-        const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
-        const supervisorPrompt = resolvedPrompt.prompt
-        const effectiveToolSupervisorPrompt = resolvedPrompt.effectiveToolSupervisorPrompt
+        let supervisorPrompt: string
+        let effectiveToolSupervisorPrompt: string | null
+        let promptSource: "file" | "tool" | "default" | "goal"
+        if (goal) {
+          // Goal active: use the default (goal-augmented) prompt directly.
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "goal"
+        } else {
+          const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
+          supervisorPrompt = resolvedPrompt.prompt
+          effectiveToolSupervisorPrompt = resolvedPrompt.effectiveToolSupervisorPrompt
+          promptSource = resolvedPrompt.source
+        }
 
         await showToast(client, directory, "Requesting supervisor self-assessment...", "info")
-        debug("Requesting supervisor self-assessment (source:", resolvedPrompt.source, ")")
+        debug("Requesting supervisor self-assessment (source:", promptSource, ")")
 
         // Issue #98: Run self-assessment in a separate ephemeral session instead
         // of prompting the active agent session. Asking the active session to
@@ -1869,7 +2275,8 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
             context,
             selfAssessment,
             judgeSessionIds,
-            effectiveToolSupervisorPrompt
+            effectiveToolSupervisorPrompt,
+            effRubric
           )
         }
 
@@ -1881,6 +2288,49 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         }
 
         debug("Supervisor analysis completed")
+
+        // Supervisor goal loop: when an active goal exists, decide its next state
+        // (budget exhaustion FIRST, then achievement, then continuation). An
+        // exhausted goal pauses the loop WITHOUT injecting a continuation; an
+        // achieved goal is persisted and falls through to the normal complete
+        // bookkeeping; a continuing goal must ONLY burn budget (attempts+1) when a
+        // continuation is actually injected — so we defer that persist until after
+        // the feedback prompt succeeds (see pendingGoalContinue below). This avoids
+        // silently losing budget on interrupted passes (human-action, new-message,
+        // abort, or per-message max-attempts rechecks that early-return).
+        let pendingGoalContinue: SupervisorState | null = null
+        if (goal) {
+          const t = decideGoalTransition({
+            goal,
+            complete: analysis.complete,
+            now: Date.now(),
+            maxAttempts: effectiveMaxAttempts,
+            reason: analysis.reason,
+          })
+          if (t.action === "exhausted") {
+            await supervisorStore.save(directory, sessionId, { ...sup, goal: t.goal })
+            attempts.delete(attemptKey)
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            await showToast(
+              client,
+              directory,
+              `Goal budget exhausted (${t.goal.attempts} attempts) — paused`,
+              "warning"
+            )
+            debug("Goal budget exhausted, pausing without continuation")
+            return
+          }
+          if (t.action === "achieved") {
+            // Persist the achieved status now; the existing analysis.complete
+            // branch below handles the bookkeeping + return. No attempts increment.
+            await supervisorStore.save(directory, sessionId, { ...sup, goal: t.goal })
+          } else {
+            // "continue": DO NOT persist the attempts++ here. Stash it and only
+            // write it after a continuation is actually injected (post-promptAsync
+            // success). Any early-return below leaves goal.attempts unchanged.
+            pendingGoalContinue = { ...sup, goal: t.goal }
+          }
+        }
 
         let crossReview: { modelSpec: string; response: string } | null = null
         if (analysis.complete) {
@@ -1922,7 +2372,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         if (analysis.complete) {
           attempts.delete(attemptKey)
           lastReflectedMsgId.set(sessionId, lastUserMsgId)
-          await showToast(client, directory, `Task complete ✓ (${analysis.severity})`, "success")
+          await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
           debug("Supervisor complete")
           return
         }
@@ -1962,11 +2412,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
           return
         }
 
+        // When a goal is active, goal.attempts (persisted) guards the budget via
+        // decideGoalTransition above; this per-message counter still fires as the
+        // fallback cap for ordinary sessions without a goal. They coexist on purpose.
         const nextAttemptCount = (attempts.get(attemptKey) || 0) + 1
         attempts.set(attemptKey, nextAttemptCount)
-        if (nextAttemptCount >= MAX_ATTEMPTS) {
+        if (nextAttemptCount >= effectiveMaxAttempts) {
           lastReflectedMsgId.set(sessionId, lastUserMsgId)
-          await showToast(client, directory, `Max attempts (${MAX_ATTEMPTS}) reached`, "warning")
+          await showToast(client, directory, `Max attempts (${effectiveMaxAttempts}) reached`, "warning")
           debug("Max attempts reached for", sessionId.slice(0, 8))
           return
         }
@@ -1983,7 +2436,8 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
             next_actions: analysis.nextActions
           },
           usePlanningLoopMessage,
-          actionLoopCheck.detected
+          actionLoopCheck.detected,
+          effectiveMaxAttempts
         )
 
         // Apply task-based model routing to feedback injection
@@ -2010,6 +2464,12 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         // start another supervisor cycle for the same user message.
         lastReflectedMsgId.set(sessionId, lastUserMsgId)
 
+        // Goal budget is burned ONLY here, after a continuation was actually
+        // injected. If any earlier recheck early-returned (or promptAsync above
+        // threw and returned), pendingGoalContinue was never set / never reached,
+        // so goal.attempts stays unchanged — no silent budget loss.
+        if (pendingGoalContinue) await supervisorStore.save(directory, sessionId, pendingGoalContinue)
+
         debug("Supervisor pushed continuation")
 
         const routingInfo = routingModel ? ` [${routingCategory} → ${routingModel.modelID}]` : ""
@@ -2023,10 +2483,12 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     config: async (_config) => {
       return
     },
-    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool) ? {
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
       ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
       ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
+      ...(supervisorGoalTool ? { supervisor_goal: supervisorGoalTool } : {}),
+      ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
       debug("event received:", event.type)

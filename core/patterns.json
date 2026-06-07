@@ -57,10 +57,26 @@
       "rule": "FALSE-COMPLETE: claims \"done\"/\"complete\"/\"ready\"/\"all tasks complete\" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response on an action task is NEVER complete. For an \"add a <feature>\" task, writing files is not enough — code must be wired in AND verified (test/build/run); \"ready to use\" with no integration is incomplete → classify as summary_drift_stop (not complete)."
     },
     {
+      "name": "analysis_no_implementation",
+      "maps_to": "summary_drift_stop",
+      "rule": "ANALYSIS-NO-IMPLEMENTATION (planning loop): the task requires code changes (fix/implement/add/create/build/refactor, or a GitHub issue URL) but the response only read/grepped/explored/recommended — the tools show ONLY read operations (read, grep, git log/status) and ZERO writes (edit, write, build, commit). Reading is not doing → classify as summary_drift_stop; if it halted mid-investigation with no plan, genuinely_stuck. A task mixing 'investigate' with 'fix/implement', or referencing a GitHub issue, is a CODING task, not research."
+    },
+    {
+      "name": "retry_loop",
+      "maps_to": "genuinely_stuck",
+      "rule": "RETRY-LOOP: the agent repeats the same failing approach (same command / same edit / same deploy) across turns without changing strategy. Repeating a failed action is not progress → genuinely_stuck; the nudge should force a different approach or an explicit blocker statement."
+    },
+    {
       "name": "legitimate_stop",
       "maps_to": "waiting_for_user_legitimate",
       "rule": "LEGITIMATE STOP (do NOT flag as premature): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → waiting_for_user_legitimate. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → complete; do not invent missing work."
     }
+  ],
+  "evidence_rules": [
+    "A completion claim needs evidence, but a concise summary IS evidence: 'test suite: 3 passed' or 'build ok' counts — do NOT demand full stdout.",
+    "A write/edit tool call IS evidence that a file was created or changed — do not demand a follow-up cat/read to 'prove' it.",
+    "For 'make it work' / 'pass the tests' / 'fix the bug' tasks, completion REQUIRES execution output (tests/build/run), not just code written or 'ready to use'.",
+    "Calibrate severity to the actual change: touching a file named auth/security is not itself a vulnerability or a BLOCKER."
   ],
   "feedback": {
     "max_inject_attempt": 3,
