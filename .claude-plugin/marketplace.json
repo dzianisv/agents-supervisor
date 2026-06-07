@@ -1,5 +1,6 @@
 {
   "name": "agents-supervisor",
+  "description": "Supervisor plugins that catch premature agent stops and re-prompt the agent to finish — for Claude Code and OpenCode.",
   "owner": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
   "plugins": [
     {
