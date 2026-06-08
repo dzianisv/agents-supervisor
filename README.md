@@ -6,6 +6,8 @@ stopping **prematurely** — asking permission for work it could just do, listin
 Always-on, low-risk (it approves legitimate stops and waits), and it learns from
 your own sessions.
 
+> Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
+
 Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Surface |
