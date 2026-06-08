@@ -116,5 +116,47 @@ check('attempt cap → stops injecting after max attempts', () => {
   assert.equal(blocks, 3, `expected 3 injects (max), got ${blocks}`);
 });
 
+// ── Goal loop (Claude Code side) ──────────────────────────────────────────
+import { goalStore } from '../core/goal.mjs';
+
+check('goal active + judge complete → goal achieved, no inject', () => {
+  const { dir, tp } = mkSession(completeTurns);
+  const sid = 'e2e-goal-done';
+  goalStore.setGoal(dir, sid, 'the answer is given');
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: '4.' };
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('complete'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'no inject when goal achieved');
+  assert.equal(verdict?.goal, 'achieved');
+  assert.equal(goalStore.load(dir, sid).goal.status, 'achieved');
+});
+
+check('goal active + premature stop → goal-continue inject (mentions goal)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-goal-cont';
+  goalStore.setGoal(dir, sid, 'all tests pass');
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { stdout, verdict } = runHook(payload, fakeEnv('summary_drift_stop'));
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block');
+  assert.match(out.reason, /Goal not yet met: "all tests pass"/);
+  assert.equal(verdict?.goal, 'continue');
+});
+
+check('goal raises retry budget past the default 3 (injects a 4th time)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-goal-budget';
+  goalStore.setGoal(dir, sid, 'keep going');
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  let blocks = 0;
+  for (let i = 0; i < 4; i++) {
+    const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+    if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
+  }
+  assert.equal(blocks, 4, `goal budget should allow >3 injects, got ${blocks}`);
+});
+
 console.log(`\n${pass} passed, ${fail} failed${LIVE ? ' (LIVE judge)' : ' (fake judge)'}`);
 process.exit(fail === 0 ? 0 : 1);

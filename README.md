@@ -10,7 +10,7 @@ Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Surface |
 |---|---|---|
-| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status` |
+| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:goal`, `/supervisor:retry` |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry` + `/supervisor`, `/supervisor:train`, `/supervisor:goal`, `/supervisor:retry` |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
@@ -55,11 +55,11 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
 ```
 Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
 
-## Supervisor mode — goal loop (OpenCode)
+## Supervisor mode — goal loop (both runtimes)
 
-Beyond catching premature stops, the OpenCode side can be pointed at a **goal** it
-must demonstrably meet before it lets the agent stop — it keeps re-prompting (up to
-a retry budget) until the goal's met or the budget runs out.
+Beyond catching premature stops, you can point the supervisor at a **goal** it must
+demonstrably meet before it lets the agent stop — it keeps re-prompting (up to a
+retry budget) until the goal's met or the budget runs out.
 
 ```
 /supervisor:goal all tests in test/auth pass and the PR is open with green CI
@@ -67,15 +67,20 @@ a retry budget) until the goal's met or the budget runs out.
 /supervisor:goal clear        # clear (aliases: stop, off, reset, none, cancel)
 /supervisor:retry 24          # set this session's retry budget (1–100, default 16)
 ```
-The goal is injected as a **mandatory completion requirement** on top of the normal
-rubric; the judge only reports complete when the applicable gates pass **and** the
-goal is met. State is per-session at `.supervisor/goals/<sessionId>.json` (mode 0600);
-budget is only spent when a continuation actually fires. (Web app: call the
-`supervisor_goal` / `supervisor_retry` tools.)
 
-**Configurable rubric:** drop a `.supervisor/rubric.md` (or `~/.config/opencode/supervisor/rubric.md`)
-with `## Patterns` / `## Antipatterns` sections to override the judge's rubric; otherwise
-the shipped default is used.
+The goal is injected into the judge as a **mandatory completion requirement** — the
+agent is not allowed to stop until the goal is met (or the budget exhausts). While a
+goal is active the retry budget rises to 16 (vs 3 normally). State is per-session at
+`.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
+continuation actually fires.
+
+- **Claude Code:** `/supervisor:goal` / `/supervisor:retry` skills (the `Stop` hook enforces it).
+- **OpenCode:** same commands in the TUI; in the web app call the `supervisor_goal` / `supervisor_retry` tools.
+
+**Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
+`~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
+sections to override the judge's rubric; otherwise the shipped default is used.
+(Claude Code reads its rubric from `core/patterns.json` ⊕ your user-local patterns.)
 
 ## How it decides
 

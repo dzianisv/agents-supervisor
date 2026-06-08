@@ -18,6 +18,7 @@ import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { loadPatterns } from './patterns.mjs';
+import { buildGoalRequirementSection } from './goal.mjs';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -89,7 +90,7 @@ function truncate(s, n) {
  * @param {object} patterns
  * @returns {string}
  */
-export function buildPrompt(ctx, patterns) {
+export function buildPrompt(ctx, patterns, goalCondition) {
   const cats = patterns?.categories ?? [];
   const names = cats.map((c) => c.name);
   const catLines = cats.map((c) => `- ${c.name}: ${c.description}`).join('\n');
@@ -105,6 +106,8 @@ export function buildPrompt(ctx, patterns) {
     .join('\n\n');
   const finalText = truncate(ctx.final_assistant_text ?? '', 2400);
   const tools = (ctx.tools_available_inferred ?? []).join(', ');
+
+  const goalBlock = goalCondition ? `\n${buildGoalRequirementSection(goalCondition)}\n` : '';
 
   const provenance = meta.dataset_size
     ? `PREMATURE-STOP ANTIPATTERNS (mined from ${meta.dataset_size} real agent stops where the user replied; ${meta.premature_pct ?? '~78'}% were premature — the user said "go"/"continue"/"yes do it" or corrected the agent). Use these to sharpen category assignments:`
@@ -126,7 +129,7 @@ ${finalText}
 ${provenance}
 
 ${antipatternBlock}
-${evidenceBlock}
+${evidenceBlock}${goalBlock}
 Respond ONLY with a JSON object on a single line, no markdown fence, no prose:
 {"category": "<one of: ${names.join(' | ')}>", "reason": "<one short sentence citing the specific antipattern or evidence>", "confidence": <0.0-1.0>}`;
 }
@@ -178,7 +181,7 @@ export async function classifyStop(stopContext, opts = {}) {
   }
 
   const auth = loadAuth();
-  const prompt = buildPrompt(stopContext, patterns);
+  const prompt = buildPrompt(stopContext, patterns, opts.goalCondition);
 
   const body = JSON.stringify({
     model,

@@ -88,7 +88,7 @@ export interface SupervisorState {
 }
 
 function supervisorDir(directory: string): string {
-  return join(directory, ".supervisor", "supervisor")
+  return join(directory, ".supervisor", "goals")
 }
 
 /** Guard against path-traversal attacks via a malformed sessionId. */

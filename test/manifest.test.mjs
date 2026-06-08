@@ -28,8 +28,8 @@ test('hooks/hooks.json registers the Stop hook → bin/on-stop.mjs', () => {
   assert.ok(fs.existsSync(path.join(ROOT, 'bin', 'on-stop.mjs')));
 });
 
-test('bundled skills exist with frontmatter names → /supervisor:train, /supervisor:status', () => {
-  for (const name of ['train', 'status']) {
+test('bundled skills exist with frontmatter names → /supervisor:{train,status,goal,retry}', () => {
+  for (const name of ['train', 'status', 'goal', 'retry']) {
     const p = path.join(ROOT, 'skills', name, 'SKILL.md');
     assert.ok(fs.existsSync(p), `skills/${name}/SKILL.md missing`);
     const fm = fs.readFileSync(p, 'utf8').slice(0, 400);

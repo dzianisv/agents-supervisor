@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { classifyStop } from '../core/judge-core.mjs';
 import { buildFeedback, injectCategories } from '../core/feedback-core.mjs';
 import { loadPatterns } from '../core/patterns.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition } from '../core/goal.mjs';
 
 const STATE_DIR = '.supervisor';
 const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);
@@ -254,9 +255,29 @@ async function main() {
   } catch { /* not disabled */ }
 
   // 2. Attempt cap.
+  // Goal loop: if a goal is active, raise the retry budget and feed the goal to
+  // the judge. All goal logic is best-effort — any failure falls back to default.
+  let goal = null;
+  let goalState = {};
+  let effectiveMax = MAX_ATTEMPTS;
+  try {
+    goalState = goalStore.load(cwd, session_id);
+    if (goalState.goal && goalState.goal.status === 'active') {
+      goal = goalState.goal;
+      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
+    } else if (typeof goalState.maxAttempts === 'number') {
+      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
+    }
+  } catch (e) {
+    debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
+  }
+
   const attempts = readAttempts(session_id, cwd);
-  if (attempts >= MAX_ATTEMPTS) {
-    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: MAX_ATTEMPTS }, cwd);
+  if (attempts >= effectiveMax) {
+    if (goal) {
+      try { goalStore.save(cwd, session_id, { ...goalState, goal: { ...goal, status: 'exhausted' } }); } catch { /* */ }
+    }
+    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal }, cwd);
     process.exit(0);
   }
 
@@ -281,7 +302,7 @@ async function main() {
   // 5. Judge.
   let verdict;
   try {
-    verdict = await classifyStop(ctx, { patterns, cwd });
+    verdict = await classifyStop(ctx, { patterns, cwd, goalCondition: goal?.condition });
   } catch (e) {
     debug({ msg: 'judge_threw', err: String(e?.message ?? e) }, cwd);
     verdict = { category: 'API_ERROR', reason: String(e?.message ?? e), confidence: 0 };
@@ -291,7 +312,54 @@ async function main() {
   const nextAttempt = attempts + 1;
   const verdictRecord = { ...verdict, session_id, attempt: nextAttempt, timestamp: new Date().toISOString(), injected: false };
 
-  // 6. Inject decision.
+  // 6a. Goal loop: when a goal is active it overrides the normal inject rules —
+  // keep pushing until the goal is met (judge says complete) or budget exhausts.
+  if (goal) {
+    const t = decideGoalTransition({
+      goal,
+      complete: verdict.category === 'complete',
+      now: Date.now(),
+      maxAttempts: effectiveMax,
+      reason: verdict.reason,
+    });
+    if (t.action === 'achieved') {
+      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      verdictRecord.goal = 'achieved';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'goal_achieved', session_id }, cwd);
+      process.exit(0);
+    }
+    if (t.action === 'exhausted') {
+      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      verdictRecord.goal = 'exhausted';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'goal_exhausted', session_id }, cwd);
+      process.exit(0);
+    }
+    // continue — but never override a genuine human-only block.
+    if (verdict.category !== 'waiting_for_user_legitimate') {
+      const inj = injectCategories(patterns).has(verdict.category)
+        ? buildFeedback(verdict.category, ctx, nextAttempt, patterns).additionalContext
+        : null;
+      const msg = `Goal not yet met: "${goal.condition}". ${inj ? inj + ' ' : ''}Keep going toward the goal — take the next concrete action (tool call / code / command); do not stop until it is demonstrably met. ${verdict.reason ? `(judge: ${verdict.reason})` : ''}`.trim();
+      writeAttemptCounter(session_id, nextAttempt, cwd);
+      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      verdictRecord.injected = true;
+      verdictRecord.goal = 'continue';
+      verdictRecord.feedback_reason = 'goal_continue';
+      writeVerdict(session_id, verdictRecord, cwd);
+      process.stdout.write(JSON.stringify({ decision: 'block', reason: msg }));
+      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, category: verdict.category }, cwd);
+      process.exit(0);
+    }
+    // waiting_for_user_legitimate with active goal → legit pause, don't burn budget.
+    verdictRecord.goal = 'paused';
+    writeVerdict(session_id, verdictRecord, cwd);
+    debug({ msg: 'goal_paused_user_wait', session_id }, cwd);
+    process.exit(0);
+  }
+
+  // 6b. Normal (no goal) inject decision.
   if (injectCategories(patterns).has(verdict.category)) {
     const fb = buildFeedback(verdict.category, ctx, nextAttempt, patterns);
     if (fb.shouldInject) {
