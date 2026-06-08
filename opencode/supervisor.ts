@@ -12,6 +12,13 @@ import { join, dirname } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "url"
 import { execFile } from "child_process"
+// Shared goal-loop DECISION logic — single source of truth across runtimes.
+// (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
+import {
+  resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  decideGoalTransition, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS,
+} from "../core/goal.mjs"
+export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition }
 
 // Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
 async function reportError(err: unknown, context?: Record<string, string>): Promise<void> {
@@ -24,23 +31,8 @@ async function reportError(err: unknown, context?: Record<string, string>): Prom
 
 const SELF_ASSESSMENT_MARKER = "## Supervisor Self-Assessment"
 const FEEDBACK_MARKER = "## Supervisor:"
-const DEFAULT_MAX_ATTEMPTS = 16
-const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000
-
-/**
- * Pure function: resolve the effective max attempts from opts (no I/O).
- * Priority: sessionOverride > config > DEFAULT_MAX_ATTEMPTS (16).
- * Result is clamped to [1, 100]. Non-finite values (NaN, Infinity) are ignored.
- */
-export function resolveMaxAttempts(opts: { sessionOverride?: number; config?: number }): number {
-  const candidates = [opts.sessionOverride, opts.config, DEFAULT_MAX_ATTEMPTS]
-  for (const candidate of candidates) {
-    if (candidate !== undefined && Number.isFinite(candidate)) {
-      return Math.min(100, Math.max(1, Math.floor(candidate)))
-    }
-  }
-  return DEFAULT_MAX_ATTEMPTS
-}
+// DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS, resolveMaxAttempts now come
+// from ../core/goal.mjs (shared with the Claude Code side).
 
 /**
  * Read the top-level `maxAttempts:` integer from ~/.config/opencode/supervisor.yaml.
@@ -180,39 +172,7 @@ export const supervisorStore = {
 // No I/O. Safe to call from any context.
 // ---------------------------------------------------------------------------
 
-export type SupervisorCommand =
-  | { kind: "goal-set"; condition: string }
-  | { kind: "goal-status" }
-  | { kind: "goal-clear" }
-  | { kind: "retry-set"; n: number }
-  | { kind: "retry-status" }
-  | { kind: "unknown"; name: string }
-
-const GOAL_CLEAR_ALIASES = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
-
-/**
- * Parse a supervisor slash-command into a typed action.
- *
- * @param name - command name, e.g. "goal" or "retry"
- * @param args - raw argument string (may have leading/trailing whitespace)
- */
-export function parseSupervisorCommand(name: string, args: string): SupervisorCommand {
-  const trimmed = args.trim()
-
-  if (name === "goal") {
-    if (trimmed === "") return { kind: "goal-status" }
-    if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: "goal-clear" }
-    return { kind: "goal-set", condition: trimmed.slice(0, 4000) }
-  }
-
-  if (name === "retry") {
-    if (trimmed === "") return { kind: "retry-status" }
-    if (/^\d+$/.test(trimmed)) return { kind: "retry-set", n: parseInt(trimmed, 10) }
-    return { kind: "retry-status" }
-  }
-
-  return { kind: "unknown", name }
-}
+// parseSupervisorCommand now imported from ../core/goal.mjs (shared).
 
 // ---------------------------------------------------------------------------
 // buildGoalRequirementSection — prompt fragment for active session goals
@@ -222,28 +182,7 @@ export function parseSupervisorCommand(name: string, args: string): SupervisorCo
 // appending in that case).
 // ---------------------------------------------------------------------------
 
-/**
- * Build a prompt fragment that tells the evaluator a user-set goal condition
- * is a MANDATORY completion requirement, additional to the existing workflow
- * gates. A claim that the condition is met must be backed by transcript
- * evidence (commands + output / tests actually run).
- *
- * @param condition - the goal condition string (will be trimmed)
- * @returns a labeled prompt block, or "" if condition is blank
- */
-export function buildGoalRequirementSection(condition: string): string {
-  const trimmed = condition.trim()
-  if (!trimmed) return ""
-  return `## GOAL (mandatory completion requirement)
-
-MANDATORY: The following user-set goal condition MUST be demonstrably met before the task can be considered complete:
-
-  "${trimmed}"
-
-This is an ADDITIONAL requirement on top of the existing workflow gates (tests, build, PR, CI checks) — it does not replace them. The task is NOT complete until this condition is satisfied AND all normal completion criteria are met.
-
-Evidence rule: a claim that this goal condition is met must be backed by evidence already surfaced in the transcript — commands run and their output, tests actually executed, artefacts produced. A bare assertion that the condition is satisfied does NOT count as evidence.`
-}
+// buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
 
 // ---------------------------------------------------------------------------
 // decideGoalTransition — pure decision for an active session goal
@@ -254,28 +193,7 @@ Evidence rule: a claim that this goal condition is met must be backed by evidenc
 // then achievement, then continuation (which increments attempts).
 // ---------------------------------------------------------------------------
 
-export type GoalTransition =
-  | { action: "exhausted"; goal: SupervisorGoal }
-  | { action: "achieved"; goal: SupervisorGoal }
-  | { action: "continue"; goal: SupervisorGoal }
-
-export function decideGoalTransition(params: {
-  goal: SupervisorGoal
-  complete: boolean
-  now: number
-  maxAttempts: number
-  reason?: string
-}): GoalTransition {
-  const { goal, complete, now, maxAttempts, reason } = params
-  const lastReason = reason ?? goal.lastReason
-  if (goal.attempts >= maxAttempts || now >= goal.deadline) {
-    return { action: "exhausted", goal: { ...goal, status: "exhausted", lastReason } }
-  }
-  if (complete) {
-    return { action: "achieved", goal: { ...goal, status: "achieved", lastReason } }
-  }
-  return { action: "continue", goal: { ...goal, status: "active", attempts: goal.attempts + 1, lastReason } }
-}
+// decideGoalTransition now imported from ../core/goal.mjs (shared decision logic).
 
 // ---------------------------------------------------------------------------
 // Supervisor rubric (configurable patterns/antipatterns)
