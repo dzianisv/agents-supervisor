@@ -19,6 +19,16 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+// Salt for project_slug hashing — random per-export so even brute-force
+// can't reverse the slug→name mapping across snapshots.
+const SLUG_SALT = process.env.HF_EXPORT_SLUG_SALT ?? Math.random().toString(36).slice(2);
+function opaqueProject(slug) {
+  if (!slug) return '<proj-unknown>';
+  const h = createHash('sha256').update(slug + SLUG_SALT).digest('hex').slice(0, 8);
+  return `proj-${h}`;
+}
 
 const args = parseArgs(process.argv.slice(2));
 const IN  = args.in  ?? 'evals/gold-cc-oc.example.jsonl';
@@ -97,6 +107,7 @@ function secondPassRedact(s) {
 
 function redactRecord(rec) {
   const r = { ...rec };
+  // Wrapped schema (gold-format with {name, expected, ctx: {...}})
   if (r.ctx) {
     r.ctx = {
       ...r.ctx,
@@ -105,6 +116,27 @@ function redactRecord(rec) {
       tools_available_inferred: r.ctx.tools_available_inferred ?? [],
     };
   }
+  // Flat schema (classified-vN format with top-level user_messages, project_slug, etc.)
+  if (r.user_messages !== undefined) {
+    r.user_messages = (r.user_messages ?? []).map(secondPassRedact);
+  }
+  if (r.final_assistant_text !== undefined) {
+    r.final_assistant_text = secondPassRedact(r.final_assistant_text ?? '');
+  }
+  if (r.classification?.reason) {
+    r.classification = { ...r.classification, reason: secondPassRedact(r.classification.reason) };
+  }
+  // project_slug is the user's local path baked into Claude Code's project dir:
+  //   "-home-azureuser--paperclip-instances-default-..." or
+  //   "-Users-engineer-workspace-..."  → leak. Replace with opaque tag.
+  // project_slug = the user's local path baked into the CC/OC project dir.
+  // Hash it to a stable opaque label so cross-record analysis ("which project
+  // did this stop come from") survives but the path itself doesn't.
+  if (r.project_slug !== undefined) {
+    r.project_slug = opaqueProject(r.project_slug);
+  }
+  // session_id is a UUID — safe to keep. timestamps are absolute date-times,
+  // not identifying on their own.
   return r;
 }
 
