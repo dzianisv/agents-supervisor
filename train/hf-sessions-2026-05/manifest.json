@@ -1,0 +1,27 @@
+{
+  "snapshot_id": "2026-05",
+  "exported_at": "2026-06-14T11:08:50Z",
+  "records": 1194,
+  "splits": {
+    "cc": 731,
+    "oc": 463
+  },
+  "distribution": {
+    "complete": 570,
+    "summary_drift_stop": 197,
+    "tool_available_punt": 188,
+    "working": 123,
+    "waiting_for_user_legitimate": 67,
+    "genuinely_stuck": 49
+  },
+  "classifier": {
+    "name": "agents-supervisor-v3",
+    "model": "claude-haiku-4-5",
+    "commit": "3dbd6b4"
+  },
+  "redaction": {
+    "audit_time": ["sk-ant-*", "ghp_*", "gho_*", "AKIA*", "Bearer headers", "x-api-key", "emails", "homedir paths"],
+    "hf_export": ["project names → opaque", "user handles", "ipv4 → <ip>", "project_slug → salted sha256", "neon/supabase/render db credentials", "stripe/openai/anthropic/hf/github keys"]
+  },
+  "salt_strategy": "HF_EXPORT_SLUG_SALT=2026-05-snapshot (deterministic across this snapshot only)"
+}
