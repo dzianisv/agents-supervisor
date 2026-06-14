@@ -29,7 +29,7 @@ test('derivePatterns: recomputes weights from antipattern stop_type distribution
   assert.equal(byName.stopped_with_todos, 50);
   assert.equal(patterns.meta.dataset_size, 400);
   assert.equal(patterns.meta.premature_pct, 25);
-  assert.equal(before.dataset_size, 227); // shipped provenance preserved as "before"
+  assert.equal(before.dataset_size, 284); // shipped provenance preserved as "before"
   assert.ok(changes.some((c) => c.includes('stopped_with_todos'))); // 30% -> 50% recorded
 });
 

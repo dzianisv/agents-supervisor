@@ -1,10 +1,10 @@
 {
   "version": 1,
   "meta": {
-    "dataset_size": 227,
+    "dataset_size": 284,
     "premature_pct": 78,
     "source": "mined real agent stops where the user replied",
-    "note": "Shipped defaults. User-local overrides at .supervisor/patterns.json or ~/.config/agents-supervisor/patterns.json take precedence. /supervisor:train writes the user-local file ONLY — never this file."
+    "note": "Shipped defaults. v3 antipatterns derived from 57-record CC+OC audited gold (#138 prompt-tune cycle) on top of original 227-record dataset. User-local overrides at .supervisor/patterns.json or ~/.config/agents-supervisor/patterns.json take precedence."
   },
   "categories": [
     {
@@ -70,6 +70,21 @@
       "name": "legitimate_stop",
       "maps_to": "waiting_for_user_legitimate",
       "rule": "LEGITIMATE STOP (do NOT flag as premature): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → waiting_for_user_legitimate. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → complete; do not invent missing work."
+    },
+    {
+      "name": "closing_delivery_dominates",
+      "maps_to": "complete",
+      "rule": "CLOSING DELIVERY DOMINATES intermediate planning phrases. A long turn often narrates the agent's process — \"Let me check X. Now let me read Y. Let me apply the fixes.\" — and THEN ends with a DELIVERED RESULT (committed PRs, test pass counts, verdict text, code-review checklist with FAIL/PASS, status report, error message returned to user, imperative guidance to the user like \"Try X\" / \"Use /clear\"). When the SAME turn ends on delivery, the intermediate \"Let me\" phrases were process narration of work that has now FINISHED — the turn is complete. Only mark drift if the turn ENDS on the unfinished action with NO subsequent result. Read the FINAL paragraph of the assistant text before deciding on intermediate signals."
+    },
+    {
+      "name": "imperative_guidance_to_user",
+      "maps_to": "complete",
+      "rule": "IMPERATIVE GUIDANCE TO USER is delivery, not drift. Sentences like \"Try X\", \"Use /clear\", \"Run npm test\", \"Check the log at /var/log/foo\", \"Look at the dashboard\" directed AT THE USER (not narrating agent self-action) are GUIDANCE — complete. Drift requires first-person commitment from the agent itself (\"I will run\", \"Let me now\", numbered self-plan). Imperatives are advice for the user to act; not a paused agent task."
+    },
+    {
+      "name": "capability_offer_vs_commitment",
+      "maps_to": "complete",
+      "rule": "CAPABILITY OFFER IS NOT COMMITMENT. \"I can do X\" / \"Next I can run X\" / \"If you want, I can X\" / \"I could update the doc\" is an OFFER extended to the user — the agent is not committed to acting and the turn is COMPLETE. Drift requires committed action (\"I will run\", \"Let me now\", \"Next I'll\", numbered execution plan). Distinguish: capability/permissive (\"can\", \"could\", \"if you want\") = complete; commitment/imperative (\"will\", \"let me now\", \"now I'll\") = drift."
     }
   ],
   "evidence_rules": [
@@ -78,9 +93,35 @@
     "For 'make it work' / 'pass the tests' / 'fix the bug' tasks, completion REQUIRES execution output (tests/build/run), not just code written or 'ready to use'.",
     "Calibrate severity to the actual change: touching a file named auth/security is not itself a vulnerability or a BLOCKER."
   ],
+  "few_shots": [
+    {"label": "A — complete", "note": "user-directed guidance is NOT drift", "final": "Deployed. To disable later: flip the flag in config.ts. Watch the dashboard over the next few days for the drop in error rate.", "output": {"category": "complete", "reason": "shipped + user-directed guidance, no agent next action", "confidence": 0.9}},
+    {"label": "B — summary_drift_stop", "note": "agent-claimed next step", "final": "I've created the file. Next I'll run the tests and commit.", "output": {"category": "summary_drift_stop", "reason": "claimed agent next step (tests + commit) but stopped", "confidence": 0.9}},
+    {"label": "C — complete", "note": "status delivery, even with promise to report later", "final": "Monitor armed. Will report per-job results + final status.", "output": {"category": "complete", "reason": "status delivered, monitoring is passive — not mid-action", "confidence": 0.85}},
+    {"label": "D — waiting_for_user_legitimate", "note": "only-user-can-answer preference", "final": "Which do you prefer — single comprehensive post or series?", "output": {"category": "waiting_for_user_legitimate", "reason": "asks user preference no tool can answer", "confidence": 0.9}},
+    {"label": "E — tool_available_punt", "note": "tool could answer", "tools": "Bash, Read, Grep, WebFetch", "final": "What does the PR description say? Paste it here and I'll review.", "output": {"category": "tool_available_punt", "reason": "WebFetch/gh CLI could pull PR description without asking user", "confidence": 0.85}},
+    {"label": "F — genuinely_stuck", "note": "no closure", "final": "Continuing.", "output": {"category": "genuinely_stuck", "reason": "single-word non-closure, no summary or question", "confidence": 0.9}},
+    {"label": "G — complete", "note": "terse acknowledgement is a delivery", "final": "Ignored — stale monitor noise.", "output": {"category": "complete", "reason": "terse acknowledgement, no open action", "confidence": 0.85}},
+    {"label": "H — summary_drift_stop", "note": "numbered next-step list, none executed", "final": "1. Run the tests. 2. Commit with feat(byok): ... 3. Open PR with test evidence.", "output": {"category": "summary_drift_stop", "reason": "numbered execution plan the agent owns, no step taken", "confidence": 0.9}},
+    {"label": "I — tool_available_punt", "note": "permission to update reversible artifact when agent has Edit/WebFetch", "tools": "Bash, Read, Edit, WebFetch", "final": "If you want, I can patch this now in one pass. Want me to?", "output": {"category": "tool_available_punt", "reason": "Edit/Bash available; agent could just patch instead of asking", "confidence": 0.85}},
+    {"label": "J — tool_available_punt", "note": "Bash available, asks user for shell state", "tools": "Bash, Read, Edit", "final": "What does `git status` show in your worktree?", "output": {"category": "tool_available_punt", "reason": "Bash could run git status directly", "confidence": 0.9}},
+    {"label": "K — complete", "note": "background tasks running, agent at rest this turn", "final": "PR #1376 merged. 3 worktree agents still running (homepage CTA, bot one-tap, Sentry triage). Will report as they land.", "output": {"category": "complete", "reason": "PR shipped; pending agents are passive", "confidence": 0.85}},
+    {"label": "L — complete", "note": "system error message, not a stuck agent", "final": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.", "output": {"category": "complete", "reason": "system status delivered, no agent action open", "confidence": 0.85}},
+    {"label": "M — complete", "note": "subagent fan-out, agent passive this turn", "final": "Subagent is running — probing RSS feeds and sitemaps. I'll share findings when it reports back.", "output": {"category": "complete", "reason": "dispatched subagent + passive wait", "confidence": 0.85}},
+    {"label": "N — complete", "note": "'I can do X' is offer, not commitment", "final": "UI updated, tests pass. Next I can run the full pre-merge suite if you want.", "output": {"category": "complete", "reason": "work delivered + capability offer ('I can'), no committed next action", "confidence": 0.85}},
+    {"label": "O — complete", "note": "present-tense process narration that delivers a finding", "final": "I'm checking whether the blocked conclusion missed usable context. Looked at the last 3 turns — no missed context, conclusion stands.", "output": {"category": "complete", "reason": "present-tense narration that delivered a concrete finding", "confidence": 0.85}},
+    {"label": "P — complete", "note": "next-steps list as user hand-off, no 'I will'", "final": "Shipped. Next steps for you: 1. Verify in staging 2. Roll out to prod 3. Monitor error rate.", "output": {"category": "complete", "reason": "next-steps list directed at user, no agent commitment", "confidence": 0.9}},
+    {"label": "Q — summary_drift_stop", "note": "'Let me now' + cut-off mid-action, NO closing result", "final": "Let me apply all 3 fixes now. First I need to update auth.ts... Now I need to add the validation step...", "output": {"category": "summary_drift_stop", "reason": "committed action ('Let me') + mid-action with no closing result", "confidence": 0.9}},
+    {"label": "R — complete", "note": "multi-step process narration that ENDS with delivery — closing dominates", "final": "Let me read the file. Now let me check the webhook URL. Let me apply all 3 fixes. ... All 1241 unit tests pass, TypeScript compiles clean. Fixes committed and pushed to PR #1043.", "output": {"category": "complete", "reason": "closing delivery (tests pass + PR pushed) overrides intermediate 'Let me' phrases", "confidence": 0.9}},
+    {"label": "S — complete", "note": "imperative guidance to user, not agent self-action", "final": "Autocompact thrashing. Try reading in smaller chunks, or use /clear to start fresh.", "output": {"category": "complete", "reason": "imperative guidance directed at user, not agent commitment", "confidence": 0.9}},
+    {"label": "T — complete", "note": "present-tense process narration ENDS with verdict — closing dominates", "final": "I'm checking whether the blocked conclusion missed usable context. ... Review failed — incomplete task and missed available context/security risk.", "output": {"category": "complete", "reason": "checklist + verdict delivered; intermediate 'I'm checking' was process narration", "confidence": 0.9}}
+  ],
   "feedback": {
     "max_inject_attempt": 3,
-    "inject_categories": ["summary_drift_stop", "tool_available_punt", "genuinely_stuck"],
+    "inject_categories": [
+      "summary_drift_stop",
+      "tool_available_punt",
+      "genuinely_stuck"
+    ],
     "templates": {
       "summary_drift_stop": {
         "reasons": [
