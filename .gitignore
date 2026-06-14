@@ -3,6 +3,8 @@
 .supervisor/
 *.jsonl
 !evals/**/*.example.jsonl
+# Redacted gold sets — safe to commit (PII/tokens stripped at audit time)
+!evals/gold-*.jsonl
 /tmp/
 stop-candidates/
 session-digests/
