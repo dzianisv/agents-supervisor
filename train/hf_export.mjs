@@ -52,7 +52,10 @@ const PROJECT_MAP = [
 // Longest first — possessive `dzianisvs` and compound `whoisdzianisvm`
 // must catch before stem `dzianisv` (or substring redact eats them anyway,
 // but listing keeps audit clear).
-const USER_HANDLES = ['whoisdzianisvm', 'dzianisvs', 'dzianisv', 'azureuser', 'engineer'];
+// NOTE: `engineer` removed — it's a generic English word and substring match
+// ate "engineers"/"engineering"/"users". Remaining /Users/engineer/ paths
+// are caught by the /home/<user> normalisation below.
+const USER_HANDLES = ['whoisdzianisvm', 'dzianisvs', 'dzianisv', 'azureuser'];
 
 // User-owned or user-referenced domains/services. Generic vendor names
 // (Anthropic, GitHub, Stripe) we keep — they're not identifying.
