@@ -1,0 +1,151 @@
+#!/usr/bin/env node
+/**
+ * hf_export.mjs — second-pass redaction + HuggingFace-format export of the
+ * shipped gold set (evals/gold-cc-oc.example.jsonl).
+ *
+ * The shipped gold is already redacted for credentials/tokens/emails/paths,
+ * but still contains project names and the user handle. This script applies
+ * a second pass:
+ *   - project names (OpenClawBot, vibebrowser, paperclip, ...) → <proj-a..z>
+ *   - user handle dzianisv → <user>
+ *   - any remaining /home/<name>/ or /Users/<name>/ → /home/<user>/
+ *   - any github.com/dzianisv/<repo> → github.com/<user>/<proj-X>
+ *
+ * Output: <outdir>/train.jsonl + dataset card stub + redaction log.
+ *
+ * Usage:
+ *   node train/hf_export.mjs --in evals/gold-cc-oc.example.jsonl \
+ *     --out /tmp/hf-export/gold-v3
+ */
+
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+
+const args = parseArgs(process.argv.slice(2));
+const IN  = args.in  ?? 'evals/gold-cc-oc.example.jsonl';
+const OUT = args.out ?? '/tmp/hf-export/gold-v3';
+mkdirSync(OUT, { recursive: true });
+
+// Project name → opaque label.
+// Keep the casing variants together so case-insensitive grep can catch them.
+// Longest variants FIRST (regex alternation prefers leftmost not longest;
+// we control order). Compound identifiers (OpenClawBoxBot, dzianisvs-projects)
+// are caught by listing them ahead of stems.
+const PROJECT_MAP = [
+  ['OpenClawBoxBot|OpenClawBox|OpenClawBot|openclaw|claw(hub)?',    '<proj-a>'],
+  ['vibebrowser|VibeBrowser|webagent',                    '<proj-b>'],
+  ['vibe',                                                '<proj-b-app>'],
+  ['paperclip',                                           '<proj-c>'],
+  ['Hermes|hermes',                                       '<proj-d>'],
+  ['Lamoom|lamoom',                                       '<proj-e>'],
+  ['opencode-plugins|agents-supervisor|reflection-3',     '<proj-f>'],
+  ['chrome-devtools-mcp',                                 '<proj-g>'],
+  ['elasticchat',                                         '<proj-h>'],
+  ['meeper',                                              '<proj-i>'],
+  ['codebox|codex-bridge-openclaw-prototype',             '<proj-j>'],
+  ['backtest|AgenticHedgeFund',                           '<proj-k>'],
+  ['sentry-dashboard',                                    '<proj-l>'],
+  ['termux-app',                                          '<proj-m>'],
+  ['rfs',                                                 '<proj-n>'],
+  ['skills\\.sh|skillssh',                                '<proj-p>'],
+];
+
+// Longest first — possessive `dzianisvs` and compound `whoisdzianisvm`
+// must catch before stem `dzianisv` (or substring redact eats them anyway,
+// but listing keeps audit clear).
+// NOTE: `engineer` removed — it's a generic English word and substring match
+// ate "engineers"/"engineering"/"users". Remaining /Users/engineer/ paths
+// are caught by the /home/<user> normalisation below.
+const USER_HANDLES = ['whoisdzianisvm', 'dzianisvs', 'dzianisv', 'azureuser'];
+
+// User-owned or user-referenced domains/services. Generic vendor names
+// (Anthropic, GitHub, Stripe) we keep — they're not identifying.
+const DOMAIN_MAP = [
+  ['clawhub\\.ai',          '<domain-a>'],
+  ['beadaholique\\.com',    '<customer-x>'],
+  ['claude\\.ai',           'claude.ai'], // keep — public reference
+  ['claude\\.com',          'claude.com'], // keep
+];
+
+// Any IPv4 address (public + private) — even private ones leak tailnet topology.
+const IPV4_RE = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
+// Localhost-ish meta-IP allowlist (keep so prompts about 127.0.0.1 stay readable)
+const IPV4_KEEP = new Set(['127.0.0.1', '0.0.0.0', '169.254.169.254']);
+
+function secondPassRedact(s) {
+  if (!s) return s;
+  let out = s;
+  // Substring redact (no \b) — needed because identifiers like
+  // `paperclip_agent_id`, `OpenClawBoxBot`, `dzianisvs-projects` slip past
+  // word boundaries since `_`/`-` are word-adjacent. Match longest variants
+  // first so e.g. `OpenClawBoxBot` resolves before stem `claw`.
+  for (const [pattern, replacement] of PROJECT_MAP) {
+    out = out.replace(new RegExp(`(${pattern})`, 'gi'), replacement);
+  }
+  for (const u of USER_HANDLES) {
+    out = out.replace(new RegExp(u, 'gi'), '<user>');
+  }
+  for (const [pattern, replacement] of DOMAIN_MAP) {
+    out = out.replace(new RegExp(pattern, 'gi'), replacement);
+  }
+  // IPv4 — replace all except a small allowlist
+  out = out.replace(IPV4_RE, (m) => (IPV4_KEEP.has(m) ? m : '<ip>'));
+  // generic path normalisation
+  out = out.replace(/\/(home|Users)\/[a-zA-Z0-9_-]+/g, '/home/<user>');
+  // github.com/<owner>/<repo> with already-redacted owner stays as is
+  return out;
+}
+
+function redactRecord(rec) {
+  const r = { ...rec };
+  if (r.ctx) {
+    r.ctx = {
+      ...r.ctx,
+      user_messages: (r.ctx.user_messages ?? []).map(secondPassRedact),
+      final_assistant_text: secondPassRedact(r.ctx.final_assistant_text ?? ''),
+      tools_available_inferred: r.ctx.tools_available_inferred ?? [],
+    };
+  }
+  return r;
+}
+
+const inLines  = readFileSync(IN, 'utf8').split('\n').filter(Boolean);
+const records  = inLines.map((l) => JSON.parse(l));
+const exported = records.map(redactRecord);
+
+writeFileSync(`${OUT}/train.jsonl`, exported.map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+// Distribution + redaction summary
+const dist = {};
+for (const r of exported) {
+  dist[r.expected] = (dist[r.expected] ?? 0) + 1;
+}
+
+const allBlob = JSON.stringify(exported);
+const leakCheck = {
+  project_names_remaining: Array.from(new Set(allBlob.match(
+    /\b(OpenClawBot|openclaw|vibebrowser|paperclip|Hermes|lamoom|opencode-plugins|agents-supervisor)\b/gi,
+  ) ?? [])),
+  user_handle_remaining:   Array.from(new Set(allBlob.match(/\bdzianisv\b/g) ?? [])),
+  raw_homedir_remaining:   Array.from(new Set(allBlob.match(/\/home\/[a-zA-Z0-9_-]+/g) ?? [])),
+};
+
+writeFileSync(`${OUT}/redaction-log.json`, JSON.stringify({
+  in: IN,
+  records: exported.length,
+  distribution: dist,
+  project_map: PROJECT_MAP.map(([p, r]) => ({ matched: p, replaced_with: r })),
+  user_handles_stripped: USER_HANDLES,
+  post_pass_leak_check: leakCheck,
+}, null, 2));
+
+console.log(`exported ${exported.length} records to ${OUT}/train.jsonl`);
+console.log('distribution:', dist);
+console.log('post-pass leak check:', leakCheck);
+
+function parseArgs(argv) {
+  const o = {};
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i].startsWith('--')) { o[argv[i].slice(2)] = argv[i + 1]; i++; }
+  }
+  return o;
+}
