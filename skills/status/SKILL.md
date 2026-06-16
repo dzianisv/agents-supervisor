@@ -25,6 +25,5 @@ Report the current supervisor state for this project.
    - Whether the current session id is in `.supervisor/disabled`.
 
 2. Summarize concisely for the user. If they asked to turn the supervisor on/off,
-   tell them: disable this session with
-   `echo "$(cat .supervisor/current_session)" >> .supervisor/disabled`, re-enable by
-   removing that line.
+   tell them: `/supervisor:off` to disable this session, `/supervisor:on` to re-enable.
+   For the whole plugin: `claude plugin disable supervisor@agents-supervisor`.

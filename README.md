@@ -47,14 +47,14 @@ claude plugin install supervisor@agents-supervisor
 
 **Switch off / on:**
 ```sh
-# whole plugin (all sessions)
+# whole plugin (all sessions) — run in terminal
 claude plugin disable supervisor@agents-supervisor
 claude plugin enable  supervisor@agents-supervisor
-
-# this session only (inside Claude Code)
-/supervisor off    # disable
-/supervisor on     # re-enable
 ```
+
+Inside an active Claude Code session:
+- `/supervisor:off` — disable for this session
+- `/supervisor:on` — re-enable for this session
 
 ### OpenCode
 Add to `opencode.json`:
