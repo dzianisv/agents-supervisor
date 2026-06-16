@@ -22,25 +22,39 @@ so both runtimes — and the trainer — share one brain.
 ## Quickstart (1 minute)
 
 ### Claude Code
+
+Run in your terminal:
+```sh
+claude plugin marketplace add dzianisv/agents-supervisor
+claude plugin install supervisor@agents-supervisor
 ```
-/plugin marketplace add dzianisv/agents-supervisor
-/plugin install supervisor
+The `Stop` hook is active in the next session. Verify:
+```sh
+claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
 ```
-Done — the `Stop` hook is active immediately. Then:
-- `/supervisor:status` — show effective patterns + recent verdicts
+
+Then, inside any Claude Code session:
+- `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 
-**Switch off / on:**
+> **Slash commands vs CLI:** `claude plugin ...` runs from your terminal; `/plugin ...` is the equivalent inside an active Claude Code session. Both work — use whichever fits your context.
+
+**Local dev install** (clone first, then):
+```sh
+claude plugin marketplace add /path/to/agents-supervisor
+claude plugin install supervisor@agents-supervisor
 ```
+
+**Switch off / on:**
+```sh
 # whole plugin (all sessions)
 claude plugin disable supervisor@agents-supervisor
 claude plugin enable  supervisor@agents-supervisor
 
-# this session only
-echo "$(cat .supervisor/current_session)" >> .supervisor/disabled          # off
-grep -v "$(cat .supervisor/current_session)" .supervisor/disabled > .supervisor/disabled.tmp && mv .supervisor/disabled.tmp .supervisor/disabled   # on
+# this session only (inside Claude Code)
+/supervisor off    # disable
+/supervisor on     # re-enable
 ```
-(Local dev install: `/plugin marketplace add /path/to/agents-supervisor` instead of the GitHub slug.)
 
 ### OpenCode
 Add to `opencode.json`:
