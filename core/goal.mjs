@@ -27,7 +27,7 @@ export function resolveMaxAttempts(opts = {}) {
   return DEFAULT_MAX_ATTEMPTS;
 }
 
-/** Parse `/supervisor:goal`/`/supervisor:retry` args into a typed action. */
+/** Parse `/supervisor:goal`/`/supervisor:retry`/`/supervisor:autopilot` args into a typed action. */
 export function parseSupervisorCommand(name, args) {
   const trimmed = (args ?? '').trim();
   if (name === 'goal') {
@@ -39,6 +39,13 @@ export function parseSupervisorCommand(name, args) {
     if (trimmed === '') return { kind: 'retry-status' };
     if (/^\d+$/.test(trimmed)) return { kind: 'retry-set', n: parseInt(trimmed, 10) };
     return { kind: 'retry-status' };
+  }
+  if (name === 'autopilot') {
+    const lower = trimmed.toLowerCase();
+    if (lower === '' || lower === 'on' || lower === 'true' || lower === 'start') return { kind: 'autopilot-on' };
+    if (lower === 'off' || lower === 'false' || lower === 'stop' || lower === 'exit') return { kind: 'autopilot-off' };
+    if (lower === 'status') return { kind: 'autopilot-status' };
+    return { kind: 'autopilot-on' };
   }
   return { kind: 'unknown', name };
 }
