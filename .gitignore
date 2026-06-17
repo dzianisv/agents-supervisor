@@ -1,5 +1,6 @@
 # Mined data + learned state — PRIVATE, never commit
 .dataset/
+.tasks/
 .supervisor/
 *.jsonl
 !evals/**/*.example.jsonl
