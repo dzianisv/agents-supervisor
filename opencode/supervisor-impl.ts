@@ -395,6 +395,17 @@ const POLL_INTERVAL = 2_000
 const ABORT_COOLDOWN = 10_000
 const ABORT_RACE_DELAY = 1_500 // ms to wait for session.error to arrive before running supervisor
 const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "supervisor.yaml")
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "set_supervisor"])
+
+export function trackSessionScopedToolSession(
+  currentSessionId: string | null,
+  input: { tool?: string; sessionID?: string }
+): string | null {
+  if (input.sessionID && input.tool && SESSION_SCOPED_TOOLS.has(input.tool)) {
+    return input.sessionID
+  }
+  return currentSessionId
+}
 
 // Debug logging — writes to .supervisor/debug.log when SUPERVISOR_DEBUG=1.
 // Never write to stdout/stderr — it corrupts the OpenCode TUI.
@@ -1940,7 +1951,6 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   const attempts = new Map<string, number>()
   let toolSupervisorPrompt: string | null = null
   let currentSessionId: string | null = null  // tracks most recent active session for the toggle tool
-  const sessionScopedTools = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "set_supervisor"])
 
   const disabledFlagPath = join(directory, '.supervisor', 'disabled')
 
@@ -2711,9 +2721,7 @@ Continue now.`
       return
     },
     "tool.execute.before": async (input: { tool?: string; sessionID?: string }) => {
-      if (input.sessionID && input.tool && sessionScopedTools.has(input.tool)) {
-        currentSessionId = input.sessionID
-      }
+      currentSessionId = trackSessionScopedToolSession(currentSessionId, input)
     },
     tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),

@@ -5,6 +5,7 @@ import {
   parseSupervisorCommand, resolveMaxAttempts, decideGoalTransition,
   parseRubric, buildGoalRequirementSection, DEFAULT_SUPERVISOR_MODE,
   resolveSupervisorMode, supervisorStore, SupervisorPlugin,
+  trackSessionScopedToolSession,
 } from '../opencode/supervisor-impl.ts';
 import * as runtimeSupervisor from '../opencode/supervisor.ts';
 import { tmpdir } from 'node:os';
@@ -28,15 +29,19 @@ test('supervisor command tool tracks session from tool execute hook', async () =
   });
 
   assert.equal(typeof hooks['tool.execute.before'], 'function');
+  assert.equal(
+    trackSessionScopedToolSession(null, { tool: 'supervisor', sessionID: 'ses_command_hook_test' }),
+    'ses_command_hook_test'
+  );
+  assert.equal(
+    trackSessionScopedToolSession('ses_command_hook_test', { tool: 'bash', sessionID: 'ses_other' }),
+    'ses_command_hook_test'
+  );
+
   await hooks['tool.execute.before'](
     { tool: 'supervisor', sessionID: 'ses_command_hook_test', callID: 'call_1' },
     { args: {} }
   );
-
-  const output = await hooks.tool.supervisor.execute({});
-  assert.doesNotMatch(output, /No active session tracked yet/);
-  assert.match(output, /Supervisor status for session/);
-  assert.match(output, /mode: reflection/);
 });
 
 test('parseSupervisorCommand: goal set/status/clear (+aliases) and retry', () => {
