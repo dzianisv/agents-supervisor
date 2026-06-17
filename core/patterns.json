@@ -49,7 +49,7 @@
       "name": "stopped_with_todos",
       "weight_pct": 30,
       "maps_to": "summary_drift_stop",
-      "rule": "STOPPED-WITH-TODOS (~30%): the response lists \"Remaining Tasks\"/\"Next steps\"/\"Still TODO\"/\"What I did NOT do\" or names a verify/run/check/create-PR step as \"next\" — then stops without doing it. Listing remaining work does not complete it → classify as summary_drift_stop."
+      "rule": "STOPPED-WITH-TODOS (~30%): the response lists \"Remaining Tasks\"/\"Next steps\"/\"Still TODO\"/\"What I did NOT do\"/\"Outstanding Work\" or names a verify/run/check/create-PR step as \"next\" — then stops without doing it. FIRST-OCCURRENCE IS SUFFICIENT: do NOT wait for a second signal; 98% of these are premature (user says \"continue\"). TERMINAL-POSITION TEST: the list appears in the LAST ~40% of the response with NO subsequent tool calls or execution following it. A mid-response \"here's what I did\" followed by actual execution is process narration (complete), not a stop-with-todos. Listing remaining work does not complete it → classify as summary_drift_stop."
     },
     {
       "name": "false_complete",
@@ -65,6 +65,11 @@
       "name": "retry_loop",
       "maps_to": "genuinely_stuck",
       "rule": "RETRY-LOOP: the agent repeats the same failing approach (same command / same edit / same deploy) across turns without changing strategy. Repeating a failed action is not progress → genuinely_stuck; the nudge should force a different approach or an explicit blocker statement."
+    },
+    {
+      "name": "verification_deferral",
+      "maps_to": "summary_drift_stop",
+      "rule": "VERIFICATION-DEFERRAL: agent wrote/edited code (write/edit tool calls present in tool commands) but the response ends without running tests, build, or lint — and the task type requires verification (fix/implement/add/create/build/refactor). The agent should run verification before stopping → classify as summary_drift_stop."
     },
     {
       "name": "legitimate_stop",
@@ -113,14 +118,16 @@
     {"label": "Q — summary_drift_stop", "note": "'Let me now' + cut-off mid-action, NO closing result", "final": "Let me apply all 3 fixes now. First I need to update auth.ts... Now I need to add the validation step...", "output": {"category": "summary_drift_stop", "reason": "committed action ('Let me') + mid-action with no closing result", "confidence": 0.9}},
     {"label": "R — complete", "note": "multi-step process narration that ENDS with delivery — closing dominates", "final": "Let me read the file. Now let me check the webhook URL. Let me apply all 3 fixes. ... All 1241 unit tests pass, TypeScript compiles clean. Fixes committed and pushed to PR #1043.", "output": {"category": "complete", "reason": "closing delivery (tests pass + PR pushed) overrides intermediate 'Let me' phrases", "confidence": 0.9}},
     {"label": "S — complete", "note": "imperative guidance to user, not agent self-action", "final": "Autocompact thrashing. Try reading in smaller chunks, or use /clear to start fresh.", "output": {"category": "complete", "reason": "imperative guidance directed at user, not agent commitment", "confidence": 0.9}},
-    {"label": "T — complete", "note": "present-tense process narration ENDS with verdict — closing dominates", "final": "I'm checking whether the blocked conclusion missed usable context. ... Review failed — incomplete task and missed available context/security risk.", "output": {"category": "complete", "reason": "checklist + verdict delivered; intermediate 'I'm checking' was process narration", "confidence": 0.9}}
+    {"label": "T — complete", "note": "present-tense process narration ENDS with verdict — closing dominates", "final": "I'm checking whether the blocked conclusion missed usable context. ... Review failed — incomplete task and missed available context/security risk.", "output": {"category": "complete", "reason": "checklist + verdict delivered; intermediate 'I'm checking' was process narration", "confidence": 0.9}},
+    {"label": "U — summary_drift_stop", "note": "terminal-position todo list, first occurrence sufficient", "final": "## Summary\nI've investigated the CI failure and identified the root cause.\n\n## Next Steps\n1. Fix the failing assertion in auth.test.ts\n2. Run the test suite locally\n3. Push and verify CI passes", "output": {"category": "summary_drift_stop", "reason": "terminal-position numbered plan — first occurrence, agent owns all steps, none executed", "confidence": 0.9}}
   ],
   "feedback": {
     "max_inject_attempt": 3,
     "inject_categories": [
       "summary_drift_stop",
       "tool_available_punt",
-      "genuinely_stuck"
+      "genuinely_stuck",
+      "verification_deferral"
     ],
     "templates": {
       "summary_drift_stop": {
@@ -157,6 +164,18 @@
           "You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence.",
           "Second time. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If you are blocked, say exactly what is blocking you and what you already tried. If you are not blocked, make a tool call.",
           "Third inject. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If this approach is not working, try a completely different strategy. Next response must be a tool call, code, or an explicit blocker statement. Session closes after this."
+        ]
+      },
+      "verification_deferral": {
+        "reasons": [
+          "verification_deferral: code written but not verified",
+          "verification_deferral: second inject — still not verified",
+          "verification_deferral: final inject before session close"
+        ],
+        "messages": [
+          "You wrote code but did not run tests/build/lint. Run verification now before stopping. {stepClause}",
+          "Second time. You wrote code but STILL did not verify. Run the test/build command NOW. {stepClause}",
+          "Third inject. Code unverified. Run tests/build immediately or state what blocks you. {stepClause}"
         ]
       }
     }

@@ -12,7 +12,7 @@ test('shipped patterns: 6 categories, correct inject set', () => {
     'summary_drift_stop', 'genuinely_stuck', 'working',
   ]);
   assert.deepEqual([...injectCategories(shipped)].sort(),
-    ['genuinely_stuck', 'summary_drift_stop', 'tool_available_punt']);
+    ['genuinely_stuck', 'summary_drift_stop', 'tool_available_punt', 'verification_deferral']);
 });
 
 test('deepMerge: objects merge, arrays/scalars replace', () => {
