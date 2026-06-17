@@ -1388,6 +1388,124 @@ ${rb.patterns}
 ${rb.antipatterns}`
 }
 
+/**
+ * Interpolate a simple mustache-like template:
+ * - {{variable}} → replaced with value
+ * - {{#section}}...{{/section}} → included only if variable is truthy
+ */
+function interpolateTemplate(template: string, vars: Record<string, string | undefined>): string {
+  // Handle conditional sections: {{#key}}...{{/key}}
+  let result = template.replace(
+    /\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
+    (_match, key: string, content: string) => {
+      const value = vars[key]
+      if (!value) return ""
+      // Within the section, also interpolate variables
+      return content.replace(/\{\{(\w+)\}\}/g, (_m: string, k: string) => vars[k] ?? "")
+    }
+  )
+  // Handle remaining simple variables
+  result = result.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => vars[key] ?? "")
+  return result
+}
+
+/**
+ * Build the reflection prompt by reading 3 external files and interpolating:
+ *   1. .agents/supervisor/SystemPrompt.md — template with {{variable}} placeholders
+ *   2. .agents/supervisor/Patterns.md — patterns & antipatterns
+ *   3. .agents/supervisor/User.md — user-editable overrides
+ *
+ * Falls back to embedded defaults (buildSelfAssessmentPrompt equivalent) if files
+ * are missing, so the plugin works without the files on disk.
+ */
+async function buildReflectionPromptFromFiles(
+  directory: string,
+  context: TaskContext,
+  agents: string,
+  lastAssistantText: string | undefined,
+  attemptCount: number | undefined,
+  maxAttempts: number | undefined,
+  goalSection?: string
+): Promise<string> {
+  const basePath = join(directory, ".agents", "supervisor")
+
+  // Attempt to read each file; null if not found
+  async function tryRead(filename: string): Promise<string | null> {
+    try {
+      return await readFile(join(basePath, filename), "utf-8")
+    } catch {
+      return null
+    }
+  }
+
+  const [systemPromptFile, patternsFile, userFile] = await Promise.all([
+    tryRead("SystemPrompt.md"),
+    tryRead("Patterns.md"),
+    tryRead("User.md"),
+  ])
+
+  // Build context variables for interpolation
+  const safeContext = {
+    ...context,
+    detectedSignals: Array.isArray(context.detectedSignals) ? context.detectedSignals : []
+  }
+
+  const requirements: string[] = []
+  if (safeContext.requiresTests) requirements.push("Tests required (run after latest changes)")
+  if (safeContext.requiresBuild) requirements.push("Build/compile required")
+  if (safeContext.requiresPR) requirements.push("PR required (include link)")
+  if (safeContext.requiresCI) requirements.push("CI checks required (verify status)")
+  if (safeContext.requiresLocalTests) requirements.push("Local tests required (must run in this session)")
+  if (safeContext.pushedToDefaultBranch) requirements.push("Detected direct push to default branch (must be avoided)")
+  if (requirements.length === 0) requirements.push("No explicit workflow gates detected")
+
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const currentAttempt = attemptCount || 0
+
+  const templateVars: Record<string, string | undefined> = {
+    taskSummary: safeContext.taskSummary,
+    taskType: safeContext.taskType,
+    agentMode: safeContext.agentMode,
+    requirements: requirements.join("; "),
+    signals: safeContext.detectedSignals.length ? safeContext.detectedSignals.join(", ") : "none",
+    toolsSummary: safeContext.toolsSummary,
+    lastAssistantText: lastAssistantText ? lastAssistantText.slice(0, 4000) : undefined,
+    attemptSection: currentAttempt > 0 ? "true" : undefined,
+    attemptNumber: String(currentAttempt + 1),
+    maxAttempts: String(effectiveCap),
+    projectInstructions: agents ? agents.slice(0, 800) : undefined,
+    goalSection: goalSection || undefined,
+  }
+
+  // If the system prompt file exists, use the file-based approach
+  if (systemPromptFile) {
+    const interpolated = interpolateTemplate(systemPromptFile, templateVars)
+    const parts = [interpolated]
+    if (patternsFile) {
+      parts.push(patternsFile)
+    }
+    if (userFile && userFile.trim() !== "") {
+      parts.push(userFile)
+    }
+    return parts.join("\n\n")
+  }
+
+  // Fallback: build prompt using the same logic as buildSelfAssessmentPrompt
+  // (for projects that don't have the 3-file structure yet)
+  const rubric = parseRubric(DEFAULT_RUBRIC)
+  const effRubric: Rubric = goalSection
+    ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+    : rubric
+  return buildSelfAssessmentPrompt(
+    context,
+    agents,
+    lastAssistantText,
+    currentAttempt,
+    effRubric,
+    effectiveCap
+  )
+}
+
 function parseSelfAssessmentJson(text: string | null | undefined): SelfAssessment | null {
   if (typeof text !== "string") return null
   const jsonMatch = text.match(/\{[\s\S]*\}/)
@@ -2191,19 +2309,21 @@ Continue now.`
         }
 
         // When a goal is active, its condition is the strongest stated intent and
-        // MUST compose with the existing gates: build the DEFAULT rubric prompt
-        // with the goal requirement appended, bypassing file/tool precedence.
+        // MUST compose with the existing gates.
         const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
         const effRubric: Rubric = goalSection
           ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
           : rubric
-        const defaultSupervisorPrompt = buildSelfAssessmentPrompt(
+
+        // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
+        const defaultSupervisorPrompt = await buildReflectionPromptFromFiles(
+          directory,
           context,
           agents,
           lastAssistantText,
           currentAttemptCount,
-          effRubric,
-          effectiveMaxAttempts
+          effectiveMaxAttempts,
+          goalSection || undefined
         )
         let supervisorPrompt: string
         let effectiveToolSupervisorPrompt: string | null
