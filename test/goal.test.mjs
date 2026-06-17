@@ -3,8 +3,41 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseSupervisorCommand, resolveMaxAttempts, decideGoalTransition,
-  parseRubric, buildGoalRequirementSection,
-} from '../opencode/supervisor.ts';
+  parseRubric, buildGoalRequirementSection, DEFAULT_SUPERVISOR_MODE,
+  resolveSupervisorMode, supervisorStore, SupervisorPlugin,
+} from '../opencode/supervisor-impl.ts';
+import * as runtimeSupervisor from '../opencode/supervisor.ts';
+import { tmpdir } from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const mkcwd = () => fs.mkdtempSync(path.join(tmpdir(), 'sup-opencode-goal-'));
+
+test('runtime supervisor entrypoint exports only plugin functions', () => {
+  assert.equal(typeof runtimeSupervisor.default, 'function');
+  assert.deepEqual(
+    Object.entries(runtimeSupervisor).filter(([, value]) => typeof value !== 'function'),
+    []
+  );
+});
+
+test('supervisor command tool tracks session from tool execute hook', async () => {
+  const hooks = await SupervisorPlugin({
+    client: {},
+    directory: mkcwd(),
+  });
+
+  assert.equal(typeof hooks['tool.execute.before'], 'function');
+  await hooks['tool.execute.before'](
+    { tool: 'supervisor', sessionID: 'ses_command_hook_test', callID: 'call_1' },
+    { args: {} }
+  );
+
+  const output = await hooks.tool.supervisor.execute({});
+  assert.doesNotMatch(output, /No active session tracked yet/);
+  assert.match(output, /Supervisor status for session/);
+  assert.match(output, /mode: reflection/);
+});
 
 test('parseSupervisorCommand: goal set/status/clear (+aliases) and retry', () => {
   assert.deepEqual(parseSupervisorCommand('goal', 'all tests pass'), { kind: 'goal-set', condition: 'all tests pass' });
@@ -14,6 +47,42 @@ test('parseSupervisorCommand: goal set/status/clear (+aliases) and retry', () =>
   }
   assert.deepEqual(parseSupervisorCommand('retry', '24'), { kind: 'retry-set', n: 24 });
   assert.deepEqual(parseSupervisorCommand('retry', ''), { kind: 'retry-status' });
+});
+
+test('parseSupervisorCommand: root supervisor supports mode UX', () => {
+  assert.deepEqual(parseSupervisorCommand('supervisor', ''), { kind: 'supervisor-status' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'status'), { kind: 'supervisor-status' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'off'), { kind: 'supervisor-off' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'on'), { kind: 'supervisor-on' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'autopilot'), { kind: 'mode-set', mode: 'autopilot' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'reminder'), { kind: 'mode-set', mode: 'autopilot' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'reflection'), { kind: 'mode-set', mode: 'reflection' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'goal all tests pass'), { kind: 'goal-set', condition: 'all tests pass' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'goal clear'), { kind: 'goal-clear' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'retry 24'), { kind: 'retry-set', n: 24 });
+});
+
+test('supervisorStore persists mode and resolves legacy autopilot state', async () => {
+  const d = mkcwd();
+  assert.equal(DEFAULT_SUPERVISOR_MODE, 'reflection');
+  assert.equal(resolveSupervisorMode({}), 'reflection');
+  assert.equal(resolveSupervisorMode({ autopilot: true }), 'autopilot');
+
+  await supervisorStore.setMode(d, 's1', 'autopilot');
+  assert.equal(resolveSupervisorMode(await supervisorStore.load(d, 's1')), 'autopilot');
+
+  await supervisorStore.setAutopilot(d, 's1', false);
+  const reflected = await supervisorStore.load(d, 's1');
+  assert.equal(reflected.mode, 'reflection');
+  assert.equal(reflected.autopilot, false);
+
+  await supervisorStore.setGoal(d, 's1', 'ship it');
+  const goalState = await supervisorStore.load(d, 's1');
+  assert.equal(goalState.mode, 'goal');
+  assert.equal(goalState.autopilot, false);
+
+  await supervisorStore.clearGoal(d, 's1');
+  assert.equal((await supervisorStore.load(d, 's1')).mode, 'reflection');
 });
 
 test('resolveMaxAttempts: sessionOverride > config > default 16, clamped [1,100]', () => {
