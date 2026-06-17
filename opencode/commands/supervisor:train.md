@@ -1,7 +1,5 @@
 ---
 description: Train the supervisor on recent sessions and update your local patterns/anti-patterns.
-agent: build
-subtask: true
 ---
 Run the supervisor training loop by calling the `supervisor_train` tool.
 

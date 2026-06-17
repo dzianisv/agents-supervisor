@@ -62,7 +62,11 @@ Add to `opencode.json`:
 { "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
 ```
 or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
-- `/supervisor` — status · `/supervisor:train` — learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
+- `/supervisor` - status, including enabled state, effective mode, goal, and retry budget
+- `/supervisor autopilot` - continue on every idle without judge latency
+- `/supervisor goal <condition>` - keep pushing until the condition is met
+- `/supervisor reflection` - return to the default completion-judge mode
+- `/supervisor:train` - learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
 
 **Switch off / on:**
 ```
@@ -71,13 +75,28 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
 ```
 Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
 
-## Supervisor mode — goal loop (both runtimes)
+## Supervisor modes
+
+OpenCode exposes three public supervisor modes:
+
+| Mode | Command | Behavior |
+|---|---|---|
+| `reflection` | `/supervisor reflection` | Default. Runs the normal completion judge on idle. |
+| `goal` | `/supervisor goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
+| `autopilot` | `/supervisor autopilot` | Skips the judge and continues on every idle until `autopilot_exit` or budget exhaustion. |
+
+The effective default mode is `reflection`. Legacy colon commands remain aliases:
+`/supervisor:goal`, `/supervisor:retry`, and `/supervisor:autopilot`.
+
+## Goal mode (both runtimes)
 
 Beyond catching premature stops, you can point the supervisor at a **goal** it must
 demonstrably meet before it lets the agent stop — it keeps re-prompting (up to a
 retry budget) until the goal's met or the budget runs out.
 
 ```
+/supervisor goal all tests in test/auth pass and the PR is open with green CI
+/supervisor goal clear
 /supervisor:goal all tests in test/auth pass and the PR is open with green CI
 /supervisor:goal              # check status (condition, attempts, last reason)
 /supervisor:goal clear        # clear (aliases: stop, off, reset, none, cancel)
@@ -91,7 +110,7 @@ goal is active the retry budget rises to 16 (vs 3 normally). State is per-sessio
 continuation actually fires.
 
 - **Claude Code:** `/supervisor:goal` / `/supervisor:retry` skills (the `Stop` hook enforces it).
-- **OpenCode:** same commands in the TUI; in the web app call the `supervisor_goal` / `supervisor_retry` tools.
+- **OpenCode:** prefer `/supervisor goal <condition>` and `/supervisor retry N` in the TUI; colon commands remain aliases. In the web app call the `supervisor` or `supervisor_goal` / `supervisor_retry` tools.
 
 **Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
 `~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
@@ -106,6 +125,8 @@ completion. No evaluation overhead, no latency from judge round-trips — just a
 prescriptive nudge to keep working.
 
 ```
+/supervisor autopilot          # enable primary UX
+/supervisor reflection         # disable and return to default reflection mode
 /supervisor:autopilot           # enable (aliases: on, true, start)
 /supervisor:autopilot off       # disable (aliases: false, stop, exit)
 /supervisor:autopilot status    # check current state

@@ -16,8 +16,19 @@ import path from 'node:path';
 
 export const DEFAULT_MAX_ATTEMPTS = 16;
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000;
+export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'goal', 'reflection']);
+export const DEFAULT_SUPERVISOR_MODE = 'reflection';
 
 const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'cancel']);
+const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
+const AUTOPILOT_COMPAT_ALIASES = new Set(['static', 'reminder', 'auto-reminder']);
+
+export function resolveSupervisorMode(state = {}) {
+  if (SUPERVISOR_MODE_SET.has(state.mode)) return state.mode;
+  if (state.autopilot === true) return 'autopilot';
+  if (state.goal?.status === 'active') return 'goal';
+  return DEFAULT_SUPERVISOR_MODE;
+}
 
 /** Priority: sessionOverride > config > 16. Clamped [1,100]; non-finite ignored. */
 export function resolveMaxAttempts(opts = {}) {
@@ -27,9 +38,23 @@ export function resolveMaxAttempts(opts = {}) {
   return DEFAULT_MAX_ATTEMPTS;
 }
 
-/** Parse `/supervisor:goal`/`/supervisor:retry`/`/supervisor:autopilot` args into a typed action. */
+/** Parse `/supervisor` and colon command args into a typed action. */
 export function parseSupervisorCommand(name, args) {
   const trimmed = (args ?? '').trim();
+  if (name === 'supervisor') {
+    if (trimmed === '') return { kind: 'supervisor-status' };
+    const [head = '', ...rest] = trimmed.split(/\s+/);
+    const lower = head.toLowerCase();
+    const tail = rest.join(' ');
+    if (lower === 'status') return { kind: 'supervisor-status' };
+    if (lower === 'off') return { kind: 'supervisor-off' };
+    if (lower === 'on') return { kind: 'supervisor-on' };
+    if (lower === 'autopilot' || AUTOPILOT_COMPAT_ALIASES.has(lower)) return { kind: 'mode-set', mode: 'autopilot' };
+    if (lower === 'reflection') return { kind: 'mode-set', mode: lower };
+    if (lower === 'goal') return parseSupervisorCommand('goal', tail);
+    if (lower === 'retry') return parseSupervisorCommand('retry', tail);
+    return { kind: 'supervisor-status' };
+  }
   if (name === 'goal') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
@@ -118,14 +143,30 @@ export const goalStore = {
       tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
       deadline: now + maxDurationMs, lastReason: '',
     };
+    state.mode = 'goal';
+    state.autopilot = false;
     goalStore.save(cwd, sessionId, state);
     return state;
   },
   clearGoal(cwd, sessionId) {
     const state = goalStore.load(cwd, sessionId);
     delete state.goal;
+    state.mode = DEFAULT_SUPERVISOR_MODE;
+    state.autopilot = false;
     goalStore.save(cwd, sessionId, state);
     return state;
+  },
+  setMode(cwd, sessionId, mode) {
+    if (!SUPERVISOR_MODE_SET.has(mode)) throw new Error(`Invalid supervisor mode: ${JSON.stringify(mode)}`);
+    const state = goalStore.load(cwd, sessionId);
+    state.mode = mode;
+    state.autopilot = mode === 'autopilot';
+    if (mode !== 'goal') delete state.goal;
+    goalStore.save(cwd, sessionId, state);
+    return state;
+  },
+  setAutopilot(cwd, sessionId, enabled) {
+    return goalStore.setMode(cwd, sessionId, enabled ? 'autopilot' : DEFAULT_SUPERVISOR_MODE);
   },
   setRetry(cwd, sessionId, n) {
     const state = goalStore.load(cwd, sessionId);

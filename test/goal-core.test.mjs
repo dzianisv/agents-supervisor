@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   goalStore, resolveMaxAttempts, decideGoalTransition,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode,
 } from '../core/goal.mjs';
 
 const mkcwd = () => fs.mkdtempSync(path.join(tmpdir(), 'sup-goal-'));
@@ -48,4 +49,39 @@ test('parseSupervisorCommand + buildGoalRequirementSection (shared logic)', () =
   assert.equal(parseSupervisorCommand('goal', 'off').kind, 'goal-clear');
   assert.match(buildGoalRequirementSection('ship it'), /MANDATORY/);
   assert.equal(buildGoalRequirementSection(''), '');
+});
+
+test('parseSupervisorCommand supports root /supervisor mode UX', () => {
+  assert.deepEqual(parseSupervisorCommand('supervisor', ''), { kind: 'supervisor-status' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'status'), { kind: 'supervisor-status' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'off'), { kind: 'supervisor-off' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'on'), { kind: 'supervisor-on' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'autopilot'), { kind: 'mode-set', mode: 'autopilot' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'static'), { kind: 'mode-set', mode: 'autopilot' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'reflection'), { kind: 'mode-set', mode: 'reflection' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'goal'), { kind: 'goal-status' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'goal clear'), { kind: 'goal-clear' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'goal all tests pass'), { kind: 'goal-set', condition: 'all tests pass' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'retry 24'), { kind: 'retry-set', n: 24 });
+});
+
+test('goalStore persists supervisor mode and resolves legacy state', () => {
+  const d = mkcwd();
+  assert.equal(DEFAULT_SUPERVISOR_MODE, 'reflection');
+  assert.equal(resolveSupervisorMode({}), 'reflection');
+  assert.equal(resolveSupervisorMode({ autopilot: true }), 'autopilot');
+  assert.equal(resolveSupervisorMode({ goal: { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 9e9, lastReason: '' } }), 'goal');
+
+  goalStore.setGoal(d, 's3', 'ship it');
+  assert.equal(goalStore.load(d, 's3').mode, 'goal');
+  assert.equal(goalStore.load(d, 's3').autopilot, false);
+
+  goalStore.setMode(d, 's3', 'autopilot');
+  assert.equal(goalStore.load(d, 's3').mode, 'autopilot');
+  assert.equal(goalStore.load(d, 's3').goal, undefined);
+  assert.equal(resolveSupervisorMode(goalStore.load(d, 's3')), 'autopilot');
+
+  goalStore.setAutopilot(d, 's3', false);
+  assert.equal(goalStore.load(d, 's3').mode, 'reflection');
+  assert.equal(goalStore.load(d, 's3').autopilot, false);
 });
