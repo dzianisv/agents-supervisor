@@ -1,15 +1,23 @@
 ---
-description: Show supervisor status, or set guidance / toggle on-off for this session.
-agent: build
+description: Show supervisor status or switch supervisor modes for this session.
 ---
-Inspect and control the supervisor for this project.
+Inspect and control the supervisor for this project. The primary modes are
+`reflection` (default), `goal`, and `autopilot`.
 
-If the user just typed `/supervisor`, call the `supervisor` tool to report status
-(effective patterns, recent verdicts, whether this session is disabled).
+Do not use the `task` tool or delegate to a subagent. Call the supervisor tools
+directly in this session so the plugin-provided tools are available.
+
+If the user just typed `/supervisor`, call the `supervisor` tool with no args to
+report status: enabled/disabled state, effective mode, goal, and retry budget.
 
 Interpret `$ARGUMENTS`:
-- `off` / `on` → call the `supervisor` tool with that action to disable/enable the
-  judge for THIS session only.
-- a plan/checklist → call `set_supervisor` with it as `guidance` so the judge
-  validates completion against those steps.
-- anything else → report current status.
+- empty / `status` -> call `supervisor` with no args.
+- `off` / `on` -> call `supervisor` with that action to disable/enable the
+  supervisor for THIS session only. These are not modes.
+- `autopilot` -> call `supervisor` with `mode: "autopilot"`.
+- `reflection` -> call `supervisor` with `mode: "reflection"`.
+- `goal <condition>` -> call `supervisor_goal` with the remaining text.
+- exactly `goal` -> call `supervisor_goal` with no args.
+- `goal clear` -> call `supervisor_goal` with `clear: true`.
+- `retry N` -> call `supervisor_retry` with `n: N`.
+- otherwise -> call `set_supervisor` with `$ARGUMENTS` as guidance.
