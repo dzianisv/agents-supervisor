@@ -1,0 +1,2780 @@
+/**
+ * Supervisor Plugin for OpenCode
+ *
+ * Consolidated supervisor layer that combines self-assessment with workflow checks.
+ * Uses a dynamic prompt (task + workflow requirements) unless supervisor.md overrides it.
+ * Ensures tests/build/PR/CI checks are verified before completion.
+ */
+
+import type { Plugin } from "@opencode-ai/plugin"
+import { readFile, writeFile, mkdir, stat, appendFile, readdir, chmod } from "fs/promises"
+import { join, dirname } from "path"
+import { homedir } from "os"
+import { fileURLToPath } from "url"
+import { execFile } from "child_process"
+// Shared goal-loop DECISION logic — single source of truth across runtimes.
+// (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
+import {
+  resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  decideGoalTransition, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS,
+  resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
+} from "../core/goal.mjs"
+export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
+
+// Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
+async function reportError(err: unknown, context?: Record<string, string>): Promise<void> {
+  try {
+    const Sentry = await import("@sentry/node")
+    if (!Sentry.isInitialized()) return
+    Sentry.captureException(err, context ? { tags: context } : undefined)
+  } catch {}
+}
+
+const SELF_ASSESSMENT_MARKER = "## Supervisor Self-Assessment"
+const FEEDBACK_MARKER = "## Supervisor:"
+// DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS, resolveMaxAttempts now come
+// from ../core/goal.mjs (shared with the Claude Code side).
+
+/**
+ * Read the top-level `maxAttempts:` integer from ~/.config/opencode/supervisor.yaml.
+ * Returns undefined if the file is missing, the key is absent, or the value is invalid.
+ */
+async function loadConfiguredMaxAttempts(): Promise<number | undefined> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith("#")) continue
+      const match = line.match(/^maxAttempts\s*:\s*(\S+)/)
+      if (match) {
+        const raw = match[1].trim()
+        if (/^\d+$/.test(raw)) {
+          const value = parseInt(raw, 10)
+          if (Number.isFinite(value)) return value
+        }
+      }
+    }
+  } catch {}
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor per-session persistence (supervisorStore)
+//
+// Stores goal + retry state at <directory>/.supervisor/goals/<sessionId>.json
+// so supervisor decisions survive across tool invocations within a session.
+// ---------------------------------------------------------------------------
+
+export interface SupervisorGoal {
+  condition: string
+  status: "active" | "paused" | "achieved" | "cleared" | "exhausted"
+  attempts: number
+  tokenBaseline: number
+  startedAt: number
+  deadline: number
+  lastReason: string
+}
+
+export type SupervisorMode = "autopilot" | "goal" | "reflection"
+
+export interface SupervisorState {
+  maxAttempts?: number       // /supervisor:retry override (optional)
+  goal?: SupervisorGoal
+  mode?: SupervisorMode
+  autopilot?: boolean        // autopilot mode: skip judge, always continue
+}
+
+function supervisorDir(directory: string): string {
+  return join(directory, ".supervisor", "goals")
+}
+
+/** Guard against path-traversal attacks via a malformed sessionId. */
+function assertSafeSessionId(sessionId: string): void {
+  if (!sessionId || sessionId.includes("/") || sessionId.includes("\\") || sessionId.includes("..")) {
+    throw new Error(`Invalid sessionId: ${JSON.stringify(sessionId)}`)
+  }
+}
+
+function supervisorPath(directory: string, sessionId: string): string {
+  return join(supervisorDir(directory), `${sessionId}.json`)
+}
+
+export const supervisorStore = {
+  async load(directory: string, sessionId: string): Promise<SupervisorState> {
+    try {
+      const content = await readFile(supervisorPath(directory, sessionId), "utf-8")
+      return JSON.parse(content) as SupervisorState
+    } catch {
+      return {}
+    }
+  },
+
+  async save(directory: string, sessionId: string, state: SupervisorState): Promise<void> {
+    assertSafeSessionId(sessionId)
+    const dir = supervisorDir(directory)
+    await mkdir(dir, { recursive: true })
+    const filePath = supervisorPath(directory, sessionId)
+    await writeFile(filePath, JSON.stringify(state, null, 2), { mode: 0o600 })
+    await chmod(filePath, 0o600)
+  },
+
+  async setGoal(
+    directory: string,
+    sessionId: string,
+    condition: string,
+    opts?: { tokenBaseline?: number; now?: number; maxDurationMs?: number }
+  ): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    const now = opts?.now ?? Date.now()
+    const maxDurationMs = opts?.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS
+    state.goal = {
+      condition,
+      status: "active",
+      attempts: 0,
+      tokenBaseline: opts?.tokenBaseline ?? 0,
+      startedAt: now,
+      deadline: now + maxDurationMs,
+      lastReason: "",
+    }
+    state.mode = "goal"
+    state.autopilot = false
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async clearGoal(directory: string, sessionId: string): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    delete state.goal
+    state.mode = DEFAULT_SUPERVISOR_MODE
+    state.autopilot = false
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setMode(directory: string, sessionId: string, mode: SupervisorMode): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.mode = mode
+    state.autopilot = mode === "autopilot"
+    if (mode !== "goal") delete state.goal
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setRetry(directory: string, sessionId: string, n: number): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.maxAttempts = n
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setAutopilot(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    return supervisorStore.setMode(directory, sessionId, enabled ? "autopilot" : DEFAULT_SUPERVISOR_MODE)
+  },
+
+  async list(directory: string): Promise<string[]> {
+    try {
+      const dir = supervisorDir(directory)
+      const entries = await readdir(dir, { withFileTypes: true })
+      // Build result in a local array to ensure consistent realm in ESM environments
+      const ids: string[] = []
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith(".json")) ids.push(e.name.slice(0, -".json".length))
+      }
+      return ids
+    } catch {
+      return []
+    }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// parseSupervisorCommand — pure parser for /supervisor:* command names
+//
+// Maps a command name + its argument string to a discriminated action.
+// No I/O. Safe to call from any context.
+// ---------------------------------------------------------------------------
+
+// parseSupervisorCommand now imported from ../core/goal.mjs (shared).
+
+// ---------------------------------------------------------------------------
+// buildGoalRequirementSection — prompt fragment for active session goals
+//
+// Appended to the judge/self-assessment rubric when a goal is active. Pure,
+// no I/O. Returns an empty string for blank conditions (caller should skip
+// appending in that case).
+// ---------------------------------------------------------------------------
+
+// buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
+
+// ---------------------------------------------------------------------------
+// decideGoalTransition — pure decision for an active session goal
+//
+// Given the current goal, the judge's verdict, and the budget, decide the next
+// goal state. No I/O; returns a NEW goal object (never mutates the input).
+// Applied in strict order: budget exhaustion FIRST (attempts cap or deadline),
+// then achievement, then continuation (which increments attempts).
+// ---------------------------------------------------------------------------
+
+// decideGoalTransition now imported from ../core/goal.mjs (shared decision logic).
+
+// ---------------------------------------------------------------------------
+// Supervisor rubric (configurable patterns/antipatterns)
+//
+// The judge's positive completion rules ("Patterns") and the mined
+// premature-stop rules ("Antipatterns") were historically hardcoded inline in
+// two prompt builders. They now live in this single embedded default, which
+// users can override with a rubric.md file (see loadRubric). The embedded
+// default keeps the single-file `cp supervisor-3.ts` install working.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_RUBRIC = `## Patterns
+- If coding work is complete, confirm tests ran after the latest changes and passed.
+- If local tests are required, provide the exact commands run in this session.
+- If PR exists, verify CI checks and report status.
+- Tests cannot be skipped or marked as flaky/not important.
+- Direct pushes to main/master are not allowed; require a PR instead.
+- If stuck, propose an alternate approach.
+- If you need user action (auth, 2FA, credentials, access requests, uploads, approvals), list it in needs_user_action.
+- PLANNING LOOP CHECK: If the task requires code changes (fix, implement, add, create, build, refactor, update) but the tool commands show ONLY read operations (read, glob, grep, git log, git status, git diff, webfetch, task/explore) and NO write operations (edit, write, bash with build/test/commit, github_create_pull_request, etc.), then the task is NOT complete. Set status to "in_progress", set stuck to true, and list "Implement the actual code changes" in remaining_work. Analyzing and recommending changes is not the same as making them.
+- If you are repeating the same actions (deploy, test, build) without making progress, set "stuck": true.
+- Do not retry the same failing approach more than twice — try something different or report stuck.
+
+## Antipatterns
+PREMATURE-STOP ANTIPATTERNS (mined from 227 real agent stops where the user replied; 78% were premature — the user said "go"/"continue"/"yes do it" or corrected the agent). If the agent's last response matches one of these AND executable work remains, the task is NOT complete — set status "in_progress", and put the concrete next action in remaining_work and next_steps:
+- PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — "Want me to…?", "Would you like me to…?", "Should I…?", "Shall I proceed?", or "Try running it now"/"Please run X and confirm" (deferring a check it could run itself). DECISIVE TEST: if the final turn is a yes/no or "want me to X?" question AND X is something the agent can do with its own tools AND X carries no irreversible risk, the stop is premature — it should have just done X. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message).
+- STOPPED-WITH-TODOS (~30%): the response lists "Remaining Tasks"/"Next steps"/"Still TODO"/"What I did NOT do"/"Outstanding Work" or names a verify/run/check/create-PR step as "next" — then stops without doing it. FIRST-OCCURRENCE IS SUFFICIENT: do NOT wait for a second signal; 98% of these are premature. TERMINAL-POSITION TEST: the list appears in the LAST ~40% of the response with NO subsequent tool calls or execution. A mid-response progress report followed by actual execution is complete, not drift. Set status "in_progress" with that work in remaining_work.
+- VERIFICATION-DEFERRAL: agent wrote/edited code (write/edit tool calls in tool commands) but the response ends without running tests, build, or lint — and the task requires verification. Run verification before stopping. Set status "in_progress" with "run tests/build" in remaining_work.
+- FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a <feature/system>" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
+- LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → status "complete"; do not invent missing work.
+- SEVERITY/STUCK: a single recoverable technical snag mid-task (knows the fix) is not "stuck". But a policy/process violation — pushing to main when a PR was required, skipping mandated tests — is a real failure: status "in_progress" with the corrective action in remaining_work, never "complete".`
+
+export interface Rubric {
+  patterns: string
+  antipatterns: string
+}
+
+/** Split a rubric markdown doc into its `## Patterns` and `## Antipatterns` sections. */
+export function parseRubric(md: string): Rubric {
+  const section = (name: string): string => {
+    const re = new RegExp(`##\\s+${name}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, "i")
+    return (md.match(re)?.[1] ?? "").trim()
+  }
+  return { patterns: section("Patterns"), antipatterns: section("Antipatterns") }
+}
+
+/**
+ * Load the active rubric for a project. Precedence (first complete one wins):
+ *   1. project: <directory>/.supervisor/rubric.md      → source "project"
+ *   2. global:  ~/.config/opencode/supervisor/rubric.md → source "global"
+ *   3. embedded DEFAULT_RUBRIC                           → source "default"
+ * An override missing either section falls through to the next source, so the
+ * judge never runs with an empty rubric.
+ */
+export async function loadRubric(
+  directory: string
+): Promise<Rubric & { source: "project" | "global" | "default" }> {
+  const candidates: Array<{ path: string; source: "project" | "global" }> = [
+    { path: join(directory, ".supervisor", "rubric.md"), source: "project" },
+    { path: join(homedir(), ".config", "opencode", "supervisor", "rubric.md"), source: "global" },
+  ]
+  for (const { path, source } of candidates) {
+    try {
+      const md = await readFile(path, "utf-8")
+      const r = parseRubric(md)
+      if (r.patterns && r.antipatterns) return { ...r, source }
+    } catch {
+      /* not present / unreadable — try next */
+    }
+  }
+  return { ...parseRubric(DEFAULT_RUBRIC), source: "default" }
+}
+
+const JUDGE_BLOCKED_PATTERNS = [
+  /\bhaiku\b/i,
+  /\bmini\b/i,
+  /\bnano\b/i,
+  /\bflash\b/i,
+  /\bgpt-3\.5\b/i,
+  /\bllama-3\.1-8b\b/i,
+  /\bmixtral-8x7b\b/i,
+]
+
+const PLANNING_LOOP_MIN_TOOL_CALLS = 8
+const PLANNING_LOOP_WRITE_RATIO_THRESHOLD = 0.1
+const ACTION_LOOP_MIN_COMMANDS = 4
+const ACTION_LOOP_REPETITION_THRESHOLD = 0.6
+
+type TaskType = "coding" | "docs" | "research" | "ops" | "other"
+type AgentMode = "plan" | "build" | "unknown"
+type RoutingCategory = "backend" | "architecture" | "frontend" | "default"
+
+interface WorkflowRequirements {
+  requiresTests: boolean
+  requiresBuild: boolean
+  requiresPR: boolean
+  requiresCI: boolean
+  requiresLocalTests: boolean
+  requiresLocalTestsEvidence: boolean
+}
+
+interface TaskContext extends WorkflowRequirements {
+  taskSummary: string
+  taskType: TaskType
+  agentMode: AgentMode
+  humanMessages: string[]
+  toolsSummary: string
+  detectedSignals: string[]
+  recentCommands: string[]
+  pushedToDefaultBranch: boolean
+}
+
+interface SelfAssessment {
+  task_summary?: string
+  task_type?: string
+  status?: "complete" | "in_progress" | "blocked" | "stuck" | "waiting_for_user"
+  confidence?: number
+  evidence?: {
+    tests?: {
+      ran?: boolean
+      results?: "pass" | "fail" | "unknown"
+      ran_after_changes?: boolean
+      commands?: string[]
+      skipped?: boolean
+      skip_reason?: string
+    }
+    build?: {
+      ran?: boolean
+      results?: "pass" | "fail" | "unknown"
+    }
+    pr?: {
+      created?: boolean
+      url?: string
+      ci_status?: "pass" | "fail" | "unknown"
+      checked?: boolean
+    }
+  }
+  remaining_work?: string[]
+  next_steps?: string[]
+  needs_user_action?: string[]
+  stuck?: boolean
+  alternate_approach?: string
+}
+
+interface SupervisorAnalysis {
+  complete: boolean
+  shouldContinue: boolean
+  reason: string
+  missing: string[]
+  nextActions: string[]
+  requiresHumanAction: boolean
+  severity: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "BLOCKER"
+}
+
+interface RoutingConfig {
+  enabled: boolean
+  models: Record<RoutingCategory, string>
+}
+
+interface ModelSpecParts {
+  providerID: string
+  modelID: string
+}
+
+const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
+  enabled: false,
+  models: {
+    backend: "",
+    architecture: "",
+    frontend: "",
+    default: ""
+  }
+}
+
+const JUDGE_RESPONSE_TIMEOUT = 120_000
+const POLL_INTERVAL = 2_000
+const ABORT_COOLDOWN = 10_000
+const ABORT_RACE_DELAY = 1_500 // ms to wait for session.error to arrive before running supervisor
+const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "supervisor.yaml")
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "set_supervisor"])
+
+export function trackSessionScopedToolSession(
+  currentSessionId: string | null,
+  input: { tool?: string; sessionID?: string }
+): string | null {
+  if (input.sessionID && input.tool && SESSION_SCOPED_TOOLS.has(input.tool)) {
+    return input.sessionID
+  }
+  return currentSessionId
+}
+
+// Debug logging — writes to .supervisor/debug.log when SUPERVISOR_DEBUG=1.
+// Never write to stdout/stderr — it corrupts the OpenCode TUI.
+const SUPERVISOR_DEBUG = process.env.SUPERVISOR_DEBUG === "1"
+
+// Module-level debug function, initially a no-op.
+// Replaced with a file-backed logger once the plugin initializes with a directory.
+let debug: (...args: any[]) => void = () => {}
+
+function initDebugLogger(directory: string) {
+  if (!SUPERVISOR_DEBUG) return
+  const logPath = join(directory, ".supervisor", "debug.log")
+  let dirEnsured = false
+  debug = (...args: any[]) => {
+    const msg = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")
+    const ts = new Date().toISOString()
+    const line = `[${ts}] [Supervisor] ${msg}\n`
+    // Fire-and-forget: do not await to avoid slowing down the plugin
+    ;(async () => {
+      if (!dirEnsured) {
+        try { await mkdir(join(directory, ".supervisor"), { recursive: true }) } catch {}
+        dirEnsured = true
+      }
+      try { await appendFile(logPath, line) } catch {}
+    })()
+  }
+}
+
+function isBlockedJudgeModel(modelSpec: string): boolean {
+  const normalized = modelSpec.toLowerCase()
+  return JUDGE_BLOCKED_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/\/\*[^]*?\*\//g, "")
+    .replace(/(^|\s)\/\/.*$/gm, "$1")
+}
+
+async function loadPreferredModelSpec(directory: string): Promise<string | null> {
+  const candidates = [
+    join(directory, "opencode.json"),
+    join(directory, ".opencode", "opencode.json"),
+    join(homedir(), ".config", "opencode", "opencode.json"),
+    join(directory, "opencode.jsonc"),
+    join(directory, ".opencode", "opencode.jsonc"),
+    join(homedir(), ".config", "opencode", "opencode.jsonc"),
+  ]
+
+  for (const path of candidates) {
+    try {
+      const content = await readFile(path, "utf-8")
+      const parsed = JSON.parse(stripJsonComments(content))
+      const model = parsed?.model
+      if (typeof model === "string" && model.trim()) {
+        return model.trim()
+      }
+    } catch {}
+  }
+  return null
+}
+
+async function loadSupervisorPrompt(directory: string): Promise<string | null> {
+  const candidates = [".supervisor.md", ".supervisor.MD", "supervisor.md", "supervisor.MD"]
+  for (const name of candidates) {
+    try {
+      const supervisorPath = join(directory, name)
+      const customPrompt = await readFile(supervisorPath, "utf-8")
+      debug("Loaded custom prompt from", name)
+      return customPrompt.trim()
+    } catch {}
+  }
+  return null
+}
+
+function buildToolSupervisorGuidanceSection(toolSupervisorPrompt: string | null): string {
+  if (!toolSupervisorPrompt) return ""
+  return `\n## Tool Supervisor Guidance\n${toolSupervisorPrompt.slice(0, 4000)}\n`
+}
+
+function resolveSupervisorPromptPrecedence(
+  filePrompt: string | null,
+  toolSupervisorPrompt: string | null,
+  defaultPrompt: string
+): { prompt: string; source: "file" | "tool" | "default"; effectiveToolSupervisorPrompt: string | null } {
+  if (filePrompt) {
+    return {
+      prompt: filePrompt,
+      source: "file",
+      effectiveToolSupervisorPrompt: null
+    }
+  }
+  if (toolSupervisorPrompt) {
+    return {
+      prompt: `${defaultPrompt}${buildToolSupervisorGuidanceSection(toolSupervisorPrompt)}`,
+      source: "tool",
+      effectiveToolSupervisorPrompt: toolSupervisorPrompt
+    }
+  }
+  return {
+    prompt: defaultPrompt,
+    source: "default",
+    effectiveToolSupervisorPrompt: null
+  }
+}
+
+async function getAgentsFile(directory: string): Promise<string> {
+  for (const name of ["AGENTS.md", ".opencode/AGENTS.md", "agents.md"]) {
+    try {
+      const content = await readFile(join(directory, name), "utf-8")
+      return content
+    } catch {}
+  }
+  return ""
+}
+
+function getMessageSignature(msg: any): string {
+  if (msg.id) return msg.id
+  const role = msg.info?.role || "unknown"
+  const time = msg.info?.time?.start || 0
+  const textPart = msg.parts?.find((p: any) => p.type === "text")?.text?.slice(0, 20) || ""
+  return `${role}:${time}:${textPart}`
+}
+
+export function detectPlanningLoop(messages: any[]): {
+  detected: boolean
+  readCount: number
+  writeCount: number
+  totalTools: number
+} {
+  if (!Array.isArray(messages)) {
+    return { detected: false, readCount: 0, writeCount: 0, totalTools: 0 }
+  }
+  let readCount = 0
+  let writeCount = 0
+  let totalTools = 0
+
+  for (const msg of messages) {
+    if (msg.info?.role !== "assistant") continue
+    for (const part of msg.parts || []) {
+      if (part.type !== "tool") continue
+      totalTools++
+
+      const toolName = (part.tool || "").toString().toLowerCase()
+      const input = part.state?.input || {}
+
+      if (["edit", "write", "apply_patch", "github_create_or_update_file", "github_push_files", "github_delete_file", "github_create_pull_request", "github_update_pull_request"].includes(toolName)) {
+        writeCount++
+        continue
+      }
+
+      if (toolName === "bash") {
+        const cmd = (input.command || input.cmd || "").toString()
+        if (/^\s*(npm|yarn|pnpm)\s+(run\s+)?(build|test|lint|fmt|format)\b/i.test(cmd) || /^\s*git\s+(add|commit|push|checkout|switch|merge|rebase)\b/i.test(cmd) || /^\s*(mkdir|rm|mv|cp)\b/i.test(cmd)) {
+          writeCount++
+        } else if (/^\s*git\s+(status|log|diff|show|branch|remote|tag)\b/i.test(cmd) || /^\s*(ls|cat|head|tail|find|grep|rg|wc|file)\b/i.test(cmd)) {
+          readCount++
+        }
+        continue
+      }
+
+      if (["read", "glob", "grep", "todowrite", "task", "webfetch", "knowledge-graph_search", "knowledge-graph_read", "knowledge-graph_open"].some((name) => toolName.startsWith(name)) || toolName.startsWith("context7_")) {
+        readCount++
+      }
+    }
+  }
+
+  const detected =
+    totalTools >= PLANNING_LOOP_MIN_TOOL_CALLS &&
+    (writeCount === 0 || writeCount / totalTools < PLANNING_LOOP_WRITE_RATIO_THRESHOLD)
+
+  return { detected, readCount, writeCount, totalTools }
+}
+
+export function shouldApplyPlanningLoop(taskType: TaskType, loopDetected: boolean): boolean {
+  if (!loopDetected) return false
+  return taskType === "coding"
+}
+
+/**
+ * Detects when the agent is repeating the same commands/actions without progress.
+ * Unlike detectPlanningLoop (read-heavy without writes), this catches action loops
+ * where the agent IS making write-like operations but repeating the same ones.
+ * Example: repeatedly re-deploying and re-running the same failing evaluation.
+ */
+export function detectActionLoop(messages: any[]): {
+  detected: boolean
+  repeatedCommands: string[]
+  totalCommands: number
+} {
+  if (!Array.isArray(messages)) {
+    return { detected: false, repeatedCommands: [], totalCommands: 0 }
+  }
+
+  const commands: string[] = []
+  for (const msg of messages) {
+    if (msg.info?.role !== "assistant") continue
+    for (const part of msg.parts || []) {
+      if (part.type !== "tool") continue
+      const toolName = (part.tool || "").toString().toLowerCase()
+      const input = part.state?.input || {}
+
+      if (toolName === "bash") {
+        const cmd = (input.command || input.cmd || "").toString().trim()
+        if (cmd) {
+          // Normalize: collapse whitespace and remove trailing timestamps/IDs
+          const normalized = cmd.replace(/\s+/g, " ").replace(/\d{10,}/g, "TIMESTAMP").toLowerCase()
+          commands.push(normalized)
+        }
+      } else if (toolName !== "read" && toolName !== "glob" && toolName !== "grep" && toolName !== "todowrite") {
+        // Track non-read tool calls by name + key input params
+        const key = `${toolName}:${JSON.stringify(input).slice(0, 100)}`
+        commands.push(key)
+      }
+    }
+  }
+
+  if (commands.length < ACTION_LOOP_MIN_COMMANDS) {
+    return { detected: false, repeatedCommands: [], totalCommands: commands.length }
+  }
+
+  // Count occurrences of each command
+  const counts = new Map<string, number>()
+  for (const cmd of commands) {
+    counts.set(cmd, (counts.get(cmd) || 0) + 1)
+  }
+
+  // Find commands repeated 3+ times
+  const repeatedCommands: string[] = []
+  let repeatedCount = 0
+  for (const [cmd, count] of counts) {
+    if (count >= 3) {
+      repeatedCommands.push(cmd)
+      repeatedCount += count
+    }
+  }
+
+  // Loop detected if repeated commands make up a significant fraction
+  const detected = repeatedCommands.length > 0 && repeatedCount / commands.length >= ACTION_LOOP_REPETITION_THRESHOLD
+
+  return { detected, repeatedCommands, totalCommands: commands.length }
+}
+
+export function buildEscalatingFeedback(
+  attemptCount: number,
+  severity: string,
+  verdict: { feedback?: string; missing?: string[]; next_actions?: string[] } | undefined | null,
+  isPlanningLoop: boolean,
+  isActionLoop?: boolean,
+  maxAttempts?: number
+): string {
+  const safeVerdict = verdict ?? {}
+  const missingItems = Array.isArray(safeVerdict.missing) ? safeVerdict.missing : []
+  const nextActionItems = Array.isArray(safeVerdict.next_actions) ? safeVerdict.next_actions : []
+  const feedbackStr = safeVerdict.feedback || ""
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  if (isPlanningLoop) {
+    return `${FEEDBACK_MARKER} STOP: Planning Loop Detected
+
+You have been reading files, checking git status, and creating todo lists without writing any code.
+
+DO NOT:
+- Run git status or git log again
+- Create another todo list
+- Read more files "for context"
+- Say "let me get right to work" without actually working
+
+DO NOW:
+Pick the FIRST item from your existing todo list and implement it. Open a file with Edit or Write and make changes. If you don't know where to start, create the simplest possible file first.
+
+Start coding NOW. No more planning.`
+  }
+
+  if (isActionLoop) {
+    return `${FEEDBACK_MARKER} STOP: Action Loop Detected (attempt ${attemptCount}/${effectiveCap})
+
+You are repeating the same commands without making progress. Running the same deploy/test/build cycle again will produce the same result.
+
+STOP and do ONE of these:
+1. If the same test/eval keeps failing, analyze the failure output and fix the root cause before re-running.
+2. If you cannot fix the root cause, explain what is blocking you and ask the user for help.
+3. Try a completely different approach (e.g., test locally instead of via deployment).
+
+Do NOT re-run the same command hoping for a different result.`
+  }
+
+  if (attemptCount < effectiveCap - 1) {
+    const missing = missingItems.length
+      ? `\n### Missing\n${missingItems.map((m) => `- ${m}`).join("\n")}`
+      : ""
+    const nextActions = nextActionItems.length
+      ? `\n### Next Actions\n${nextActionItems.map((a) => `- ${a}`).join("\n")}`
+      : ""
+    return `${FEEDBACK_MARKER} Task Incomplete (${severity})
+${feedbackStr}
+${missing}
+${nextActions}
+
+Please address these issues and continue.`
+  }
+
+  const missingBrief = missingItems.length
+    ? `Still missing: ${missingItems.slice(0, 3).join(", ")}.`
+    : ""
+  return `${FEEDBACK_MARKER} Final Attempt (${attemptCount}/${effectiveCap})
+
+${missingBrief}
+
+You have been asked ${attemptCount} times to complete this task. This is your LAST chance before supervisor stops.
+
+If you cannot complete the remaining items:
+- Explain clearly what is blocking you
+- Set needs_user_action if you need user help
+- Try a different approach instead of repeating the same steps
+
+Do NOT re-read files or re-plan. Either implement the fix now or explain why you cannot.`
+}
+
+function getLastRelevantUserMessageId(messages: any[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.info?.role === "user") {
+      let isSupervisor = false
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) {
+          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) {
+            isSupervisor = true
+            break
+          }
+        }
+      }
+      if (!isSupervisor) return getMessageSignature(msg)
+    }
+  }
+  return null
+}
+
+function isJudgeSession(sessionId: string, messages: any[], judgeSessionIds: Set<string>): boolean {
+  if (judgeSessionIds.has(sessionId)) return true
+  for (const msg of messages) {
+    for (const part of msg.parts || []) {
+      if (part.type === "text" && (part.text?.includes("ANALYZE SUPERVISOR") || part.text?.includes("SELF-ASSESS SUPERVISOR") || part.text?.includes("REVIEW SUPERVISOR COMPLETION"))) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+export function isPlanMode(messages: any[]): boolean {
+  if (!Array.isArray(messages)) return false
+  // Check system/developer messages for plan mode indicators
+  const hasSystemPlanMode = messages.some((m: any) =>
+    (m.info?.role === "system" || m.info?.role === "developer") &&
+    m.parts?.some((p: any) =>
+      p.type === "text" &&
+      p.text &&
+      (p.text.includes("Plan Mode") ||
+        p.text.includes("plan mode ACTIVE") ||
+        p.text.includes("plan mode is active") ||
+        p.text.includes("read-only mode") ||
+        p.text.includes("READ-ONLY phase"))
+    )
+  )
+  if (hasSystemPlanMode) return true
+
+  // OpenCode injects plan mode as <system-reminder> inside user message parts.
+  // Check ALL text parts of ALL messages for plan mode system-reminder patterns.
+  for (const msg of messages) {
+    for (const part of msg.parts || []) {
+      if (part.type === "text" && part.text) {
+        const text = part.text
+        if (
+          text.includes("<system-reminder>") &&
+          (/plan mode/i.test(text) || /READ-ONLY phase/i.test(text))
+        ) {
+          return true
+        }
+      }
+    }
+  }
+
+  // Check the last non-supervisor user message for plan-related keywords
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.info?.role === "user") {
+      let isSupervisor = false
+      const texts: string[] = []
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) {
+          if (part.text.includes(SELF_ASSESSMENT_MARKER)) {
+            isSupervisor = true
+            break
+          }
+          texts.push(part.text)
+        }
+      }
+      if (!isSupervisor && texts.length > 0) {
+        for (const text of texts) {
+          if (/plan mode/i.test(text)) return true
+          if (/\b(create|make|draft|generate|propose|write|update)\b.{1,30}\bplan\b/i.test(text)) return true
+          if (/^plan\b/i.test(text.trim())) return true
+        }
+        return false
+      }
+    }
+  }
+  return false
+}
+
+async function showToast(client: any, directory: string, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  try {
+    await client.tui.publish({
+      query: { directory },
+      body: {
+        type: "tui.toast.show",
+        properties: { title: "Supervisor", message, variant, duration: 5000 }
+      }
+    })
+  } catch {}
+}
+
+function parseModelListFromYaml(content: string): string[] {
+  const models: string[] = []
+  const lines = content.split(/\r?\n/)
+  let inModels = false
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+
+    if (/^models\s*:/i.test(line)) {
+      inModels = true
+      const inline = line.replace(/^models\s*:/i, "").trim()
+      if (inline.startsWith("[") && inline.endsWith("]")) {
+        const items = inline.slice(1, -1).split(",")
+        for (const item of items) {
+          const value = item.trim().replace(/^['"]|['"]$/g, "")
+          if (value) models.push(value)
+        }
+        inModels = false
+      }
+      continue
+    }
+
+    if (inModels) {
+      if (/^[\w-]+\s*:/.test(line)) {
+        inModels = false
+        continue
+      }
+      if (line.startsWith("-")) {
+        const value = line.replace(/^-\s*/, "").trim().replace(/^['"]|['"]$/g, "")
+        if (value) models.push(value)
+      }
+    }
+  }
+
+  return models
+}
+
+function parseRoutingFromYaml(content: string): RoutingConfig {
+  const config: RoutingConfig = { ...DEFAULT_ROUTING_CONFIG, models: { ...DEFAULT_ROUTING_CONFIG.models } }
+  const lines = content.split(/\r?\n/)
+  let inRouting = false
+  let inRoutingModels = false
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+
+    if (/^routing\s*:/i.test(line)) {
+      inRouting = true
+      continue
+    }
+
+    if (inRouting) {
+      // Exit routing section when we hit a top-level key
+      if (/^[a-zA-Z][\w-]*\s*:/.test(rawLine) && !rawLine.startsWith(" ") && !rawLine.startsWith("\t")) {
+        inRouting = false
+        inRoutingModels = false
+        continue
+      }
+
+      if (/^\s*enabled\s*:\s*(true|false)/i.test(rawLine)) {
+        config.enabled = /true/i.test(rawLine)
+        continue
+      }
+
+      if (/^\s*models\s*:/i.test(rawLine)) {
+        inRoutingModels = true
+        continue
+      }
+
+      if (inRoutingModels) {
+        // Exit models sub-section on a non-indented or non-model key
+        if (/^\s{2,}[\w-]+\s*:/.test(rawLine) || /^\s+[\w-]+\s*:/.test(rawLine)) {
+          const match = rawLine.match(/^\s+([\w-]+)\s*:\s*(.*)/)
+          if (match) {
+            const key = match[1].toLowerCase() as RoutingCategory
+            const value = match[2].trim().replace(/^['"]|['"]$/g, "")
+            if (key === "backend" || key === "architecture" || key === "frontend" || key === "default") {
+              config.models[key] = value
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return config
+}
+
+
+function parseRoutingCategory(text: string | null | undefined): RoutingCategory | null {
+  if (typeof text !== "string") return null
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as { category?: string }
+      const value = (parsed.category || "").toLowerCase()
+      if (value === "backend" || value === "architecture" || value === "frontend" || value === "default") {
+        return value
+      }
+    } catch {}
+  }
+  const word = trimmed.split(/\s+/)[0]?.toLowerCase()
+  if (word === "backend" || word === "architecture" || word === "frontend" || word === "default") {
+    return word
+  }
+  return null
+}
+
+function parseModelSpec(modelSpec: string | null | undefined): ModelSpecParts | null {
+  if (typeof modelSpec !== "string") return null
+  const trimmed = modelSpec.trim()
+  if (!trimmed) return null
+  const parts = trimmed.split("/")
+  if (parts.length < 2) return null
+  const providerID = parts[0] || ""
+  const modelID = parts.slice(1).join("/") || ""
+  if (!providerID || !modelID) return null
+  return { providerID, modelID }
+}
+
+function getGitHubCopilotModelForRouting(modelSpec: string | null | undefined): string | null {
+  const parsed = parseModelSpec(modelSpec)
+  if (!parsed) return null
+  const providerID = parsed.providerID.toLowerCase()
+  const modelID = parsed.modelID.toLowerCase()
+  if (providerID === "github-copilot" || providerID === "github-copilot/free") {
+    if (modelID.includes("gpt-4.1") || modelID.includes("gpt-4o") || modelID.includes("gpt-4")) {
+      return "github-copilot/gpt-4.1"
+    }
+  }
+  return null
+}
+
+function getCrossReviewModelSpec(modelSpec: string | null | undefined): string | null {
+  const parsed = parseModelSpec(modelSpec)
+  if (!parsed) return null
+  const modelID = parsed.modelID.toLowerCase()
+  if (modelID === "claude-opus-4.6") return "github-copilot/gpt-5.2-codex"
+  if (modelID === "gpt-5.2-codex") return "github-copilot/claude-opus-4.6"
+  return null
+}
+
+async function classifyTaskForRoutingWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  judgeSessionIds: Set<string>
+): Promise<RoutingCategory | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+
+  let attempts: string[] = []
+  if (modelList.length) {
+    attempts = modelList
+  } else if (preferredModel) {
+    const routingModel = getGitHubCopilotModelForRouting(preferredModel)
+    if (routingModel && !isBlockedJudgeModel(routingModel)) {
+      attempts = [routingModel]
+    } else if (!isBlockedJudgeModel(preferredModel)) {
+      attempts = [preferredModel]
+    }
+  }
+  if (attempts.length === 0) attempts = [""]
+
+  const prompt = `CLASSIFY TASK ROUTING\n\nYou are classifying a task into one routing category.\n\nTask summary:\n${context.taskSummary}\n\nTask type: ${context.taskType}\n\nRecent user messages:\n${context.humanMessages.slice(0, 4).join("\n\n")}\n\nChoose exactly one category from: backend, architecture, frontend, default.\nReturn JSON only:\n{\n  "category": "backend|architecture|frontend|default"\n}`
+
+  for (const modelSpec of attempts) {
+    let classifierSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      classifierSession = data
+    } catch {
+      return null
+    }
+    if (!classifierSession?.id) return null
+    judgeSessionIds.add(classifierSession.id)
+
+    let response: string | null = null
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: classifierSession.id },
+        body
+      })
+
+      response = await waitForResponse(client, classifierSession.id)
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "routing-classifier" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: classifierSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(classifierSession.id)
+    }
+
+    const category = parseRoutingCategory(response)
+    if (category) return category
+  }
+
+  return null
+}
+
+async function loadRoutingConfig(): Promise<RoutingConfig> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    return parseRoutingFromYaml(content)
+  } catch {
+    return { ...DEFAULT_ROUTING_CONFIG, models: { ...DEFAULT_ROUTING_CONFIG.models } }
+  }
+}
+
+function getRoutingModel(config: RoutingConfig, category: RoutingCategory | null): { providerID: string; modelID: string } | null {
+  if (!category) return null
+  if (!config.enabled) return null
+  const modelSpec = config.models[category] || config.models["default"] || ""
+  if (!modelSpec) return null
+  const parts = modelSpec.split("/")
+  const providerID = parts[0] || ""
+  const modelID = parts.slice(1).join("/") || ""
+  if (!providerID || !modelID) return null
+  return { providerID, modelID }
+}
+
+async function loadSupervisorModelList(): Promise<string[]> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    const models = parseModelListFromYaml(content)
+    const filtered = models.filter((model) => {
+      if (isBlockedJudgeModel(model)) {
+        debug("Blocked weak supervisor model:", model)
+        return false
+      }
+      return true
+    })
+    if (filtered.length) debug("Loaded supervisor model list:", JSON.stringify(filtered))
+    return filtered
+  } catch {
+    return []
+  }
+}
+
+async function ensureSupervisorDir(directory: string): Promise<string> {
+  const supervisorDir = join(directory, ".supervisor")
+  try {
+    await mkdir(supervisorDir, { recursive: true })
+  } catch {}
+  return supervisorDir
+}
+
+async function writeVerdictSignal(directory: string, sessionId: string, complete: boolean, severity: string): Promise<void> {
+  const supervisorDir = await ensureSupervisorDir(directory)
+  const signalPath = join(supervisorDir, `verdict_${sessionId.slice(0, 8)}.json`)
+  const signal = {
+    sessionId: sessionId.slice(0, 8),
+    complete,
+    severity,
+    timestamp: Date.now()
+  }
+  try {
+    await writeFile(signalPath, JSON.stringify(signal))
+    debug("Wrote verdict signal:", signalPath)
+  } catch (e) {
+    debug("Failed to write verdict signal:", String(e))
+    reportError(e, { plugin: "supervisor-3", op: "write-verdict-signal" })
+  }
+}
+
+async function saveSupervisorData(directory: string, sessionId: string, data: any): Promise<void> {
+  const supervisorDir = await ensureSupervisorDir(directory)
+  const filename = `${sessionId.slice(0, 8)}_${Date.now()}.json`
+  const filepath = join(supervisorDir, filename)
+  try {
+    await writeFile(filepath, JSON.stringify(data, null, 2))
+  } catch {}
+}
+
+async function waitForResponse(client: any, sessionId: string): Promise<string | null> {
+  const start = Date.now()
+  while (Date.now() - start < JUDGE_RESPONSE_TIMEOUT) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL))
+    try {
+      const { data } = await client.session.messages({ path: { id: sessionId } })
+      const messages = Array.isArray(data) ? data : []
+      const assistantMsg = [...messages].reverse().find((m: any) => m.info?.role === "assistant")
+      if (!(assistantMsg?.info?.time as any)?.completed) continue
+      for (const part of assistantMsg?.parts || []) {
+        if (part.type === "text" && part.text) return part.text
+      }
+    } catch {}
+  }
+  return null
+}
+
+function inferTaskType(text: string): TaskType {
+  const hasResearch = /research|investigate|analyze|compare|evaluate|study/i.test(text)
+  const hasCodingAction = /\bfix\b|implement|add|create|build|feature|refactor|improve|update/i.test(text)
+  const hasCodingSignal = /\bbug\b|\berror\b|\bregression\b/i.test(text)
+  const hasGitHubIssue = /github\.com\/[^\s/]+\/[^\s/]+\/issues\/\d+/i.test(text)
+
+  // When text contains both research AND coding-action keywords (e.g. "investigate and fix this bug"),
+  // or references a GitHub issue URL alongside research terms, prefer coding —
+  // these are almost always coding tasks even if the description says "investigate".
+  // Note: coding-signal words (bug, error, regression) alone don't override research,
+  // because "investigate performance regressions" is legitimate research.
+  if (hasResearch && (hasCodingAction || hasGitHubIssue)) return "coding"
+
+  if (hasResearch) return "research"
+  if (/docs?|readme|documentation/i.test(text)) return "docs"
+  // Ops detection: explicit ops terms and personal-assistant / browser-automation patterns
+  // Must be checked BEFORE coding to avoid "create filter" or "build entities" matching as coding
+  if (/deploy|release|infra|ops|oncall|incident|runbook/i.test(text)) return "ops"
+  if (/\bgmail\b|\bemail\b|\bfilter\b|\binbox\b|\bcalendar\b|\blinkedin\b|\brecruiter\b|\bbrowser\b/i.test(text)) return "ops"
+  if (/\bclean\s*up\b|\borganize\b|\bconfigure\b|\bsetup\b|\bset\s*up\b|\binstall\b/i.test(text)) return "ops"
+  if (hasCodingAction || hasCodingSignal) return "coding"
+  return "other"
+}
+
+async function hasPath(target: string): Promise<boolean> {
+  try {
+    await stat(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function getRepoSignals(directory: string): Promise<{ hasTestScript: boolean; hasBuildScript: boolean; hasTestsDir: boolean }>{
+  let hasTestScript = false
+  let hasBuildScript = false
+  const packagePath = join(directory, "package.json")
+  try {
+    const content = await readFile(packagePath, "utf-8")
+    const pkg = JSON.parse(content)
+    const scripts = pkg?.scripts || {}
+    hasTestScript = Boolean(scripts.test || scripts["test:ci"] || scripts["test:e2e"])
+    hasBuildScript = Boolean(scripts.build || scripts["build:prod"])
+  } catch {}
+
+  const hasTestsDir = (await hasPath(join(directory, "test"))) || (await hasPath(join(directory, "tests")))
+  return { hasTestScript, hasBuildScript, hasTestsDir }
+}
+
+function extractToolCommands(messages: any[]): string[] {
+  const commands: string[] = []
+  for (const msg of messages) {
+    for (const part of msg.parts || []) {
+      if (part.type === "tool" && part.tool === "bash") {
+        const command = part.state?.input?.command
+        if (typeof command === "string" && command.trim()) {
+          commands.push(command)
+        }
+      }
+    }
+  }
+  return commands
+}
+
+function detectSignals(humanText: string, commands: string[]): string[] {
+  const signals: string[] = []
+  if (/test|tests|pytest|jest|unit|e2e|integration/i.test(humanText)) signals.push("test-mention")
+  if (/build|compile|bundle|release/i.test(humanText)) signals.push("build-mention")
+  if (/pull request|\bPR\b|merge request/i.test(humanText)) signals.push("pr-mention")
+  if (/ci|checks|github actions/i.test(humanText)) signals.push("ci-mention")
+
+  if (commands.some(cmd => /\b(npm|pnpm|yarn)\s+test\b|pytest\b|go\s+test\b|cargo\s+test\b/i.test(cmd))) {
+    signals.push("test-command")
+  }
+  if (commands.some(cmd => /\b(npm|pnpm|yarn)\s+run\s+build\b|cargo\s+build\b|go\s+build\b/i.test(cmd))) {
+    signals.push("build-command")
+  }
+  if (commands.some(cmd => /\bgh\s+pr\b/i.test(cmd))) signals.push("gh-pr")
+  if (commands.some(cmd => /\bgh\s+issue\b/i.test(cmd))) signals.push("gh-issue")
+  if (commands.some(cmd => /\bgh\s+pr\s+create\b/i.test(cmd))) signals.push("gh-pr-create")
+  if (commands.some(cmd => /\bgh\s+pr\s+view\b/i.test(cmd))) signals.push("gh-pr-view")
+  if (commands.some(cmd => /\bgh\s+pr\s+status\b/i.test(cmd))) signals.push("gh-pr-status")
+  if (commands.some(cmd => /\bgh\s+pr\s+checks\b/i.test(cmd))) signals.push("gh-pr-checks")
+  if (commands.some(cmd => /\bgit\s+push\b/i.test(cmd))) signals.push("git-push")
+  return signals
+}
+
+function normalizeCommand(command: string): string {
+  return command.replace(/\s+/g, " ").trim()
+}
+
+function getRecentCommands(commands: string[], limit = 20): string[] {
+  return commands.map(normalizeCommand).slice(-limit)
+}
+
+function hasLocalTestCommand(commands: string[]): boolean {
+  return commands.some(cmd =>
+    /\bnpm\s+test\b/i.test(cmd) ||
+    /\bnpm\s+run\s+test\b/i.test(cmd) ||
+    /\bnpm\s+run\s+typecheck\b/i.test(cmd) ||
+    /\bpnpm\s+test\b/i.test(cmd) ||
+    /\byarn\s+test\b/i.test(cmd) ||
+    /\bpytest\b/i.test(cmd) ||
+    /\bgo\s+test\b/i.test(cmd) ||
+    /\bcargo\s+test\b/i.test(cmd)
+  )
+}
+
+function pushedToDefaultBranch(commands: string[]): boolean {
+  return commands.some(cmd =>
+    /\bgit\s+push\b.*\b(main|master)\b/i.test(cmd) ||
+    /\bgit\s+push\b.*\borigin\b\s+\b(main|master)\b/i.test(cmd) ||
+    /\bgit\s+push\b.*\bHEAD:(main|master)\b/i.test(cmd)
+  )
+}
+
+async function buildTaskContext(messages: any[], directory: string): Promise<TaskContext | null> {
+  if (!Array.isArray(messages)) return null
+  const humanMessages: string[] = []
+  let lastAssistantText = ""
+
+  for (const msg of messages) {
+    if (msg.info?.role === "user") {
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) {
+          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue
+          humanMessages.push(part.text)
+          break
+        }
+      }
+    }
+    if (msg.info?.role === "assistant") {
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) {
+          lastAssistantText = part.text
+        }
+      }
+    }
+  }
+
+  if (humanMessages.length === 0) return null
+
+  const taskSummary = humanMessages.length === 1
+    ? humanMessages[0]
+    : humanMessages.map((msg, i) => `[${i + 1}] ${msg}`).join("\n\n")
+
+  const combinedText = `${humanMessages.join(" ")} ${lastAssistantText}`
+  const taskType = inferTaskType(combinedText)
+  const agentMode: AgentMode = isPlanMode(messages) ? "plan" : "build"
+
+  const repoSignals = await getRepoSignals(directory)
+  const commands = extractToolCommands(messages)
+  const detectedSignals = detectSignals(combinedText, commands)
+  const recentCommands = getRecentCommands(commands)
+  const hasLocalTests = hasLocalTestCommand(commands)
+  const pushedDefault = pushedToDefaultBranch(commands)
+
+  const requiresTests = taskType === "coding" && (repoSignals.hasTestScript || repoSignals.hasTestsDir || detectedSignals.includes("test-mention"))
+  const requiresBuild = taskType === "coding" && (repoSignals.hasBuildScript || detectedSignals.includes("build-mention"))
+  // PR and CI are only required for coding tasks; ops/personal-assistant tasks don't need them
+  const requiresPR = taskType === "coding"
+  const requiresCI = taskType === "coding"
+  const requiresLocalTests = requiresTests
+  const requiresLocalTestsEvidence = requiresTests && !hasLocalTests
+
+  const toolsSummary = commands.slice(-6).join("\n") || "(none)"
+
+  return {
+    taskSummary,
+    taskType,
+    agentMode,
+    humanMessages,
+    toolsSummary,
+    detectedSignals,
+    recentCommands,
+    pushedToDefaultBranch: pushedDefault,
+    requiresTests,
+    requiresBuild,
+    requiresPR,
+    requiresCI,
+    requiresLocalTests,
+    requiresLocalTestsEvidence
+  }
+}
+
+function extractLastAssistantText(messages: any[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.info?.role === "assistant") {
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) return part.text
+      }
+    }
+  }
+  return ""
+}
+
+export function buildSelfAssessmentPrompt(
+  context: TaskContext,
+  agents: string,
+  lastAssistantText?: string,
+  attemptCount?: number,
+  rubric?: Rubric,
+  maxAttempts?: number
+): string {
+  const safeContext = {
+    ...context,
+    detectedSignals: Array.isArray(context.detectedSignals) ? context.detectedSignals : []
+  }
+  const requirements: string[] = []
+  if (safeContext.requiresTests) requirements.push("Tests required (run after latest changes)")
+  if (safeContext.requiresBuild) requirements.push("Build/compile required")
+  if (safeContext.requiresPR) requirements.push("PR required (include link)")
+  if (safeContext.requiresCI) requirements.push("CI checks required (verify status)")
+  if (safeContext.requiresLocalTests) requirements.push("Local tests required (must run in this session)")
+  if (safeContext.pushedToDefaultBranch) requirements.push("Detected direct push to default branch (must be avoided)")
+  if (requirements.length === 0) requirements.push("No explicit workflow gates detected")
+
+  const signalSummary = safeContext.detectedSignals.length ? safeContext.detectedSignals.join(", ") : "none"
+
+  const assistantSection = lastAssistantText
+    ? `\n## Agent's Last Response\n${lastAssistantText.slice(0, 4000)}\n`
+    : ""
+
+  const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const currentAttempt = attemptCount || 0
+  const attemptSection = currentAttempt > 0
+    ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
+    : ""
+  return `SELF-ASSESS SUPERVISOR
+
+You are evaluating an agent's work against workflow requirements.
+Analyze the task context, the agent's last response, and the tool signals to determine whether the task is complete.
+
+## Task Context
+- Summary: ${safeContext.taskSummary}
+- Type: ${safeContext.taskType}
+- Mode: ${safeContext.agentMode}
+- Required checks: ${requirements.join("; ")}
+- Detected signals: ${signalSummary}
+
+## Tool Commands Run
+${safeContext.toolsSummary}
+${assistantSection}${attemptSection}
+${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ""}Return JSON only:
+{
+  "task_summary": "brief description of what was done",
+  "task_type": "feature|bugfix|refactor|docs|research|ops|other",
+  "status": "complete|in_progress|blocked|stuck|waiting_for_user",
+  "confidence": 0.95,
+  "evidence": {
+    "tests": {
+      "ran": true,
+      "results": "pass|fail|unknown",
+      "ran_after_changes": true,
+      "commands": ["npm test", "pytest"]
+    },
+    "build": {
+      "ran": true,
+      "results": "pass|fail|unknown"
+    },
+    "pr": {
+      "created": true,
+      "url": "https://github.com/...",
+      "ci_status": "pass|fail|unknown",
+      "checked": true
+    }
+  },
+  "remaining_work": ["list any incomplete items"],
+  "next_steps": ["list next actions needed"],
+  "needs_user_action": ["list any actions requiring user input"],
+  "stuck": false,
+  "alternate_approach": "describe if needed"
+}
+
+Rules:
+${rb.patterns}
+
+${rb.antipatterns}`
+}
+
+/**
+ * Interpolate a simple mustache-like template:
+ * - {{variable}} → replaced with value
+ * - {{#section}}...{{/section}} → included only if variable is truthy
+ */
+function interpolateTemplate(template: string, vars: Record<string, string | undefined>): string {
+  // Handle conditional sections: {{#key}}...{{/key}}
+  let result = template.replace(
+    /\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
+    (_match, key: string, content: string) => {
+      const value = vars[key]
+      if (!value) return ""
+      // Within the section, also interpolate variables
+      return content.replace(/\{\{(\w+)\}\}/g, (_m: string, k: string) => vars[k] ?? "")
+    }
+  )
+  // Handle remaining simple variables
+  result = result.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => vars[key] ?? "")
+  return result
+}
+
+/**
+ * Build the reflection prompt by reading 3 external files and interpolating:
+ *   1. .agents/supervisor/SystemPrompt.md — template with {{variable}} placeholders
+ *   2. .agents/supervisor/Patterns.md — patterns & antipatterns
+ *   3. .agents/supervisor/User.md — user-editable overrides
+ *
+ * Falls back to embedded defaults (buildSelfAssessmentPrompt equivalent) if files
+ * are missing, so the plugin works without the files on disk.
+ */
+async function buildReflectionPromptFromFiles(
+  directory: string,
+  context: TaskContext,
+  agents: string,
+  lastAssistantText: string | undefined,
+  attemptCount: number | undefined,
+  maxAttempts: number | undefined,
+  goalSection?: string
+): Promise<string> {
+  const basePath = join(directory, ".agents", "supervisor")
+
+  // Attempt to read each file; null if not found
+  async function tryRead(filename: string): Promise<string | null> {
+    try {
+      return await readFile(join(basePath, filename), "utf-8")
+    } catch {
+      return null
+    }
+  }
+
+  const [systemPromptFile, patternsFile, userFile] = await Promise.all([
+    tryRead("SystemPrompt.md"),
+    tryRead("Patterns.md"),
+    tryRead("User.md"),
+  ])
+
+  // Build context variables for interpolation
+  const safeContext = {
+    ...context,
+    detectedSignals: Array.isArray(context.detectedSignals) ? context.detectedSignals : []
+  }
+
+  const requirements: string[] = []
+  if (safeContext.requiresTests) requirements.push("Tests required (run after latest changes)")
+  if (safeContext.requiresBuild) requirements.push("Build/compile required")
+  if (safeContext.requiresPR) requirements.push("PR required (include link)")
+  if (safeContext.requiresCI) requirements.push("CI checks required (verify status)")
+  if (safeContext.requiresLocalTests) requirements.push("Local tests required (must run in this session)")
+  if (safeContext.pushedToDefaultBranch) requirements.push("Detected direct push to default branch (must be avoided)")
+  if (requirements.length === 0) requirements.push("No explicit workflow gates detected")
+
+  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const currentAttempt = attemptCount || 0
+
+  const templateVars: Record<string, string | undefined> = {
+    taskSummary: safeContext.taskSummary,
+    taskType: safeContext.taskType,
+    agentMode: safeContext.agentMode,
+    requirements: requirements.join("; "),
+    signals: safeContext.detectedSignals.length ? safeContext.detectedSignals.join(", ") : "none",
+    toolsSummary: safeContext.toolsSummary,
+    lastAssistantText: lastAssistantText ? lastAssistantText.slice(0, 4000) : undefined,
+    attemptSection: currentAttempt > 0 ? "true" : undefined,
+    attemptNumber: String(currentAttempt + 1),
+    maxAttempts: String(effectiveCap),
+    projectInstructions: agents ? agents.slice(0, 800) : undefined,
+    goalSection: goalSection || undefined,
+  }
+
+  // If the system prompt file exists, use the file-based approach
+  if (systemPromptFile) {
+    const interpolated = interpolateTemplate(systemPromptFile, templateVars)
+    const parts = [interpolated]
+    if (patternsFile) {
+      parts.push(patternsFile)
+    }
+    if (userFile && userFile.trim() !== "") {
+      parts.push(userFile)
+    }
+    return parts.join("\n\n")
+  }
+
+  // Fallback: build prompt using the same logic as buildSelfAssessmentPrompt
+  // (for projects that don't have the 3-file structure yet)
+  const rubric = parseRubric(DEFAULT_RUBRIC)
+  const effRubric: Rubric = goalSection
+    ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+    : rubric
+  return buildSelfAssessmentPrompt(
+    context,
+    agents,
+    lastAssistantText,
+    currentAttempt,
+    effRubric,
+    effectiveCap
+  )
+}
+
+function parseSelfAssessmentJson(text: string | null | undefined): SelfAssessment | null {
+  if (typeof text !== "string") return null
+  const jsonMatch = text.match(/\{[\s\S]*\}/)
+  if (!jsonMatch) return null
+  try {
+    return JSON.parse(jsonMatch[0]) as SelfAssessment
+  } catch (e) {
+    reportError(e, { plugin: "supervisor-3", op: "parse-self-assessment" })
+    return null
+  }
+}
+
+const HUMAN_ONLY_ACTION_PATTERNS: RegExp[] = [
+  /\b(auth|authentication|oauth|2fa|mfa|captcha|otp|one[- ]time)\b/i,
+  /\b(log ?in|sign ?in|verification code|passcode)\b/i,
+  /\b(api key|secret|token|credential|access key|session cookie)\b/i,
+  /\b(permission|consent|approve|approval|access request|request access|grant access|invite)\b/i,
+  /\bupload\b/i
+]
+
+const AGENT_ACTION_PATTERNS: RegExp[] = [
+  /\b(run|re-?run|execute|test|build|compile|lint|format|commit|push|merge|pr|ci|check)\b/i,
+  /\b(gh|npm|node|python|bash|curl|script)\b/i,
+  /\b(edit|write|update|fix|implement|add|remove|change|create|open|verify|capture|screenshot|record)\b/i
+]
+
+function isHumanOnlyAction(item: string): boolean {
+  const text = item.trim()
+  if (!text) return false
+  const hasHuman = HUMAN_ONLY_ACTION_PATTERNS.some(pattern => pattern.test(text))
+  const hasAgent = AGENT_ACTION_PATTERNS.some(pattern => pattern.test(text))
+  return hasHuman && !hasAgent
+}
+
+function splitActionItems(items: string[]): { humanOnly: string[]; agentActionable: string[] } {
+  const humanOnly: string[] = []
+  const agentActionable: string[] = []
+  for (const raw of items) {
+    if (typeof raw !== "string") continue
+    const item = raw.trim()
+    if (!item) continue
+    if (isHumanOnlyAction(item)) humanOnly.push(item)
+    else agentActionable.push(item)
+  }
+  return { humanOnly, agentActionable }
+}
+
+function evaluateSelfAssessment(assessment: SelfAssessment, context: TaskContext): SupervisorAnalysis {
+  const safeContext: TaskContext = {
+    taskSummary: context?.taskSummary || "",
+    taskType: context?.taskType || "other",
+    agentMode: context?.agentMode || "unknown",
+    humanMessages: Array.isArray(context?.humanMessages) ? context.humanMessages : [],
+    toolsSummary: context?.toolsSummary || "(none)",
+    detectedSignals: Array.isArray(context?.detectedSignals) ? context.detectedSignals : [],
+    recentCommands: Array.isArray(context?.recentCommands) ? context.recentCommands : [],
+    pushedToDefaultBranch: !!context?.pushedToDefaultBranch,
+    requiresTests: !!context?.requiresTests,
+    requiresBuild: !!context?.requiresBuild,
+    requiresPR: !!context?.requiresPR,
+    requiresCI: !!context?.requiresCI,
+    requiresLocalTests: !!context?.requiresLocalTests,
+    requiresLocalTestsEvidence: !!context?.requiresLocalTestsEvidence
+  }
+  const missing: string[] = []
+  const nextActions: string[] = []
+  const remaining = assessment.remaining_work || []
+  const needsUserAction = assessment.needs_user_action || []
+  const status = assessment.status || "in_progress"
+  const confidence = assessment.confidence ?? 0.5
+  const stuck = assessment.stuck === true
+
+  const tests = assessment.evidence?.tests || {}
+  const build = assessment.evidence?.build || {}
+  const pr = assessment.evidence?.pr || {}
+  const hasPrSignal = safeContext.detectedSignals.includes("gh-pr-create") || safeContext.detectedSignals.includes("gh-pr")
+  const hasCiSignal = safeContext.detectedSignals.includes("gh-pr-checks") || safeContext.detectedSignals.includes("gh-pr-view") || safeContext.detectedSignals.includes("gh-pr-status")
+
+  const addMissing = (item: string, action?: string) => {
+    if (!missing.includes(item)) missing.push(item)
+    if (action && !nextActions.includes(action)) nextActions.push(action)
+  }
+
+  if (remaining.length) {
+    for (const item of remaining) addMissing(item)
+  }
+
+  const { humanOnly: humanNeeds, agentActionable: agentNeeds } = splitActionItems(needsUserAction)
+  if (agentNeeds.length) {
+    for (const item of agentNeeds) {
+      addMissing(item)
+      if (!nextActions.includes(item)) nextActions.push(item)
+    }
+  }
+
+  if (safeContext.requiresTests) {
+    if (tests.ran !== true) {
+      addMissing("Run tests", "Run the full test suite and capture output")
+    } else {
+      if (tests.skipped === true || typeof tests.skip_reason === "string") {
+        addMissing("Do not skip required tests", "Run required tests and document passing results")
+      }
+      if (tests.results !== "pass") {
+        addMissing("Fix failing tests", "Fix failing tests and re-run")
+      }
+      if (tests.ran_after_changes !== true) {
+        addMissing("Re-run tests after latest changes", "Re-run tests after latest changes")
+      }
+    }
+  }
+
+  if (safeContext.requiresLocalTests) {
+    const ranCommands = tests.commands || []
+    if (ranCommands.length === 0) {
+      addMissing("Provide local test commands", "Run local tests and include commands in self-assessment")
+    } else {
+      const normalizedRecent = safeContext.recentCommands.map(normalizeCommand)
+      const normalizedEvidence = ranCommands.map(normalizeCommand)
+      const hasMatch = normalizedEvidence.some(cmd => normalizedRecent.includes(cmd))
+      if (!hasMatch) {
+        addMissing("Provide local test commands from this session", "Run local tests in this session and include exact commands")
+      }
+    }
+  }
+
+  if (safeContext.requiresBuild) {
+    if (build.ran !== true) {
+      addMissing("Run build/compile", "Run the build/compile step and confirm success")
+    } else if (build.results !== "pass") {
+      addMissing("Fix build failures", "Fix build errors and re-run")
+    }
+  }
+
+  if (safeContext.requiresPR) {
+    if (pr.created !== true) {
+      addMissing("Create PR", "Create a pull request with summary and checklist")
+    } else if (safeContext.requiresCI) {
+      if (!pr.url) {
+        addMissing("Provide PR link", "Include the PR URL in the self-assessment")
+      }
+      if (!hasPrSignal) {
+        addMissing("Provide PR creation evidence", "Create the PR using gh or include evidence of PR creation")
+      }
+      if (pr.checked !== true) {
+        addMissing("Verify CI checks", "Run `gh pr checks` or `gh pr view` and report results")
+      } else if (pr.ci_status !== "pass") {
+        addMissing("Fix failing CI", "Fix CI failures and re-run checks")
+      }
+      if (!hasCiSignal) {
+        addMissing("Provide CI check evidence", "Use `gh pr checks` or `gh pr view` and include results")
+      }
+    }
+  }
+
+  if (safeContext.pushedToDefaultBranch) {
+    addMissing("Avoid direct push to default branch", "Revert direct push and open a PR instead")
+  }
+
+  if (stuck) {
+    addMissing("Rethink approach", "Propose an alternate approach and continue")
+  }
+
+  const humanOnlyNextSteps = (assessment.next_steps || []).filter(item => isHumanOnlyAction(item))
+  const requiresHumanAction = humanNeeds.length > 0 || humanOnlyNextSteps.length > 0 || missing.some(isHumanOnlyAction) || nextActions.some(isHumanOnlyAction)
+  const complete = status === "complete" && missing.length === 0 && confidence >= 0.8 && !requiresHumanAction
+
+  let severity: SupervisorAnalysis["severity"] = "NONE"
+  const severityItems = missing.length > 0 ? missing : nextActions
+  if (severityItems.some(item => /test|build/i.test(item))) severity = "HIGH"
+  else if (severityItems.some(item => /CI|check/i.test(item))) severity = "MEDIUM"
+  else if (severityItems.length > 0) severity = "LOW"
+
+  if (requiresHumanAction && missing.length === 0 && nextActions.length === 0) severity = "LOW"
+
+  if (assessment.next_steps?.length) {
+    for (const step of assessment.next_steps) {
+      if (!nextActions.includes(step)) nextActions.push(step)
+    }
+  }
+
+  const actionableMissing = missing.filter(item => !isHumanOnlyAction(item))
+  const finalActionableNextActions = nextActions.filter(item => !isHumanOnlyAction(item))
+  const finalShouldContinue = actionableMissing.length > 0 || finalActionableNextActions.length > 0
+  const finalReason = complete
+    ? "Self-assessment confirms completion with required evidence"
+    : requiresHumanAction && !finalShouldContinue
+      ? "User action required before continuing"
+      : missing.length || finalActionableNextActions.length
+        ? "Missing required workflow steps"
+        : "Task not confirmed complete"
+
+  return {
+    complete,
+    shouldContinue: finalShouldContinue,
+    reason: finalReason,
+    missing,
+    nextActions,
+    requiresHumanAction,
+    severity
+  }
+}
+
+export function buildJudgePrompt(
+  context: TaskContext,
+  selfAssessment: string,
+  toolSupervisorPrompt?: string | null,
+  rubric?: Rubric
+): string {
+  const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
+  return `ANALYZE SUPERVISOR
+
+You are validating an agent's self-assessment against workflow requirements.
+
+## Task Summary
+${context.taskSummary}
+
+## Task Type
+${context.taskType}
+
+## Workflow Requirements
+- Tests required: ${context.requiresTests}
+- Build required: ${context.requiresBuild}
+- PR required: ${context.requiresPR}
+- CI checks required: ${context.requiresCI}
+- Local test commands required: ${context.requiresLocalTests}
+
+## Tool Signals
+${context.toolsSummary}
+
+## Agent Self-Assessment
+${selfAssessment.slice(0, 4000)}
+${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
+
+Rules:
+${rb.patterns}
+
+${rb.antipatterns}
+
+Return JSON only:
+{
+  "complete": true/false,
+  "severity": "NONE|LOW|MEDIUM|HIGH|BLOCKER",
+  "feedback": "brief explanation",
+  "missing": ["missing steps"],
+  "next_actions": ["actions to take"],
+  "requires_human_action": true/false
+}`
+}
+
+async function analyzeSelfAssessmentWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  selfAssessment: string,
+  judgeSessionIds: Set<string>,
+  toolSupervisorPrompt?: string | null,
+  rubric?: Rubric
+): Promise<SupervisorAnalysis | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const attempts = modelList.length
+    ? modelList
+    : preferredModel && !isBlockedJudgeModel(preferredModel)
+      ? [preferredModel]
+      : [""]
+
+  const prompt = buildJudgePrompt(context, selfAssessment, toolSupervisorPrompt, rubric)
+
+  for (const modelSpec of attempts) {
+    let judgeSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      judgeSession = data
+    } catch {
+      return null
+    }
+    if (!judgeSession?.id) return null
+    judgeSessionIds.add(judgeSession.id)
+
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: judgeSession.id },
+        body
+      })
+
+      const response = await waitForResponse(client, judgeSession.id)
+      if (!response) continue
+
+      const jsonMatch = response.match(/\{[\s\S]*\}/)
+      if (!jsonMatch) continue
+
+      const verdict = JSON.parse(jsonMatch[0]) as any
+      const missing = Array.isArray(verdict.missing) ? verdict.missing : []
+      const humanOnlyMissing = missing.filter((item: string) => isHumanOnlyAction(item))
+      const actionableMissing = missing.filter((item: string) => !isHumanOnlyAction(item))
+      const actionableNextActions = Array.isArray(verdict.next_actions)
+        ? verdict.next_actions.filter((item: string) => typeof item === "string" && !isHumanOnlyAction(item))
+        : []
+      const shouldContinue = !verdict.complete && (actionableMissing.length > 0 || actionableNextActions.length > 0)
+      const requiresHumanAction = !!verdict.requires_human_action || humanOnlyMissing.length > 0
+      return {
+        complete: !!verdict.complete,
+        shouldContinue,
+        reason: verdict.feedback || "Judge analysis completed",
+        missing,
+        nextActions: Array.isArray(verdict.next_actions) ? verdict.next_actions : [],
+        requiresHumanAction,
+        severity: verdict.severity || "MEDIUM"
+      }
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "judge-session" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: judgeSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(judgeSession.id)
+    }
+  }
+
+  return null
+}
+
+async function runCrossModelReview(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  selfAssessment: string,
+  analysis: SupervisorAnalysis,
+  lastAssistantText: string,
+  assessmentModelSpec: string | null,
+  judgeSessionIds: Set<string>,
+  toolSupervisorPrompt?: string | null
+): Promise<{ modelSpec: string; response: string } | null> {
+  const crossModelSpec = getCrossReviewModelSpec(assessmentModelSpec)
+  if (!crossModelSpec) return null
+
+  debug("Starting cross-model review session with model:", crossModelSpec)
+
+  let reviewSession: any
+  try {
+    const { data } = await client.session.create({ query: { directory } })
+    reviewSession = data
+  } catch {
+    debug("Failed to create cross-review session")
+    return null
+  }
+  if (!reviewSession?.id) return null
+  judgeSessionIds.add(reviewSession.id)
+
+  const prompt = `REVIEW SUPERVISOR COMPLETION
+
+You are reviewing another model's completion verdict for an agent task.
+Provide a concise critique and supervisor:
+- Does the self-assessment evidence justify completion?
+- Any missing workflow gates (tests/build/PR/CI)?
+- Any inconsistencies between tool signals and the agent's claim?
+- Provide a short supervisor: what could have been stronger?
+
+## Task Summary
+${context.taskSummary}
+
+## Task Type
+${context.taskType}
+
+## Tool Signals
+${context.toolsSummary}
+
+## Agent Last Response
+${lastAssistantText.slice(0, 2000)}
+
+## Self-Assessment
+${selfAssessment.slice(0, 3000)}
+${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
+
+## Supervisor Analysis Verdict
+${JSON.stringify(analysis, null, 2)}
+
+Return a short paragraph plus bullet list of any gaps.`
+
+  try {
+    const modelParts = parseModelSpec(crossModelSpec)
+    const body: any = { parts: [{ type: "text", text: prompt }] }
+    if (modelParts) body.model = modelParts
+
+    await client.session.promptAsync({
+      path: { id: reviewSession.id },
+      body
+    })
+
+    const response = await waitForResponse(client, reviewSession.id)
+    if (!response) return null
+    return { modelSpec: crossModelSpec, response }
+  } catch (e) {
+    reportError(e, { plugin: "supervisor-3", op: "cross-review" })
+    return null
+  } finally {
+    try {
+      await client.session.delete({ path: { id: reviewSession.id }, query: { directory } })
+    } catch {}
+    judgeSessionIds.delete(reviewSession.id)
+  }
+}
+
+export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
+  initDebugLogger(directory)
+  const judgeSessionIds = new Set<string>()
+  const lastReflectedMsgId = new Map<string, string>()
+  const activeSupervisors = new Set<string>()
+  const recentlyAbortedSessions = new Map<string, number>()
+  const attempts = new Map<string, number>()
+  let toolSupervisorPrompt: string | null = null
+  let currentSessionId: string | null = null  // tracks most recent active session for the toggle tool
+
+  const disabledFlagPath = join(directory, '.supervisor', 'disabled')
+
+  async function isSessionDisabled(sessionId: string): Promise<boolean> {
+    try {
+      const content = await readFile(disabledFlagPath, 'utf8')
+      return content.split('\n').map(l => l.trim()).filter(Boolean).includes(sessionId)
+    } catch { return false }
+  }
+
+  async function setSessionDisabled(sessionId: string, disabled: boolean): Promise<void> {
+    let lines: string[] = []
+    try {
+      const content = await readFile(disabledFlagPath, 'utf8')
+      lines = content.split('\n').map(l => l.trim()).filter(Boolean)
+    } catch {}
+    if (disabled) {
+      if (!lines.includes(sessionId)) lines.push(sessionId)
+    } else {
+      lines = lines.filter(l => l !== sessionId)
+    }
+    await mkdir(join(directory, '.supervisor'), { recursive: true })
+    await writeFile(disabledFlagPath, lines.join('\n') + (lines.length ? '\n' : ''))
+  }
+
+  const setSupervisorDescription = "Use this for difficult or complex tasks to set supervisor guidance with a plan/checklist. Provide concrete steps and verification checks so supervisor can validate completion quality and catch missed work."
+  const executeSetSupervisor = async (args: { guidance?: string; clear?: boolean }) => {
+    if (args.clear) {
+      toolSupervisorPrompt = null
+      return "Cleared tool-provided supervisor guidance. Supervisor now uses file override (.supervisor.md/supervisor.md) or default prompt."
+    }
+    const guidance = (args.guidance || "").trim()
+    if (!guidance) {
+      if (!toolSupervisorPrompt) {
+        return "No tool-provided supervisor guidance is set."
+      }
+      return `Current tool-provided supervisor guidance:\n${toolSupervisorPrompt}`
+    }
+    toolSupervisorPrompt = guidance
+    const msg = "Set tool-provided supervisor guidance for this runtime. It will be used when no .supervisor.md/supervisor.md file override exists."
+    if (guidance.length > 4000) return `${msg}\n\nNote: guidance exceeds 4000 chars and will be truncated when applied to supervisor prompts.`
+    return msg
+  }
+
+  // Primary supervisor tool: status, session on/off, and mode selection.
+  const supervisorToggleDescription = "Inspect or change supervisor state for the current session. Use mode=autopilot or mode=reflection to switch modes. Use action=off/on for session disable/enable, or omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
+  const executeSupervisorToggle = async (args: { action?: string; mode?: SupervisorMode; condition?: string; clear?: boolean; n?: number } = {}) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session tracked yet — wait for the first session.idle event, then try again."
+    const requestedMode = args.mode?.trim().toLowerCase()
+    if (requestedMode === "autopilot") {
+      await supervisorStore.setMode(directory, sid, "autopilot")
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+    }
+    if (requestedMode === "reflection") {
+      await supervisorStore.setMode(directory, sid, "reflection")
+      return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
+    }
+    const action = (args.action || "status").trim().toLowerCase()
+    if (action === "off") {
+      await setSessionDisabled(sid, true)
+      return `Supervisor disabled for session ${sid.slice(0, 8)}… (added to .supervisor/disabled).`
+    }
+    if (action === "on") {
+      await setSessionDisabled(sid, false)
+      return `Supervisor enabled for session ${sid.slice(0, 8)}… (removed from .supervisor/disabled).`
+    }
+    if (action === "autopilot") {
+      await supervisorStore.setMode(directory, sid, "autopilot")
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+    }
+    if (action === "reflection") {
+      await supervisorStore.setMode(directory, sid, "reflection")
+      return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
+    }
+    if (action === "goal") {
+      return executeSupervisorGoal({ condition: args.condition, clear: args.clear })
+    }
+    if (action === "retry") {
+      return executeSupervisorRetry({ n: args.n })
+    }
+    const disabled = await isSessionDisabled(sid)
+    const st = await supervisorStore.load(directory, sid)
+    const mode = resolveSupervisorMode(st)
+    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}${goalText}`
+  }
+
+  // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
+  // update USER-LOCAL patterns). Web-app portable (works in TUI, web, and serve).
+  const supervisorTrainDescription = "Train the supervisor on recent sessions: mine how the agent stopped and how the user followed up, then update the user-local patterns/anti-patterns. Never commits to git; dataset stays private. Args: since (e.g. '14d'), dryRun (preview only), pushHf (push private dataset to HuggingFace)."
+  const executeSupervisorTrain = async (args: { since?: string; dryRun?: boolean; pushHf?: boolean }) => {
+    const trainScript = join(dirname(fileURLToPath(import.meta.url)), "..", "train", "run-train.mjs")
+    const argv = [trainScript, `--since=${args.since || "14d"}`]
+    if (args.dryRun) argv.push("--dry-run")
+    if (args.pushHf) argv.push("--push-hf")
+    return await new Promise<string>((resolve) => {
+      execFile("node", argv, { cwd: directory, timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const out = `${stdout || ""}${stderr ? `\n[stderr]\n${stderr}` : ""}`.trim()
+        if (err) resolve(`supervisor:train failed (${err.message}).\n${out.slice(-4000)}`)
+        else resolve(out.slice(-8000) || "supervisor:train completed (no output).")
+      })
+    })
+  }
+
+  // supervisor_goal / supervisor_retry tools — wire the supervisor-mode goal loop
+  // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
+  // this per-session state on the next session.idle.
+  const supervisorGoalDescription = "Set, check, or clear a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear)."
+  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
+    if (args.clear) {
+      await supervisorStore.clearGoal(directory, sid)
+      return `Goal cleared for session ${sid.slice(0, 8)}….`
+    }
+    const condition = (args.condition || "").trim()
+    if (!condition) {
+      const st = await supervisorStore.load(directory, sid)
+      if (!st.goal) return "No goal set for this session."
+      return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+    }
+    await supervisorStore.setGoal(directory, sid, condition, {})
+    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out).`
+  }
+  const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
+  const executeSupervisorRetry = async (args: { n?: number }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then set retry."
+    if (typeof args.n === "number" && Number.isFinite(args.n)) {
+      await supervisorStore.setRetry(directory, sid, args.n)
+      const eff = resolveMaxAttempts({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
+      return `Retry budget set to ${eff} for session ${sid.slice(0, 8)}….`
+    }
+    const st = await supervisorStore.load(directory, sid)
+    return `Retry budget (session override): ${st.maxAttempts ?? "(default)"}.`
+  }
+
+  // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
+  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call autopilot_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
+  const executeSupervisorAutopilot = async (args: { enabled: boolean }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then toggle autopilot."
+    await supervisorStore.setAutopilot(directory, sid, args.enabled)
+    if (args.enabled) {
+      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+    }
+    return `Autopilot disabled for session ${sid.slice(0, 8)}….`
+  }
+
+  // autopilot_exit tool — signal that autopilot work is complete
+  const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
+Call this tool:
+- After finishing the autonomous implementation task
+- When you are ready to provide a final concise summary
+Do NOT call this tool:
+- Before implementation work is complete
+- If you still need to run more tools to finish the task`
+  const executeAutopilotExit = async () => {
+    const sid = currentSessionId
+    if (sid) {
+      await supervisorStore.setAutopilot(directory, sid, false)
+    }
+    return { title: "Exited autopilot", output: "Autopilot completed." }
+  }
+
+  let setSupervisorTool: any = null
+  let supervisorToggleTool: any = null
+  let supervisorTrainTool: any = null
+  let supervisorGoalTool: any = null
+  let supervisorRetryTool: any = null
+  let supervisorAutopilotTool: any = null
+  let autopilotExitTool: any = null
+  try {
+    const { tool } = await import("@opencode-ai/plugin/tool")
+    supervisorGoalTool = tool({
+      description: supervisorGoalDescription,
+      args: {
+        condition: tool.schema.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal.")
+      },
+      execute: executeSupervisorGoal as any
+    })
+    supervisorRetryTool = tool({
+      description: supervisorRetryDescription,
+      args: {
+        n: tool.schema.number().optional().describe("Retry budget (1–100). Omit to check current.")
+      },
+      execute: executeSupervisorRetry as any
+    })
+    supervisorTrainTool = tool({
+      description: supervisorTrainDescription,
+      args: {
+        since: tool.schema.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
+        dryRun: tool.schema.boolean().optional().describe("Preview the proposed pattern changes without writing."),
+        pushHf: tool.schema.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
+      },
+      execute: executeSupervisorTrain as any
+    })
+    setSupervisorTool = tool({
+      description: setSupervisorDescription,
+      args: {
+        guidance: tool.schema.string().optional().describe("Supervisor guidance. Include a concise plan/checklist for complex work and evidence expectations."),
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current tool-provided supervisor guidance.")
+      },
+      execute: executeSetSupervisor
+    })
+    supervisorToggleTool = tool({
+      description: supervisorToggleDescription,
+      args: {
+        mode: tool.schema.string().optional().describe("Supervisor mode to set: autopilot or reflection. Prefer this over action for mode changes."),
+        action: tool.schema.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
+        condition: tool.schema.string().optional().describe("Goal text when action is 'goal'."),
+        clear: tool.schema.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+        n: tool.schema.number().optional().describe("Retry budget when action is 'retry'.")
+      },
+      execute: executeSupervisorToggle as any
+    })
+    supervisorAutopilotTool = tool({
+      description: supervisorAutopilotDescription,
+      args: {
+        enabled: tool.schema.boolean().describe("Set true to enable autopilot mode, false to disable it.")
+      },
+      execute: executeSupervisorAutopilot as any
+    })
+    autopilotExitTool = tool({
+      description: autopilotExitDescription,
+      args: {},
+      execute: executeAutopilotExit as any
+    })
+  } catch {
+    try {
+      const { z } = await import("zod")
+      setSupervisorTool = {
+        description: setSupervisorDescription,
+        args: {
+          guidance: z.string().optional().describe("Supervisor guidance. Include a concise plan/checklist for complex work and evidence expectations."),
+          clear: z.boolean().optional().describe("Set true to clear the current tool-provided supervisor guidance.")
+        },
+        execute: executeSetSupervisor
+      }
+      supervisorToggleTool = {
+        description: supervisorToggleDescription,
+        args: {
+          mode: z.enum(["autopilot", "reflection"]).optional().describe("Supervisor mode to set. Prefer this over action for mode changes."),
+          action: z.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
+          condition: z.string().optional().describe("Goal text when action is 'goal'."),
+          clear: z.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+          n: z.number().optional().describe("Retry budget when action is 'retry'.")
+        },
+        execute: executeSupervisorToggle
+      }
+      supervisorTrainTool = {
+        description: supervisorTrainDescription,
+        args: {
+          since: z.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
+          dryRun: z.boolean().optional().describe("Preview the proposed pattern changes without writing."),
+          pushHf: z.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
+        },
+        execute: executeSupervisorTrain
+      }
+      supervisorGoalTool = {
+        description: supervisorGoalDescription,
+        args: {
+          condition: z.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
+          clear: z.boolean().optional().describe("Set true to clear the current session goal.")
+        },
+        execute: executeSupervisorGoal
+      }
+      supervisorRetryTool = {
+        description: supervisorRetryDescription,
+        args: {
+          n: z.number().optional().describe("Retry budget (1–100). Omit to check current.")
+        },
+        execute: executeSupervisorRetry
+      }
+      supervisorAutopilotTool = {
+        description: supervisorAutopilotDescription,
+        args: {
+          enabled: z.boolean().describe("Set true to enable autopilot mode, false to disable it.")
+        },
+        execute: executeSupervisorAutopilot
+      }
+      autopilotExitTool = {
+        description: autopilotExitDescription,
+        args: {},
+        execute: executeAutopilotExit
+      }
+    } catch {
+      setSupervisorTool = null
+      supervisorToggleTool = null
+      supervisorTrainTool = null
+      supervisorGoalTool = null
+      supervisorRetryTool = null
+      supervisorAutopilotTool = null
+      autopilotExitTool = null
+    }
+  }
+
+  async function runSupervisor(sessionId: string): Promise<void> {
+      debug("runSupervisor called for session:", sessionId.slice(0, 8))
+      if (activeSupervisors.has(sessionId)) return
+
+      currentSessionId = sessionId
+      if (await isSessionDisabled(sessionId)) {
+        debug("Supervisor disabled for session:", sessionId.slice(0, 8))
+        return
+      }
+
+      activeSupervisors.add(sessionId)
+
+      try {
+        let messages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          messages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session not found (likely deleted), skipping supervisor:", sessionId.slice(0, 8))
+          return
+        }
+        if (!messages || messages.length < 2) return
+
+        if (isJudgeSession(sessionId, messages, judgeSessionIds)) return
+        if (isPlanMode(messages)) return
+
+        // Issue #82 / Issue #109: ESC-abort detection.
+        // Previously we checked time.completed on the last assistant message, but
+        // that caused false negatives — sessions where the model stopped producing
+        // output (context exhaustion, rate limit, etc.) also lack time.completed,
+        // and supervisor would silently skip them.
+        // We now rely solely on the recentlyAbortedSessions map (populated by
+        // session.error with MessageAbortedError) plus a brief delay in the event
+        // handler to handle the race where session.idle fires before session.error.
+
+        const lastUserMsgId = getLastRelevantUserMessageId(messages)
+        if (!lastUserMsgId) return
+
+        const initialUserMsgId = lastUserMsgId
+        const attemptKey = `${sessionId}:${lastUserMsgId}`
+        const lastReflectedId = lastReflectedMsgId.get(sessionId)
+        if (lastUserMsgId === lastReflectedId) return
+
+        const context = await buildTaskContext(messages, directory)
+        if (!context) return
+
+        const lastAssistantText = extractLastAssistantText(messages)
+        const customPrompt = await loadSupervisorPrompt(directory)
+        const agents = await getAgentsFile(directory)
+        const rubric = await loadRubric(directory)
+        const currentAttemptCount = attempts.get(attemptKey) || 0
+        // Supervisor goal/retry state. A /supervisor:retry override applies even
+        // without a goal (sessionOverride). An active goal augments the judge
+        // rubric with a mandatory completion requirement and drives the goal loop.
+        const sup = await supervisorStore.load(directory, sessionId)
+        const mode = resolveSupervisorMode(sup) as SupervisorMode
+        const goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+        const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
+
+        // ── Autopilot fast-path ──────────────────────────────────────────
+        // When autopilot is on, skip the judge entirely and inject a
+        // prescriptive nudge directly into the active session. Still honour
+        // the attempt budget and loop detectors as safety rails.
+        if (mode === "autopilot") {
+          const autopilotAttempt = (attempts.get(attemptKey) || 0) + 1
+          attempts.set(attemptKey, autopilotAttempt)
+
+          if (autopilotAttempt >= effectiveMaxAttempts) {
+            await supervisorStore.setAutopilot(directory, sessionId, false)
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            await showToast(client, directory, `Autopilot budget exhausted (${effectiveMaxAttempts} attempts)`, "warning")
+            debug("Autopilot budget exhausted for", sessionId.slice(0, 8))
+            return
+          }
+
+          const loopCheck = detectPlanningLoop(messages)
+          const usePlanningLoopMsg = shouldApplyPlanningLoop(context.taskType, loopCheck.detected)
+          const actionLoopCheck = detectActionLoop(messages)
+
+          if (usePlanningLoopMsg || actionLoopCheck.detected) {
+            // Loop detected — use the normal escalating feedback for loops
+            const loopFeedback = buildEscalatingFeedback(
+              autopilotAttempt,
+              "HIGH",
+              { feedback: "Autopilot loop detected — take concrete action.", missing: [], next_actions: [] },
+              usePlanningLoopMsg,
+              actionLoopCheck.detected,
+              effectiveMaxAttempts
+            )
+            try {
+              await client.session.promptAsync({
+                path: { id: sessionId },
+                body: { parts: [{ type: "text", text: loopFeedback }] }
+              })
+            } catch (e: any) {
+              debug("promptAsync failed (autopilot loop):", e?.message || e)
+              reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot-loop" })
+            }
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            return
+          }
+
+          // Normal autopilot nudge — no judge, just continue
+          const nudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
+
+You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
+
+When you have genuinely completed ALL work (not just one step), call the autopilot_exit tool to hand control back.
+
+Continue now.`
+
+          await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${effectiveMaxAttempts})`, "info")
+          try {
+            await client.session.promptAsync({
+              path: { id: sessionId },
+              body: { parts: [{ type: "text", text: nudge }] }
+            })
+          } catch (e: any) {
+            debug("promptAsync failed (autopilot nudge):", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot" })
+          }
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+
+        // When a goal is active, its condition is the strongest stated intent and
+        // MUST compose with the existing gates.
+        const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
+        const effRubric: Rubric = goalSection
+          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+          : rubric
+
+        // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
+        const defaultSupervisorPrompt = await buildReflectionPromptFromFiles(
+          directory,
+          context,
+          agents,
+          lastAssistantText,
+          currentAttemptCount,
+          effectiveMaxAttempts,
+          goalSection || undefined
+        )
+        let supervisorPrompt: string
+        let effectiveToolSupervisorPrompt: string | null
+        let promptSource: "file" | "tool" | "default" | "goal"
+        if (goal) {
+          // Goal active: use the default (goal-augmented) prompt directly.
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "goal"
+        } else {
+          const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
+          supervisorPrompt = resolvedPrompt.prompt
+          effectiveToolSupervisorPrompt = resolvedPrompt.effectiveToolSupervisorPrompt
+          promptSource = resolvedPrompt.source
+        }
+
+        await showToast(client, directory, "Requesting supervisor self-assessment...", "info")
+        debug("Requesting supervisor self-assessment (source:", promptSource, ")")
+
+        // Issue #98: Run self-assessment in a separate ephemeral session instead
+        // of prompting the active agent session. Asking the active session to
+        // respond in JSON poisons its context, causing subsequent replies to be
+        // JSON-only.
+        const modelList = await loadSupervisorModelList()
+        const preferredModel = await loadPreferredModelSpec(directory)
+        const assessmentAttempts = modelList.length
+          ? modelList
+          : preferredModel && !isBlockedJudgeModel(preferredModel)
+            ? [preferredModel]
+            : [""]
+
+      let selfAssessment: string | null = null
+      let assessmentModelSpec: string | null = null
+      for (const modelSpec of assessmentAttempts) {
+        let assessmentSession: any
+        try {
+          const { data } = await client.session.create({ query: { directory } })
+            assessmentSession = data
+          } catch {
+            debug("Failed to create self-assessment session")
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            return
+          }
+          if (!assessmentSession?.id) {
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            return
+          }
+          judgeSessionIds.add(assessmentSession.id)
+
+          try {
+            const modelParts = modelSpec ? modelSpec.split("/") : []
+            const providerID = modelParts[0] || ""
+            const modelID = modelParts.slice(1).join("/") || ""
+            const body: any = { parts: [{ type: "text", text: supervisorPrompt }] }
+            if (providerID && modelID) body.model = { providerID, modelID }
+
+            await client.session.promptAsync({
+              path: { id: assessmentSession.id },
+              body
+            })
+
+            selfAssessment = await waitForResponse(client, assessmentSession.id)
+            if (selfAssessment) {
+              assessmentModelSpec = modelSpec || null
+              break
+            }
+          } catch (e: any) {
+            debug("promptAsync failed (self-assessment):", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "prompt-self-assessment" })
+            continue
+          } finally {
+            try {
+              await client.session.delete({ path: { id: assessmentSession.id }, query: { directory } })
+            } catch {}
+            judgeSessionIds.delete(assessmentSession.id)
+          }
+        }
+
+        if (!selfAssessment) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+
+        debug("Self-assessment received")
+
+        // Check if user sent a new message or aborted during assessment
+        const abortTime = recentlyAbortedSessions.get(sessionId)
+        if (abortTime) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+
+        let currentMessages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          currentMessages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session deleted during supervisor, aborting:", sessionId.slice(0, 8))
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+        const currentUserMsgId = getLastRelevantUserMessageId(currentMessages || [])
+        if (currentUserMsgId && currentUserMsgId !== initialUserMsgId) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, initialUserMsgId)
+          return
+        }
+
+        let analysis: SupervisorAnalysis | null = null
+        const parsedAssessment = parseSelfAssessmentJson(selfAssessment)
+        if (parsedAssessment) {
+          analysis = evaluateSelfAssessment(parsedAssessment, context)
+        } else {
+          analysis = await analyzeSelfAssessmentWithLLM(
+            client,
+            directory,
+            context,
+            selfAssessment,
+            judgeSessionIds,
+            effectiveToolSupervisorPrompt,
+            effRubric
+          )
+        }
+
+        if (!analysis) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          await showToast(client, directory, "Supervisor analysis failed", "warning")
+          return
+        }
+
+        debug("Supervisor analysis completed")
+
+        // Supervisor goal loop: when an active goal exists, decide its next state
+        // (budget exhaustion FIRST, then achievement, then continuation). An
+        // exhausted goal pauses the loop WITHOUT injecting a continuation; an
+        // achieved goal is persisted and falls through to the normal complete
+        // bookkeeping; a continuing goal must ONLY burn budget (attempts+1) when a
+        // continuation is actually injected — so we defer that persist until after
+        // the feedback prompt succeeds (see pendingGoalContinue below). This avoids
+        // silently losing budget on interrupted passes (human-action, new-message,
+        // abort, or per-message max-attempts rechecks that early-return).
+        let pendingGoalContinue: SupervisorState | null = null
+        if (goal) {
+          const t = decideGoalTransition({
+            goal,
+            complete: analysis.complete,
+            now: Date.now(),
+            maxAttempts: effectiveMaxAttempts,
+            reason: analysis.reason,
+          })
+          if (t.action === "exhausted") {
+            await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+            attempts.delete(attemptKey)
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            await showToast(
+              client,
+              directory,
+              `Goal budget exhausted (${t.goal.attempts} attempts) — paused`,
+              "warning"
+            )
+            debug("Goal budget exhausted, pausing without continuation")
+            return
+          }
+          if (t.action === "achieved") {
+            // Persist the achieved status now; the existing analysis.complete
+            // branch below handles the bookkeeping + return. No attempts increment.
+            await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+          } else {
+            // "continue": DO NOT persist the attempts++ here. Stash it and only
+            // write it after a continuation is actually injected (post-promptAsync
+            // success). Any early-return below leaves goal.attempts unchanged.
+            pendingGoalContinue = { ...sup, mode: "goal", autopilot: false, goal: t.goal }
+          }
+        }
+
+        let crossReview: { modelSpec: string; response: string } | null = null
+        if (analysis.complete) {
+          debug("Task complete, attempting cross-model review (assessmentModel:", assessmentModelSpec || "unknown", ")")
+          crossReview = await runCrossModelReview(
+            client,
+            directory,
+            context,
+            selfAssessment,
+            analysis,
+            lastAssistantText,
+            assessmentModelSpec,
+            judgeSessionIds,
+            effectiveToolSupervisorPrompt
+          )
+          if (crossReview) {
+            debug("Cross-model review completed by", crossReview.modelSpec)
+          } else {
+            debug("Cross-model review skipped (no cross-model mapping or error)")
+          }
+        }
+
+        // Compute routing early so it can be included in saved data
+        const routingConfig = await loadRoutingConfig()
+        const routingCategory = await classifyTaskForRoutingWithLLM(client, directory, context, judgeSessionIds)
+        const routingModel = getRoutingModel(routingConfig, routingCategory)
+
+        await saveSupervisorData(directory, sessionId, {
+          task: context.taskSummary,
+          assessment: selfAssessment.slice(0, 4000),
+          analysis,
+          crossReview,
+          routing: routingModel ? { category: routingCategory, model: routingModel } : null,
+          timestamp: new Date().toISOString()
+        })
+
+        await writeVerdictSignal(directory, sessionId, analysis.complete, analysis.severity)
+
+        if (analysis.complete) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
+          debug("Supervisor complete")
+          return
+        }
+
+        if (analysis.requiresHumanAction && !analysis.shouldContinue) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
+          await showToast(client, directory, `Action needed: ${hint}`, "warning")
+          debug("Supervisor requires human action (no agent-actionable work remaining)")
+          return
+        }
+
+        // Re-check for new user messages or abort before feedback injection
+        // (analysis/judge phase can take significant time)
+        let preFeedbackMessages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          preFeedbackMessages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session deleted before feedback injection, aborting:", sessionId.slice(0, 8))
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+        const preFeedbackUserMsgId = getLastRelevantUserMessageId(preFeedbackMessages || [])
+        if (preFeedbackUserMsgId && preFeedbackUserMsgId !== initialUserMsgId) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, initialUserMsgId)
+          debug("User sent new message during analysis, skipping feedback")
+          return
+        }
+        const preFeedbackAbort = recentlyAbortedSessions.get(sessionId)
+        if (preFeedbackAbort) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          debug("Session aborted during analysis, skipping feedback")
+          return
+        }
+
+        // When a goal is active, goal.attempts (persisted) guards the budget via
+        // decideGoalTransition above; this per-message counter still fires as the
+        // fallback cap for ordinary sessions without a goal. They coexist on purpose.
+        const nextAttemptCount = (attempts.get(attemptKey) || 0) + 1
+        attempts.set(attemptKey, nextAttemptCount)
+        if (nextAttemptCount >= effectiveMaxAttempts) {
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          await showToast(client, directory, `Max attempts (${effectiveMaxAttempts}) reached`, "warning")
+          debug("Max attempts reached for", sessionId.slice(0, 8))
+          return
+        }
+
+        const loopCheck = detectPlanningLoop(preFeedbackMessages || messages)
+        const usePlanningLoopMessage = shouldApplyPlanningLoop(context.taskType, loopCheck.detected)
+        const actionLoopCheck = detectActionLoop(preFeedbackMessages || messages)
+        const feedbackText = buildEscalatingFeedback(
+          nextAttemptCount,
+          analysis.severity || "MEDIUM",
+          {
+            feedback: analysis.reason || "Task incomplete",
+            missing: analysis.missing,
+            next_actions: analysis.nextActions
+          },
+          usePlanningLoopMessage,
+          actionLoopCheck.detected,
+          effectiveMaxAttempts
+        )
+
+        // Apply task-based model routing to feedback injection
+        const feedbackBody: any = { parts: [{ type: "text", text: feedbackText }] }
+        if (routingModel) {
+          feedbackBody.model = routingModel
+          debug("Routing feedback to", routingCategory, "model:", JSON.stringify(routingModel))
+        }
+
+        try {
+          await client.session.promptAsync({
+            path: { id: sessionId },
+            body: feedbackBody
+          })
+        } catch (e: any) {
+          debug("promptAsync failed (feedback):", e?.message || e)
+          reportError(e, { plugin: "supervisor-3", op: "prompt-feedback" })
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+
+        // Prevent supervisor loop: mark this task as reflected so the next
+        // session.idle (triggered by the agent responding to feedback) does not
+        // start another supervisor cycle for the same user message.
+        lastReflectedMsgId.set(sessionId, lastUserMsgId)
+
+        // Goal budget is burned ONLY here, after a continuation was actually
+        // injected. If any earlier recheck early-returned (or promptAsync above
+        // threw and returned), pendingGoalContinue was never set / never reached,
+        // so goal.attempts stays unchanged — no silent budget loss.
+        if (pendingGoalContinue) await supervisorStore.save(directory, sessionId, pendingGoalContinue)
+
+        debug("Supervisor pushed continuation")
+
+        const routingInfo = routingModel ? ` [${routingCategory} → ${routingModel.modelID}]` : ""
+        await showToast(client, directory, `Pushed agent to continue${routingInfo}`, "info")
+      } finally {
+        activeSupervisors.delete(sessionId)
+      }
+    }
+
+  return {
+    config: async (_config) => {
+      return
+    },
+    "tool.execute.before": async (input: { tool?: string; sessionID?: string }) => {
+      currentSessionId = trackSessionScopedToolSession(currentSessionId, input)
+    },
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
+      ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
+      ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
+      ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
+      ...(supervisorGoalTool ? { supervisor_goal: supervisorGoalTool } : {}),
+      ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
+      ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
+      ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
+    } : undefined,
+    event: async ({ event }: { event: { type: string; properties?: any } }) => {
+      debug("event received:", event.type)
+      if (event.type === "session.error") {
+        const props = (event as any).properties
+        const sessionId = props?.sessionID
+        const error = props?.error
+        if (sessionId && error?.name === "MessageAbortedError") {
+          recentlyAbortedSessions.set(sessionId, Date.now())
+          debug("Session aborted (Esc), cooldown started:", sessionId.slice(0, 8))
+        }
+      }
+
+      if (event.type === "session.idle") {
+        debug("session.idle received")
+        const sessionId = (event as any).properties?.sessionID
+        if (!sessionId || typeof sessionId !== "string") return
+
+        const abortTime = recentlyAbortedSessions.get(sessionId)
+        if (abortTime) {
+          const elapsed = Date.now() - abortTime
+          if (elapsed < ABORT_COOLDOWN) return
+          recentlyAbortedSessions.delete(sessionId)
+        }
+
+        // Issue #109: Brief delay before running supervisor to let session.error
+        // arrive first (handles race where session.idle fires before session.error
+        // when user presses ESC). After the delay, re-check the abort map.
+        await new Promise(resolve => setTimeout(resolve, ABORT_RACE_DELAY))
+        const postDelayAbortTime = recentlyAbortedSessions.get(sessionId)
+        if (postDelayAbortTime) {
+          debug("Session aborted during race delay, skipping supervisor:", sessionId.slice(0, 8))
+          return
+        }
+
+        try {
+          await runSupervisor(sessionId)
+        } catch (e: any) {
+          debug("runSupervisor error:", e?.message || e)
+          reportError(e, { plugin: "supervisor-3", op: "run-supervisor" })
+        }
+      }
+    }
+  }
+}
+
+export default SupervisorPlugin
