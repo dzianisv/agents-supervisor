@@ -77,6 +77,7 @@ export interface SupervisorGoal {
 export interface SupervisorState {
   maxAttempts?: number       // /supervisor:retry override (optional)
   goal?: SupervisorGoal
+  autopilot?: boolean        // autopilot mode: skip judge, always continue
 }
 
 function supervisorDir(directory: string): string {
@@ -145,6 +146,13 @@ export const supervisorStore = {
   async setRetry(directory: string, sessionId: string, n: number): Promise<SupervisorState> {
     const state = await supervisorStore.load(directory, sessionId)
     state.maxAttempts = n
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setAutopilot(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.autopilot = enabled
     await supervisorStore.save(directory, sessionId, state)
     return state
   },
@@ -1905,11 +1913,41 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     return `Retry budget (session override): ${st.maxAttempts ?? "(default)"}.`
   }
 
+  // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
+  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call autopilot_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
+  const executeSupervisorAutopilot = async (args: { enabled: boolean }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then toggle autopilot."
+    await supervisorStore.setAutopilot(directory, sid, args.enabled)
+    if (args.enabled) {
+      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+    }
+    return `Autopilot disabled for session ${sid.slice(0, 8)}….`
+  }
+
+  // autopilot_exit tool — signal that autopilot work is complete
+  const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
+Call this tool:
+- After finishing the autonomous implementation task
+- When you are ready to provide a final concise summary
+Do NOT call this tool:
+- Before implementation work is complete
+- If you still need to run more tools to finish the task`
+  const executeAutopilotExit = async () => {
+    const sid = currentSessionId
+    if (sid) {
+      await supervisorStore.setAutopilot(directory, sid, false)
+    }
+    return { title: "Exited autopilot", output: "Autopilot completed." }
+  }
+
   let setSupervisorTool: any = null
   let supervisorToggleTool: any = null
   let supervisorTrainTool: any = null
   let supervisorGoalTool: any = null
   let supervisorRetryTool: any = null
+  let supervisorAutopilotTool: any = null
+  let autopilotExitTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
     supervisorGoalTool = tool({
@@ -1950,6 +1988,18 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         action: tool.schema.string().describe("'on' to enable supervisor, 'off' to disable it for this project.")
       },
       execute: executeSupervisorToggle as any
+    })
+    supervisorAutopilotTool = tool({
+      description: supervisorAutopilotDescription,
+      args: {
+        enabled: tool.schema.boolean().describe("Set true to enable autopilot mode, false to disable it.")
+      },
+      execute: executeSupervisorAutopilot as any
+    })
+    autopilotExitTool = tool({
+      description: autopilotExitDescription,
+      args: {},
+      execute: executeAutopilotExit as any
     })
   } catch {
     try {
@@ -1993,12 +2043,26 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         },
         execute: executeSupervisorRetry
       }
+      supervisorAutopilotTool = {
+        description: supervisorAutopilotDescription,
+        args: {
+          enabled: z.boolean().describe("Set true to enable autopilot mode, false to disable it.")
+        },
+        execute: executeSupervisorAutopilot
+      }
+      autopilotExitTool = {
+        description: autopilotExitDescription,
+        args: {},
+        execute: executeAutopilotExit
+      }
     } catch {
       setSupervisorTool = null
       supervisorToggleTool = null
       supervisorTrainTool = null
       supervisorGoalTool = null
       supervisorRetryTool = null
+      supervisorAutopilotTool = null
+      autopilotExitTool = null
     }
   }
 
@@ -2059,6 +2123,73 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
         const sup = await supervisorStore.load(directory, sessionId)
         const goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
         const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
+
+        // ── Autopilot fast-path ──────────────────────────────────────────
+        // When autopilot is on, skip the judge entirely and inject a
+        // prescriptive nudge directly into the active session. Still honour
+        // the attempt budget and loop detectors as safety rails.
+        if (sup.autopilot) {
+          const autopilotAttempt = (attempts.get(attemptKey) || 0) + 1
+          attempts.set(attemptKey, autopilotAttempt)
+
+          if (autopilotAttempt >= effectiveMaxAttempts) {
+            await supervisorStore.setAutopilot(directory, sessionId, false)
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            await showToast(client, directory, `Autopilot budget exhausted (${effectiveMaxAttempts} attempts)`, "warning")
+            debug("Autopilot budget exhausted for", sessionId.slice(0, 8))
+            return
+          }
+
+          const loopCheck = detectPlanningLoop(messages)
+          const usePlanningLoopMsg = shouldApplyPlanningLoop(context.taskType, loopCheck.detected)
+          const actionLoopCheck = detectActionLoop(messages)
+
+          if (usePlanningLoopMsg || actionLoopCheck.detected) {
+            // Loop detected — use the normal escalating feedback for loops
+            const loopFeedback = buildEscalatingFeedback(
+              autopilotAttempt,
+              "HIGH",
+              { feedback: "Autopilot loop detected — take concrete action.", missing: [], next_actions: [] },
+              usePlanningLoopMsg,
+              actionLoopCheck.detected,
+              effectiveMaxAttempts
+            )
+            try {
+              await client.session.promptAsync({
+                path: { id: sessionId },
+                body: { parts: [{ type: "text", text: loopFeedback }] }
+              })
+            } catch (e: any) {
+              debug("promptAsync failed (autopilot loop):", e?.message || e)
+              reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot-loop" })
+            }
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            return
+          }
+
+          // Normal autopilot nudge — no judge, just continue
+          const nudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
+
+You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
+
+When you have genuinely completed ALL work (not just one step), call the autopilot_exit tool to hand control back.
+
+Continue now.`
+
+          await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${effectiveMaxAttempts})`, "info")
+          try {
+            await client.session.promptAsync({
+              path: { id: sessionId },
+              body: { parts: [{ type: "text", text: nudge }] }
+            })
+          } catch (e: any) {
+            debug("promptAsync failed (autopilot nudge):", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot" })
+          }
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
+
         // When a goal is active, its condition is the strongest stated intent and
         // MUST compose with the existing gates: build the DEFAULT rubric prompt
         // with the goal requirement appended, bypassing file/tool precedence.
@@ -2402,12 +2533,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     config: async (_config) => {
       return
     },
-    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool) ? {
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
       ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
       ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
       ...(supervisorGoalTool ? { supervisor_goal: supervisorGoalTool } : {}),
       ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
+      ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
+      ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
       debug("event received:", event.type)
