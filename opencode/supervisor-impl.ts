@@ -20,7 +20,7 @@ import {
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
 } from "../core/goal.mjs"
 export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
-export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec }
+export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 
 // Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
 async function reportError(err: unknown, context?: Record<string, string>): Promise<void> {
@@ -986,12 +986,11 @@ function getGitHubCopilotModelForRouting(modelSpec: string | null | undefined): 
   return null
 }
 
-function getCrossReviewModelSpec(modelSpec: string | null | undefined): string | null {
-  const parsed = parseModelSpec(modelSpec)
-  if (!parsed) return null
-  const modelID = parsed.modelID.toLowerCase()
-  if (modelID === "claude-opus-4.6") return "github-copilot/gpt-5.2-codex"
-  if (modelID === "gpt-5.2-codex") return "github-copilot/claude-opus-4.6"
+function getCrossReviewModelSpec(_modelSpec: string | null | undefined): string | null {
+  // Cross-review model pairings REMOVED: hardcoding model mappings
+  // (e.g. claude-opus→gpt-5.2-codex) caused silent failures when the target
+  // model/provider wasn't configured. Cross-review should be driven by explicit
+  // user configuration (supervisor.yaml models list), not guessed pairings.
   return null
 }
 
@@ -1000,8 +999,12 @@ async function classifyTaskForRoutingWithLLM(
   directory: string,
   context: TaskContext,
   judgeSessionIds: Set<string>,
-  sessionMessages?: any[]
+  sessionMessages?: any[],
+  opts?: { routingEnabled?: boolean }
 ): Promise<RoutingCategory | null> {
+  // Gate: skip entire classification when routing is disabled — saves tokens
+  if (opts?.routingEnabled === false) return null
+
   const modelList = await loadSupervisorModelList()
   const preferredModel = await loadPreferredModelSpec(directory)
   const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
@@ -2661,7 +2664,10 @@ Continue now.`
 
         // Compute routing early so it can be included in saved data
         const routingConfig = await loadRoutingConfig()
-        const routingCategory = await classifyTaskForRoutingWithLLM(client, directory, context, judgeSessionIds, currentMessages)
+        const routingCategory = await classifyTaskForRoutingWithLLM(
+          client, directory, context, judgeSessionIds, currentMessages,
+          { routingEnabled: routingConfig.enabled }
+        )
         const routingModel = getRoutingModel(routingConfig, routingCategory)
 
         await saveSupervisorData(directory, sessionId, {
@@ -2746,11 +2752,16 @@ Continue now.`
           effectiveMaxAttempts
         )
 
-        // Apply task-based model routing to feedback injection
+        // NEVER apply routing model to the active session feedback. The active
+        // session must keep its original model. Routing was removed because it
+        // silently switched the user's session model (e.g. to gpt-5.2-codex),
+        // breaking the session when the target model/provider wasn't available.
+        // If task-based routing is needed in the future, it must spawn a separate
+        // subagent session — never mutate the active session's model.
         const feedbackBody: any = { parts: [{ type: "text", text: feedbackText }] }
         if (routingModel) {
-          feedbackBody.model = routingModel
-          debug("Routing feedback to", routingCategory, "model:", JSON.stringify(routingModel))
+          // Log for diagnostics but do NOT apply to active session
+          debug("Routing would suggest", routingCategory, "model:", JSON.stringify(routingModel), "(NOT applied to active session)")
         }
 
         try {
@@ -2778,7 +2789,7 @@ Continue now.`
 
         debug("Supervisor pushed continuation")
 
-        const routingInfo = routingModel ? ` [${routingCategory} → ${routingModel.modelID}]` : ""
+        const routingInfo = routingModel ? ` [routing: ${routingCategory}]` : ""
         await showToast(client, directory, `Pushed agent to continue${routingInfo}`, "info")
       } finally {
         activeSupervisors.delete(sessionId)
