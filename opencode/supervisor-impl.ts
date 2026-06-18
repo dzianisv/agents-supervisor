@@ -724,6 +724,18 @@ If you cannot complete the remaining items:
 Do NOT re-read files or re-plan. Either implement the fix now or explain why you cannot.`
 }
 
+export function getLastSessionModelSpec(messages: any[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    const providerID = msg.info?.providerID
+    const modelID = msg.info?.modelID
+    if (typeof providerID === "string" && typeof modelID === "string" && providerID && modelID) {
+      return `${providerID}/${modelID}`
+    }
+  }
+  return null
+}
+
 function getLastRelevantUserMessageId(messages: any[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
@@ -978,10 +990,12 @@ async function classifyTaskForRoutingWithLLM(
   client: any,
   directory: string,
   context: TaskContext,
-  judgeSessionIds: Set<string>
+  judgeSessionIds: Set<string>,
+  sessionMessages?: any[]
 ): Promise<RoutingCategory | null> {
   const modelList = await loadSupervisorModelList()
   const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
 
   let attempts: string[] = []
   if (modelList.length) {
@@ -994,7 +1008,9 @@ async function classifyTaskForRoutingWithLLM(
       attempts = [preferredModel]
     }
   }
-  if (attempts.length === 0) attempts = [""]
+  if (attempts.length === 0) {
+    attempts = sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec) ? [sessionModelSpec] : [""]
+  }
 
   const prompt = `CLASSIFY TASK ROUTING\n\nYou are classifying a task into one routing category.\n\nTask summary:\n${context.taskSummary}\n\nTask type: ${context.taskType}\n\nRecent user messages:\n${context.humanMessages.slice(0, 4).join("\n\n")}\n\nChoose exactly one category from: backend, architecture, frontend, default.\nReturn JSON only:\n{\n  "category": "backend|architecture|frontend|default"\n}`
 
@@ -1787,15 +1803,19 @@ async function analyzeSelfAssessmentWithLLM(
   selfAssessment: string,
   judgeSessionIds: Set<string>,
   toolSupervisorPrompt?: string | null,
-  rubric?: Rubric
+  rubric?: Rubric,
+  sessionMessages?: any[]
 ): Promise<SupervisorAnalysis | null> {
   const modelList = await loadSupervisorModelList()
   const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
   const attempts = modelList.length
     ? modelList
     : preferredModel && !isBlockedJudgeModel(preferredModel)
       ? [preferredModel]
-      : [""]
+      : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+        ? [sessionModelSpec]
+        : [""]
 
   const prompt = buildJudgePrompt(context, selfAssessment, toolSupervisorPrompt, rubric)
 
@@ -2416,11 +2436,14 @@ Continue now.`
         // JSON-only.
         const modelList = await loadSupervisorModelList()
         const preferredModel = await loadPreferredModelSpec(directory)
+        const sessionModelSpec = getLastSessionModelSpec(currentMessages || [])
         const assessmentAttempts = modelList.length
           ? modelList
           : preferredModel && !isBlockedJudgeModel(preferredModel)
             ? [preferredModel]
-            : [""]
+            : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+              ? [sessionModelSpec]
+              : [""]
 
       let selfAssessment: string | null = null
       let assessmentModelSpec: string | null = null
@@ -2513,7 +2536,8 @@ Continue now.`
             selfAssessment,
             judgeSessionIds,
             effectiveToolSupervisorPrompt,
-            effRubric
+            effRubric,
+            currentMessages
           )
         }
 
@@ -2592,7 +2616,7 @@ Continue now.`
 
         // Compute routing early so it can be included in saved data
         const routingConfig = await loadRoutingConfig()
-        const routingCategory = await classifyTaskForRoutingWithLLM(client, directory, context, judgeSessionIds)
+        const routingCategory = await classifyTaskForRoutingWithLLM(client, directory, context, judgeSessionIds, currentMessages)
         const routingModel = getRoutingModel(routingConfig, routingCategory)
 
         await saveSupervisorData(directory, sessionId, {
