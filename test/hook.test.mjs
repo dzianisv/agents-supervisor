@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   loopGuard, sanitizeCwd, readAttempts, writeAttemptCounter,
   writeVerdict, readTranscriptTail, buildStopContext,
+  normalizeTranscriptToMessages, buildTaskContextFromTranscript,
 } from '../bin/on-stop.mjs';
+
+// Project root — used by new tests that must not write to /tmp.
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function mkcwd() {
   const d = fs.mkdtempSync(path.join(tmpdir(), 'sup-test-'));
@@ -83,4 +88,149 @@ test('buildStopContext prefers payload.last_assistant_message', () => {
     [{ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'tail text' }] } }],
   );
   assert.equal(ctx.final_assistant_text, 'direct final text');
+});
+
+// ---------------------------------------------------------------------------
+// normalizeTranscriptToMessages — no /tmp needed (pure function)
+// ---------------------------------------------------------------------------
+
+test('normalizeTranscriptToMessages: converts string content', () => {
+  const tail = [
+    { type: 'user', message: { role: 'user', content: 'hello world' } },
+  ];
+  const msgs = normalizeTranscriptToMessages(tail);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].info.role, 'user');
+  assert.deepEqual(msgs[0].parts, [{ type: 'text', text: 'hello world' }]);
+});
+
+test('normalizeTranscriptToMessages: converts array content with text + tool_use', () => {
+  const tail = [
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'npm test' } },
+          { type: 'text', text: 'Tests passed.' },
+        ],
+      },
+    },
+  ];
+  const msgs = normalizeTranscriptToMessages(tail);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].info.role, 'assistant');
+  assert.equal(msgs[0].parts.length, 2);
+  assert.deepEqual(msgs[0].parts[0], { type: 'tool', tool: 'bash', state: { input: { command: 'npm test' } } });
+  assert.deepEqual(msgs[0].parts[1], { type: 'text', text: 'Tests passed.' });
+});
+
+test('normalizeTranscriptToMessages: skips non-user/assistant entries', () => {
+  const tail = [
+    { type: 'system', message: { content: 'ignored' } },
+    { type: 'user', message: { role: 'user', content: 'hi' } },
+  ];
+  const msgs = normalizeTranscriptToMessages(tail);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].info.role, 'user');
+});
+
+test('normalizeTranscriptToMessages: empty string content produces no text part', () => {
+  const tail = [
+    { type: 'user', message: { role: 'user', content: '   ' } },
+  ];
+  const msgs = normalizeTranscriptToMessages(tail);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].parts.length, 0);
+});
+
+test('normalizeTranscriptToMessages: tool_result blocks are skipped', () => {
+  const tail = [
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' }],
+      },
+    },
+  ];
+  const msgs = normalizeTranscriptToMessages(tail);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].parts.length, 0); // tool_result not converted
+});
+
+// ---------------------------------------------------------------------------
+// buildTaskContextFromTranscript — uses PROJECT_ROOT (has package.json + test/)
+// ---------------------------------------------------------------------------
+
+test('buildTaskContextFromTranscript: returns null for no human messages', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }] } },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.equal(ctx, null);
+});
+
+test('buildTaskContextFromTranscript: returns null for empty tail', () => {
+  assert.equal(buildTaskContextFromTranscript([], PROJECT_ROOT), null);
+});
+
+test('buildTaskContextFromTranscript: builds context with taskSummary from human messages', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'fix the broken tests' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'I will fix the tests now.' }] } },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx, 'should return a context object');
+  assert.equal(ctx.taskSummary, 'fix the broken tests');
+  assert.equal(ctx.taskType, 'coding');
+  assert.ok(Array.isArray(ctx.humanMessages));
+  assert.deepEqual(ctx.humanMessages, ['fix the broken tests']);
+});
+
+test('buildTaskContextFromTranscript: detects tool commands from Bash tool_use', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'run the tests' } },
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'npm test' } },
+          { type: 'text', text: 'Tests ran.' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  // npm test should be detected as a local test command signal
+  assert.ok(ctx.detectedSignals.includes('test-command'), `expected test-command in ${ctx.detectedSignals}`);
+});
+
+test('buildTaskContextFromTranscript: multi-message summary uses numbered format', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'first task' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
+    { type: 'user', message: { role: 'user', content: 'second task' } },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  assert.match(ctx.taskSummary, /\[1\].*first task/);
+  assert.match(ctx.taskSummary, /\[2\].*second task/);
+});
+
+test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'implement a feature' } },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  // All required TaskContext fields must be present
+  for (const field of ['taskSummary', 'taskType', 'agentMode', 'humanMessages',
+    'toolsSummary', 'detectedSignals', 'recentCommands', 'pushedToDefaultBranch',
+    'requiresTests', 'requiresBuild', 'requiresPR', 'requiresCI',
+    'requiresLocalTests', 'requiresLocalTestsEvidence']) {
+    assert.ok(field in ctx, `missing field: ${field}`);
+  }
 });

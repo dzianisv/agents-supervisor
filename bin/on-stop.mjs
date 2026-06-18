@@ -3,26 +3,32 @@
  * on-stop.mjs — Claude Code Stop hook entry-point for the supervisor plugin.
  *
  * Reads the CC Stop payload from stdin (JSON), applies safety rails, reads the
- * transcript tail, builds a stop-context, classifies it with the shared judge
- * (core/judge-core.mjs), and injects a continuation prompt when the agent
- * stopped prematurely. Patterns/anti-patterns come from core/patterns.json
- * (shipped ⊕ user-local), so /supervisor:train sharpens behavior without code
- * changes.
+ * transcript tail, normalises it to the shared message format, builds a task
+ * context, runs the self-assessment pipeline (buildSelfAssessmentPrompt →
+ * callAnthropic → parseSelfAssessmentJson → evaluateSelfAssessment), and
+ * injects a continuation prompt when the agent stopped prematurely.
  *
  * Artifacts under <cwd>/.supervisor/: verdict_<sid>.json, <sid>_attempts.json,
  * current_session, disabled, debug.log.
  *
  * Public API (re-exported for unit tests):
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
- *   writeAttemptCounter, writeVerdict, sanitizeCwd, debug
+ *   writeAttemptCounter, writeVerdict, sanitizeCwd, debug,
+ *   normalizeTranscriptToMessages, buildTaskContextFromTranscript
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { classifyStop } from '../core/judge-core.mjs';
-import { buildFeedback, injectCategories } from '../core/feedback-core.mjs';
-import { loadPatterns } from '../core/patterns.mjs';
+import { callAnthropic } from '../core/llm-client.mjs';
+import {
+  SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER,
+  inferTaskType, extractToolCommands, detectSignals,
+  getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
+  isPlanMode, evaluateSelfAssessment,
+} from '../core/evaluation.mjs';
+import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs';
+import { buildEscalatingFeedback } from '../core/feedback.mjs';
 import { goalStore, resolveMaxAttempts, decideGoalTransition } from '../core/goal.mjs';
 
 const STATE_DIR = '.supervisor';
@@ -30,6 +36,8 @@ const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env
 const DEBUG_ENABLED = (process.env.SUPERVISOR_DEBUG ?? process.env.REFLECTION_CC_DEBUG) === '1';
 const TRANSCRIPT_MAX_BYTES = 200_000;
 const TRANSCRIPT_MAX_ENTRIES = 50;
+const ASSESSMENT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-haiku-4-5';
+const ASSESSMENT_TIMEOUT_MS = 30_000;
 
 process.on('uncaughtException', (err) => {
   _debugRaw({ msg: 'uncaught_exception', error: String(err), stack: err?.stack });
@@ -42,9 +50,11 @@ process.on('unhandledRejection', (reason) => {
 
 function _debugRaw(obj) {
   if (!DEBUG_ENABLED) return;
+  const dir = path.join(process.cwd(), STATE_DIR);
   const line = JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n';
   try {
-    fs.appendFileSync('/tmp/supervisor-cc-crash.log', line);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, 'cc-crash.log'), line);
   } catch {
     process.stderr.write(line);
   }
@@ -212,6 +222,216 @@ export function buildStopContext(stopPayload, transcriptTail) {
   return { session_id, attempt, user_messages, final_assistant_text, tools_available_inferred, raw_tail: transcriptTail };
 }
 
+/**
+ * Convert CC transcript entries (type/message.content format) to the shared
+ * opencode-compatible message format used by evaluation.mjs helpers.
+ * @param {Array} transcriptTail  — entries from readTranscriptTail
+ * @returns {Array<{ info: { role: string }, parts: Array }>}
+ */
+export function normalizeTranscriptToMessages(transcriptTail) {
+  const messages = [];
+  for (const entry of transcriptTail) {
+    const role = entry.type; // 'user' or 'assistant'
+    if (role !== 'user' && role !== 'assistant') continue;
+    const content = entry?.message?.content;
+    const parts = [];
+    if (typeof content === 'string') {
+      if (content.trim()) parts.push({ type: 'text', text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!block) continue;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          parts.push({ type: 'text', text: block.text });
+        } else if (block.type === 'tool_use' && typeof block.name === 'string') {
+          // Lowercase to match opencode's tool naming (CC uses TitleCase, evaluation.mjs expects lowercase)
+          parts.push({ type: 'tool', tool: block.name.toLowerCase(), state: { input: block.input ?? {} } });
+        }
+      }
+    }
+    messages.push({ info: { role }, parts });
+  }
+  return messages;
+}
+
+/** Read repo signals synchronously — mirrors getRepoSignals in supervisor-impl.ts. */
+function getRepoSignalsSync(cwd) {
+  let hasTestScript = false;
+  let hasBuildScript = false;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+    const scripts = pkg?.scripts ?? {};
+    hasTestScript = Boolean(scripts.test || scripts['test:ci'] || scripts['test:e2e']);
+    hasBuildScript = Boolean(scripts.build || scripts['build:prod']);
+  } catch { /* no package.json or parse error */ }
+  let hasTestsDir = false;
+  for (const d of ['test', 'tests']) {
+    try { fs.statSync(path.join(cwd, d)); hasTestsDir = true; break; } catch { /* */ }
+  }
+  return { hasTestScript, hasBuildScript, hasTestsDir };
+}
+
+/** Read AGENTS.md synchronously. */
+function getAgentsSync(cwd) {
+  for (const name of ['AGENTS.md', '.opencode/AGENTS.md', 'agents.md']) {
+    try { return fs.readFileSync(path.join(cwd, name), 'utf8'); } catch { /* */ }
+  }
+  return '';
+}
+
+/**
+ * Build a TaskContext from normalized messages — synchronous mirror of
+ * buildTaskContext in opencode/supervisor-impl.ts.
+ * Returns null when no human messages are found (nothing to assess).
+ * Accepts normalized message objects, but tolerates raw transcript entries.
+ * @param {Array} normalizedMessages
+ * @param {string} [cwd]
+ * @returns {object|null}
+ */
+export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
+  const messages =
+    Array.isArray(normalizedMessages) &&
+    normalizedMessages.every((msg) => msg?.info?.role && Array.isArray(msg?.parts))
+      ? normalizedMessages
+      : normalizeTranscriptToMessages(normalizedMessages ?? []);
+  const humanMessages = [];
+  let lastAssistantText = '';
+
+  for (const msg of messages) {
+    if (msg.info?.role === 'user') {
+      for (const part of msg.parts ?? []) {
+        if (part.type === 'text' && part.text) {
+          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
+          humanMessages.push(part.text);
+          break;
+        }
+      }
+    }
+    if (msg.info?.role === 'assistant') {
+      for (const part of msg.parts ?? []) {
+        if (part.type === 'text' && part.text) lastAssistantText = part.text;
+      }
+    }
+  }
+
+  if (humanMessages.length === 0) return null;
+
+  const taskSummary = humanMessages.length === 1
+    ? humanMessages[0]
+    : humanMessages.map((m, i) => `[${i + 1}] ${m}`).join('\n\n');
+
+  const combinedText = `${humanMessages.join(' ')} ${lastAssistantText}`;
+  const taskType = inferTaskType(combinedText);
+  const agentMode = isPlanMode(messages) ? 'plan' : 'build';
+
+  const repoSignals = getRepoSignalsSync(cwd ?? process.cwd());
+  const commands = extractToolCommands(messages);
+  const detectedSignals = detectSignals(combinedText, commands);
+  const recentCommands = getRecentCommands(commands);
+  const hasLocalTests = hasLocalTestCommand(commands);
+  const pushedDefault = pushedToDefaultBranch(commands);
+
+  const requiresTests = taskType === 'coding' &&
+    (repoSignals.hasTestScript || repoSignals.hasTestsDir || detectedSignals.includes('test-mention'));
+  const requiresBuild = taskType === 'coding' &&
+    (repoSignals.hasBuildScript || detectedSignals.includes('build-mention'));
+  const requiresPR = taskType === 'coding';
+  const requiresCI = taskType === 'coding';
+  const requiresLocalTests = requiresTests;
+  const requiresLocalTestsEvidence = requiresTests && !hasLocalTests;
+  const toolsSummary = commands.slice(-6).join('\n') || '(none)';
+
+  return {
+    taskSummary, taskType, agentMode, humanMessages,
+    toolsSummary, detectedSignals, recentCommands,
+    pushedToDefaultBranch: pushedDefault,
+    requiresTests, requiresBuild, requiresPR, requiresCI,
+    requiresLocalTests, requiresLocalTestsEvidence,
+  };
+}
+
+function buildFakeAssessment(taskContext, category) {
+  const recentTestCommands = taskContext.recentCommands.filter((command) =>
+    /\bnpm\s+test\b|\bnpm\s+run\s+test\b|\bpnpm\s+test\b|\byarn\s+test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b/i.test(command)
+  );
+
+  if (category === 'complete') {
+    return {
+      task_summary: taskContext.taskSummary,
+      task_type: taskContext.taskType,
+      status: 'complete',
+      confidence: 0.95,
+      evidence: {
+        tests: {
+          ran: taskContext.requiresTests ? recentTestCommands.length > 0 : false,
+          results: taskContext.requiresTests ? (recentTestCommands.length > 0 ? 'pass' : 'unknown') : 'unknown',
+          ran_after_changes: taskContext.requiresTests ? recentTestCommands.length > 0 : false,
+          commands: recentTestCommands,
+        },
+        build: {
+          ran: false,
+          results: 'unknown',
+        },
+        pr: {
+          created: false,
+          url: '',
+          ci_status: 'unknown',
+          checked: false,
+        },
+      },
+      remaining_work: [],
+      next_steps: [],
+      needs_user_action: [],
+      stuck: false,
+      alternate_approach: '',
+    };
+  }
+
+  if (category === 'waiting_for_user_legitimate') {
+    return {
+      task_summary: taskContext.taskSummary,
+      task_type: taskContext.taskType,
+      status: 'waiting_for_user',
+      confidence: 0.95,
+      evidence: {},
+      remaining_work: [],
+      next_steps: [],
+      needs_user_action: ['User action required before continuing'],
+      stuck: false,
+      alternate_approach: '',
+    };
+  }
+
+  return {
+    task_summary: taskContext.taskSummary,
+    task_type: taskContext.taskType,
+    status: 'in_progress',
+    confidence: 0.95,
+    evidence: {
+      tests: {
+        ran: false,
+        results: 'unknown',
+        ran_after_changes: false,
+        commands: [],
+      },
+      build: {
+        ran: false,
+        results: 'unknown',
+      },
+      pr: {
+        created: false,
+        url: '',
+        ci_status: 'unknown',
+        checked: false,
+      },
+    },
+    remaining_work: ['Continue implementation', 'Run required verification before stopping'],
+    next_steps: ['Take next concrete tool action', 'Run tests/build/PR checks required for completion'],
+    needs_user_action: [],
+    stuck: false,
+    alternate_approach: '',
+  };
+}
+
 async function readStdin() {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -255,8 +475,8 @@ async function main() {
   } catch { /* not disabled */ }
 
   // 2. Attempt cap.
-  // Goal loop: if a goal is active, raise the retry budget and feed the goal to
-  // the judge. All goal logic is best-effort — any failure falls back to default.
+  // Goal loop: if a goal is active, raise the retry budget.
+  // All goal logic is best-effort — any failure falls back to default.
   let goal = null;
   let goalState = {};
   let effectiveMax = MAX_ATTEMPTS;
@@ -296,31 +516,86 @@ async function main() {
     process.exit(0);
   }
 
-  // 4. Load patterns once; share across judge + feedback.
-  const patterns = loadPatterns({ cwd });
-
-  // 5. Judge.
-  let verdict;
-  try {
-    verdict = await classifyStop(ctx, { patterns, cwd, goalCondition: goal?.condition });
-  } catch (e) {
-    debug({ msg: 'judge_threw', err: String(e?.message ?? e) }, cwd);
-    verdict = { category: 'API_ERROR', reason: String(e?.message ?? e), confidence: 0 };
+  // 4. Build task context from transcript (shared assessment pipeline).
+  const normalizedMessages = normalizeTranscriptToMessages(tail);
+  const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
+  if (!taskContext) {
+    debug({ msg: 'no_task_context', session_id }, cwd);
+    process.exit(0);
   }
-  debug({ msg: 'verdict', category: verdict.category, confidence: verdict.confidence }, cwd);
+
+  // 5. Self-assessment via shared pipeline.
+  const agents = getAgentsSync(cwd);
+  const prompt = buildSelfAssessmentPrompt(
+    taskContext, agents, ctx.final_assistant_text, attempts, null, effectiveMax,
+  );
+
+  const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
+  let assessmentText;
+  if (fakeJudge) {
+    const [category = 'summary_drift_stop'] = fakeJudge.split(':');
+    assessmentText = JSON.stringify(buildFakeAssessment(taskContext, category));
+  } else {
+    try {
+      const result = await callAnthropic({
+        prompt,
+        system: 'You are a precise workflow completion evaluator. Output JSON only.',
+        model: ASSESSMENT_MODEL,
+        maxTokens: 1000,
+        timeoutMs: ASSESSMENT_TIMEOUT_MS,
+      });
+      assessmentText = result.text;
+    } catch (e) {
+      debug({ msg: 'assessment_threw', err: String(e?.message ?? e) }, cwd);
+      process.exit(0);
+    }
+  }
+
+  const assessment = parseSelfAssessmentJson(assessmentText);
+  const analysis = assessment
+    ? evaluateSelfAssessment(assessment, taskContext)
+    : {
+        complete: false,
+        shouldContinue: true,
+        reason: 'Failed to parse self-assessment',
+        missing: [],
+        nextActions: [],
+        requiresHumanAction: false,
+        severity: 'MEDIUM',
+      };
+  if (!assessment) {
+    debug({ msg: 'assessment_parse_failed', session_id, raw: (assessmentText ?? '').slice(0, 200) }, cwd);
+  }
+  debug({ msg: 'assessment', complete: analysis.complete, severity: analysis.severity, status: assessment?.status }, cwd);
 
   const nextAttempt = attempts + 1;
-  const verdictRecord = { ...verdict, session_id, attempt: nextAttempt, timestamp: new Date().toISOString(), injected: false };
+  const verdictRecord = {
+    session_id, attempt: nextAttempt, timestamp: new Date().toISOString(), injected: false,
+    status: assessment?.status ?? 'in_progress', confidence: assessment?.confidence ?? 0.5,
+    complete: analysis.complete, severity: analysis.severity, reason: analysis.reason,
+  };
 
-  // 6a. Goal loop: when a goal is active it overrides the normal inject rules —
-  // keep pushing until the goal is met (judge says complete) or budget exhausts.
+  // Helper: build escalating feedback message from analysis.
+  function buildAnalysisFeedback() {
+    return buildEscalatingFeedback(
+      nextAttempt,
+      analysis.severity,
+      { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason },
+      false,
+      false,
+      effectiveMax,
+    );
+  }
+
+  // 6a. Goal loop: when a goal is active, keep pushing until the goal is met
+  // (analysis says complete) or the budget exhausts.
   if (goal) {
     const t = decideGoalTransition({
       goal,
-      complete: verdict.category === 'complete',
+      complete: analysis.complete,
       now: Date.now(),
       maxAttempts: effectiveMax,
-      reason: verdict.reason,
+      reason: analysis.reason,
     });
     if (t.action === 'achieved') {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
@@ -337,11 +612,9 @@ async function main() {
       process.exit(0);
     }
     // continue — but never override a genuine human-only block.
-    if (verdict.category !== 'waiting_for_user_legitimate') {
-      const inj = injectCategories(patterns).has(verdict.category)
-        ? buildFeedback(verdict.category, ctx, nextAttempt, patterns).additionalContext
-        : null;
-      const msg = `Goal not yet met: "${goal.condition}". ${inj ? inj + ' ' : ''}Keep going toward the goal — take the next concrete action (tool call / code / command); do not stop until it is demonstrably met. ${verdict.reason ? `(judge: ${verdict.reason})` : ''}`.trim();
+    if (!analysis.requiresHumanAction) {
+      const feedbackMsg = buildAnalysisFeedback();
+      const msg = `Goal not yet met: "${goal.condition}". ${feedbackMsg}`;
       writeAttemptCounter(session_id, nextAttempt, cwd);
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.injected = true;
@@ -349,10 +622,10 @@ async function main() {
       verdictRecord.feedback_reason = 'goal_continue';
       writeVerdict(session_id, verdictRecord, cwd);
       process.stdout.write(JSON.stringify({ decision: 'block', reason: msg }));
-      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, category: verdict.category }, cwd);
+      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity }, cwd);
       process.exit(0);
     }
-    // waiting_for_user_legitimate with active goal → legit pause, don't burn budget.
+    // Human action required with active goal → legit pause, don't burn budget.
     verdictRecord.goal = 'paused';
     writeVerdict(session_id, verdictRecord, cwd);
     debug({ msg: 'goal_paused_user_wait', session_id }, cwd);
@@ -360,22 +633,19 @@ async function main() {
   }
 
   // 6b. Normal (no goal) inject decision.
-  if (injectCategories(patterns).has(verdict.category)) {
-    const fb = buildFeedback(verdict.category, ctx, nextAttempt, patterns);
-    if (fb.shouldInject) {
-      writeAttemptCounter(session_id, nextAttempt, cwd);
-      verdictRecord.injected = true;
-      verdictRecord.feedback_reason = fb.reason;
-      writeVerdict(session_id, verdictRecord, cwd);
-      const out = { decision: 'block', reason: fb.additionalContext || fb.reason };
-      process.stdout.write(JSON.stringify(out));
-      debug({ msg: 'inject_sent', category: verdict.category, attempt: nextAttempt, reason: fb.reason }, cwd);
-      process.exit(0);
-    }
+  if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction) {
+    const feedbackMsg = buildAnalysisFeedback();
+    writeAttemptCounter(session_id, nextAttempt, cwd);
+    verdictRecord.injected = true;
+    verdictRecord.feedback_reason = 'assessment_continue';
+    writeVerdict(session_id, verdictRecord, cwd);
+    process.stdout.write(JSON.stringify({ decision: 'block', reason: feedbackMsg }));
+    debug({ msg: 'inject_sent', severity: analysis.severity, attempt: nextAttempt }, cwd);
+    process.exit(0);
   }
 
   writeVerdict(session_id, verdictRecord, cwd);
-  debug({ msg: 'no_inject', category: verdict.category, attempt: nextAttempt }, cwd);
+  debug({ msg: 'no_inject', complete: analysis.complete, attempt: nextAttempt }, cwd);
   process.exit(0);
 }
 
