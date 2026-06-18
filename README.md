@@ -13,7 +13,7 @@ Works on two runtimes from one shared core:
 | Runtime | Mechanism | Surface |
 |---|---|---|
 | **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:goal`, `/supervisor:retry` |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `autopilot_exit` + `/supervisor`, `/supervisor:train`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:autopilot` |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `autopilot_exit` + `/supervisor`, `/supervisor:train` |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -85,8 +85,7 @@ OpenCode exposes three public supervisor modes:
 | `goal` | `/supervisor goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
 | `autopilot` | `/supervisor autopilot` | Skips the judge and continues on every idle until `autopilot_exit` or budget exhaustion. |
 
-The effective default mode is `reflection`. Legacy colon commands remain aliases:
-`/supervisor:goal`, `/supervisor:retry`, and `/supervisor:autopilot`.
+The effective default mode is `reflection`.
 
 ## Goal mode (both runtimes)
 
@@ -97,10 +96,7 @@ retry budget) until the goal's met or the budget runs out.
 ```
 /supervisor goal all tests in test/auth pass and the PR is open with green CI
 /supervisor goal clear
-/supervisor:goal all tests in test/auth pass and the PR is open with green CI
-/supervisor:goal              # check status (condition, attempts, last reason)
-/supervisor:goal clear        # clear (aliases: stop, off, reset, none, cancel)
-/supervisor:retry 24          # set this session's retry budget (1–100, default 16)
+/supervisor retry 24           # set this session's retry budget (1–100, default 16)
 ```
 
 The goal is injected into the judge as a **mandatory completion requirement** — the
@@ -109,8 +105,7 @@ goal is active the retry budget rises to 16 (vs 3 normally). State is per-sessio
 `.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
 continuation actually fires.
 
-- **Claude Code:** `/supervisor:goal` / `/supervisor:retry` skills (the `Stop` hook enforces it).
-- **OpenCode:** prefer `/supervisor goal <condition>` and `/supervisor retry N` in the TUI; colon commands remain aliases. In the web app call the `supervisor` or `supervisor_goal` / `supervisor_retry` tools.
+In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 
 **Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
 `~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
@@ -125,11 +120,8 @@ completion. No evaluation overhead, no latency from judge round-trips — just a
 prescriptive nudge to keep working.
 
 ```
-/supervisor autopilot          # enable primary UX
-/supervisor reflection         # disable and return to default reflection mode
-/supervisor:autopilot           # enable (aliases: on, true, start)
-/supervisor:autopilot off       # disable (aliases: false, stop, exit)
-/supervisor:autopilot status    # check current state
+/supervisor autopilot          # enable
+/supervisor reflection         # disable, return to default mode
 ```
 
 Or call the tools directly (web app / API):
@@ -146,7 +138,7 @@ Or call the tools directly (web app / API):
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:
-- **Attempt budget**: stops at `maxAttempts` (default 16, configurable via `/supervisor:retry`)
+- **Attempt budget**: stops at `maxAttempts` (default 16, configurable via `/supervisor retry N`)
 - **Planning loop detection**: catches agents that read files endlessly without writing code
 - **Action loop detection**: catches agents repeating the same commands 3+ times
 
