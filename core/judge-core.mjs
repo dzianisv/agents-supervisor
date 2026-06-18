@@ -13,69 +13,16 @@
  * Net:  POST https://api.anthropic.com/v1/messages (global fetch).
  */
 
-import { readFileSync } from 'node:fs';
-import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { loadPatterns } from './patterns.mjs';
 import { buildGoalRequirementSection } from './goal.mjs';
+import { callAnthropic, sanitizeError } from './llm-client.mjs';
 
-const API_URL = 'https://api.anthropic.com/v1/messages';
-const ANTHROPIC_VERSION = '2023-06-01';
-const ANTHROPIC_BETA = 'oauth-2025-04-20';
 const DEFAULT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-haiku-4-5';
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_TOKENS = 250;
 
 export function CATEGORY_NAMES(patterns) {
   return (patterns?.categories ?? []).map((c) => c.name);
-}
-
-function sanitizeError(text) {
-  if (typeof text !== 'string') text = String(text ?? '');
-  let s = text;
-  s = s.replace(/Bearer\s+[^\s"',}]+/gi, 'Bearer <REDACTED>');
-  s = s.replace(/"authorization"\s*:\s*"[^"]*"/gi, '"authorization":"<REDACTED>"');
-  s = s.replace(/"x-api-key"\s*:\s*"[^"]*"/gi, '"x-api-key":"<REDACTED>"');
-  if (s.length > 200) s = s.slice(0, 200);
-  return s;
-}
-
-function readOauthCredentials() {
-  const credPath = join(homedir(), '.claude', '.credentials.json');
-  try {
-    return JSON.parse(readFileSync(credPath, 'utf8'));
-  } catch {
-    /* fall through to keychain on macOS */
-  }
-  if (platform() === 'darwin') {
-    try {
-      const out = execFileSync(
-        'security',
-        ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-        { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] },
-      );
-      return JSON.parse(out.trim());
-    } catch {
-      /* no keychain item */
-    }
-  }
-  return null;
-}
-
-function loadAuth() {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey && apiKey.trim()) return { type: 'apikey', value: apiKey.trim() };
-  const obj = readOauthCredentials();
-  if (!obj) {
-    throw new Error(
-      'judge: no ANTHROPIC_API_KEY set and no Claude Code OAuth credentials found ' +
-      '(checked ~/.claude/.credentials.json and the macOS keychain)',
-    );
-  }
-  const token = obj?.claudeAiOauth?.accessToken;
-  if (!token) throw new Error('judge: OAuth credentials present but missing claudeAiOauth.accessToken');
-  return { type: 'oauth', value: token };
 }
 
 function truncate(s, n) {
@@ -204,56 +151,26 @@ export async function classifyStop(stopContext, opts = {}) {
     return { category, reason: `[fake judge] ${fakeJudge}`, confidence: parseFloat(conf ?? '0.9') || 0.9 };
   }
 
-  const auth = loadAuth();
   const prompt = buildPrompt(stopContext, patterns, opts.goalCondition);
 
-  const body = JSON.stringify({
-    model,
-    max_tokens: MAX_TOKENS,
-    system: 'You are a precise classifier. Output JSON only.',
-    messages: [{ role: 'user', content: prompt }],
-  });
-
-  const headers = { 'anthropic-version': ANTHROPIC_VERSION, 'content-type': 'application/json' };
-  if (auth.type === 'apikey') headers['x-api-key'] = auth.value;
-  else {
-    headers['authorization'] = `Bearer ${auth.value}`;
-    headers['anthropic-beta'] = ANTHROPIC_BETA;
-  }
-
-  const timeoutController = new AbortController();
-  const timerId = setTimeout(() => timeoutController.abort(), timeoutMs);
-  if (opts.signal) opts.signal.addEventListener('abort', () => timeoutController.abort(), { once: true });
-
-  let res;
+  let text, usage;
   try {
-    res = await fetch(API_URL, { method: 'POST', headers, body, signal: timeoutController.signal });
+    const result = await callAnthropic({
+      prompt,
+      system: 'You are a precise classifier. Output JSON only.',
+      model,
+      maxTokens: MAX_TOKENS,
+      timeoutMs,
+      signal: opts.signal,
+    });
+    text = result.text;
+    usage = result.usage;
   } catch (err) {
-    clearTimeout(timerId);
-    if (timeoutController.signal.aborted) {
+    if (err.message.includes('timed out')) {
       return { category: 'TIMEOUT', reason: `judge call exceeded ${timeoutMs}ms`, confidence: 0 };
     }
-    throw new Error(`judge: fetch failed: ${sanitizeError(err.message)}`);
-  } finally {
-    clearTimeout(timerId);
+    throw new Error(`judge: ${sanitizeError(err.message)}`);
   }
 
-  if (!res.ok) {
-    let errBody;
-    try { errBody = await res.text(); } catch { errBody = ''; }
-    throw new Error(`judge: api ${res.status}: ${sanitizeError(errBody)}`);
-  }
-
-  let json;
-  try {
-    json = await res.json();
-  } catch (err) {
-    throw new Error(`judge: failed to parse api response: ${sanitizeError(err.message)}`);
-  }
-
-  const rawText = json.content?.[0]?.text ?? '';
-  const usage = json.usage
-    ? { input_tokens: json.usage.input_tokens, output_tokens: json.usage.output_tokens }
-    : undefined;
-  return parseResponse(rawText, usage, names);
+  return parseResponse(text, usage, names);
 }
