@@ -156,22 +156,22 @@ describe("getGitHubCopilotModelForRouting", () => {
 })
 
 // ---------------------------------------------------------------------------
-// getCrossReviewModelSpec
+// getCrossReviewModelSpec — hardcoded pairings removed (always returns null)
 // ---------------------------------------------------------------------------
 describe("getCrossReviewModelSpec", () => {
-  test("claude-opus-4.6 pairs with gpt-5.2-codex", () => {
-    assert.equal(getCrossReviewModelSpec("github-copilot/claude-opus-4.6"), "github-copilot/gpt-5.2-codex")
+  test("claude-opus-4.6 returns null (no hardcoded pairings)", () => {
+    assert.equal(getCrossReviewModelSpec("github-copilot/claude-opus-4.6"), null)
   })
 
-  test("gpt-5.2-codex pairs with claude-opus-4.6", () => {
-    assert.equal(getCrossReviewModelSpec("github-copilot/gpt-5.2-codex"), "github-copilot/claude-opus-4.6")
+  test("gpt-5.2-codex returns null (no hardcoded pairings)", () => {
+    assert.equal(getCrossReviewModelSpec("github-copilot/gpt-5.2-codex"), null)
   })
 
-  test("claude-sonnet-4 is not in cross-review pairing", () => {
+  test("claude-sonnet-4 returns null", () => {
     assert.equal(getCrossReviewModelSpec("anthropic/claude-sonnet-4"), null)
   })
 
-  test("gpt-4.1 is not in cross-review pairing", () => {
+  test("gpt-4.1 returns null", () => {
     assert.equal(getCrossReviewModelSpec("github-copilot/gpt-4.1"), null)
   })
 
