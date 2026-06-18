@@ -50,12 +50,11 @@ export function getGitHubCopilotModelForRouting(modelSpec) {
   return null
 }
 
-export function getCrossReviewModelSpec(modelSpec) {
-  const parsed = parseModelSpec(modelSpec)
-  if (!parsed) return null
-  const modelID = parsed.modelID.toLowerCase()
-  if (modelID === 'claude-opus-4.6') return 'github-copilot/gpt-5.2-codex'
-  if (modelID === 'gpt-5.2-codex') return 'github-copilot/claude-opus-4.6'
+export function getCrossReviewModelSpec(_modelSpec) {
+  // Cross-review model pairings REMOVED: hardcoding model mappings
+  // (e.g. claude-opus→gpt-5.2-codex) caused silent failures when the target
+  // model/provider wasn't configured. Cross-review should be driven by explicit
+  // user configuration (supervisor.yaml models list), not guessed pairings.
   return null
 }
 
