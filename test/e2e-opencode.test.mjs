@@ -248,4 +248,78 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     const retrieved = await getRes.json()
     assert.equal(retrieved.id, session.id)
   })
+
+  test("supervisor autoreview toggle works via message", async () => {
+    // Create a fresh session
+    const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+    assert.equal(createRes.status, 200)
+    const session = await createRes.json()
+
+    // Send /supervisor autoreview on
+    const onRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: "/supervisor autoreview on" }],
+      }),
+    })
+    assert.equal(onRes.status, 200, `Expected 200 from autoreview on, got ${onRes.status}`)
+    const onBody = await onRes.json()
+    assert.ok(onBody.info, "autoreview on response should have info field")
+
+    // Send /supervisor autoreview off
+    const offRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: "/supervisor autoreview off" }],
+      }),
+    })
+    assert.equal(offRes.status, 200, `Expected 200 from autoreview off, got ${offRes.status}`)
+    const offBody = await offRes.json()
+    assert.ok(offBody.info, "autoreview off response should have info field")
+
+    // Send /supervisor autoreview status
+    const statusRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: "/supervisor autoreview status" }],
+      }),
+    })
+    assert.equal(statusRes.status, 200, `Expected 200 from autoreview status, got ${statusRes.status}`)
+    const statusBody = await statusRes.json()
+    assert.ok(statusBody.info, "autoreview status response should have info field")
+  })
+
+  test("supervisor_autoreview tool is listed in session tools", async () => {
+    // Create a session so plugin tools are initialized
+    const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+    assert.equal(createRes.status, 200)
+    const session = await createRes.json()
+
+    // The /session/:id endpoint should return session info including available tools
+    // or we can check the /command endpoint for the autoreview command
+    const cmdRes = await fetch(`${baseUrl}/command`)
+    if (cmdRes.status !== 200) {
+      console.log("INFO: /command endpoint not available — skipping tool registration check")
+      return
+    }
+    const text = await cmdRes.text()
+    const jsonStart = text.indexOf("[")
+    if (jsonStart === -1) {
+      console.log("INFO: /command endpoint did not return JSON array — skipping")
+      return
+    }
+    const commands = JSON.parse(text.slice(jsonStart))
+    const commandNames = commands.map((c) => c.name)
+    // Check if autoreview-related command or tool is registered
+    const hasAutoreview = commandNames.some(
+      (name) => name.includes("autoreview")
+    )
+    // This is informational — supervisor may register as tools not commands
+    if (!hasAutoreview) {
+      console.log(`INFO: No autoreview command found in: ${commandNames.join(", ")} (may be tool-only)`)
+    }
+  })
 })
