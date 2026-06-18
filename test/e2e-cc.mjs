@@ -80,7 +80,7 @@ check('summary_drift_stop → injects {decision:block} + writes verdict', () => 
   assert.equal(code, 0);
   const out = JSON.parse(stdout);
   assert.equal(out.decision, 'block');
-  assert.match(out.reason, /Execute it now|run the tests|tool call/i);
+  assert.match(out.reason, /run the full test suite|run required verification|next concrete tool action/i);
   assert.ok(verdict && verdict.injected === true, 'verdict.injected should be true');
 });
 
