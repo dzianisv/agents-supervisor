@@ -20,6 +20,7 @@ import {
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
 } from "../core/goal.mjs"
 export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
+export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec }
 
 // Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
 async function reportError(err: unknown, context?: Record<string, string>): Promise<void> {
