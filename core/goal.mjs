@@ -53,6 +53,7 @@ export function parseSupervisorCommand(name, args) {
     if (lower === 'reflection') return { kind: 'mode-set', mode: lower };
     if (lower === 'goal') return parseSupervisorCommand('goal', tail);
     if (lower === 'retry') return parseSupervisorCommand('retry', tail);
+    if (lower === 'autoreview') return parseSupervisorCommand('autoreview', tail);
     return { kind: 'supervisor-status' };
   }
   if (name === 'goal') {
@@ -71,6 +72,13 @@ export function parseSupervisorCommand(name, args) {
     if (lower === 'off' || lower === 'false' || lower === 'stop' || lower === 'exit') return { kind: 'autopilot-off' };
     if (lower === 'status') return { kind: 'autopilot-status' };
     return { kind: 'autopilot-on' };
+  }
+  if (name === 'autoreview') {
+    const lower = trimmed.toLowerCase();
+    if (lower === '' || lower === 'status') return { kind: 'autoreview-status' };
+    if (lower === 'on' || lower === 'true' || lower === 'enable') return { kind: 'autoreview-on' };
+    if (lower === 'off' || lower === 'false' || lower === 'disable') return { kind: 'autoreview-off' };
+    return { kind: 'autoreview-status' };
   }
   return { kind: 'unknown', name };
 }

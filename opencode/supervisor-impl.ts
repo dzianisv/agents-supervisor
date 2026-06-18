@@ -83,6 +83,7 @@ export interface SupervisorState {
   goal?: SupervisorGoal
   mode?: SupervisorMode
   autopilot?: boolean        // autopilot mode: skip judge, always continue
+  autoreview?: boolean       // cross-model review: gate behind explicit opt-in
 }
 
 function supervisorDir(directory: string): string {
@@ -170,6 +171,13 @@ export const supervisorStore = {
 
   async setAutopilot(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
     return supervisorStore.setMode(directory, sessionId, enabled ? "autopilot" : DEFAULT_SUPERVISOR_MODE)
+  },
+
+  async setAutoreview(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.autoreview = enabled
+    await supervisorStore.save(directory, sessionId, state)
+    return state
   },
 
   async list(directory: string): Promise<string[]> {
@@ -2053,11 +2061,19 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     if (action === "retry") {
       return executeSupervisorRetry({ n: args.n })
     }
+    if (action === "autoreview" || action === "autoreview-on" || action === "autoreview-off" || action === "autoreview-status") {
+      if (action === "autoreview-off") return executeSupervisorAutoreview({ enabled: false })
+      if (action === "autoreview-status") {
+        const st = await supervisorStore.load(directory, sid)
+        return `Autoreview: ${st.autoreview ? "on" : "off"}`
+      }
+      return executeSupervisorAutoreview({ enabled: true })
+    }
     const disabled = await isSessionDisabled(sid)
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
     const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
-    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}${goalText}`
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}${goalText}`
   }
 
   // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
@@ -2122,6 +2138,18 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     return `Autopilot disabled for session ${sid.slice(0, 8)}….`
   }
 
+  // supervisor_autoreview tool — toggle cross-model review on completion
+  const supervisorAutoreviewDescription = "Toggle cross-model autoreview. When enabled, a second AI model reviews task completion verdicts for blind-spot coverage. Usage: call with enabled=true to enable, enabled=false to disable."
+  const executeSupervisorAutoreview = async (args: { enabled: boolean }) => {
+    const sid = currentSessionId
+    if (!sid) return "No active session yet — wait for the first session.idle, then toggle autoreview."
+    await supervisorStore.setAutoreview(directory, sid, args.enabled)
+    if (args.enabled) {
+      return `Autoreview enabled for session ${sid.slice(0, 8)}…. Cross-model review will run when the judge marks a task complete.`
+    }
+    return `Autoreview disabled for session ${sid.slice(0, 8)}….`
+  }
+
   // autopilot_exit tool — signal that autopilot work is complete
   const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
 Call this tool:
@@ -2144,6 +2172,7 @@ Do NOT call this tool:
   let supervisorGoalTool: any = null
   let supervisorRetryTool: any = null
   let supervisorAutopilotTool: any = null
+  let supervisorAutoreviewTool: any = null
   let autopilotExitTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
@@ -2196,6 +2225,13 @@ Do NOT call this tool:
         enabled: tool.schema.boolean().describe("Set true to enable autopilot mode, false to disable it.")
       },
       execute: executeSupervisorAutopilot as any
+    })
+    supervisorAutoreviewTool = tool({
+      description: supervisorAutoreviewDescription,
+      args: {
+        enabled: tool.schema.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
+      },
+      execute: executeSupervisorAutoreview as any
     })
     autopilotExitTool = tool({
       description: autopilotExitDescription,
@@ -2255,6 +2291,13 @@ Do NOT call this tool:
         },
         execute: executeSupervisorAutopilot
       }
+      supervisorAutoreviewTool = {
+        description: supervisorAutoreviewDescription,
+        args: {
+          enabled: z.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
+        },
+        execute: executeSupervisorAutoreview
+      }
       autopilotExitTool = {
         description: autopilotExitDescription,
         args: {},
@@ -2267,6 +2310,7 @@ Do NOT call this tool:
       supervisorGoalTool = null
       supervisorRetryTool = null
       supervisorAutopilotTool = null
+      supervisorAutoreviewTool = null
       autopilotExitTool = null
     }
   }
@@ -2595,7 +2639,7 @@ Continue now.`
         }
 
         let crossReview: { modelSpec: string; response: string } | null = null
-        if (analysis.complete) {
+        if (analysis.complete && sup.autoreview === true) {
           debug("Task complete, attempting cross-model review (assessmentModel:", assessmentModelSpec || "unknown", ")")
           crossReview = await runCrossModelReview(
             client,
@@ -2755,6 +2799,7 @@ Continue now.`
       ...(supervisorGoalTool ? { supervisor_goal: supervisorGoalTool } : {}),
       ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
       ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
+      ...(supervisorAutoreviewTool ? { supervisor_autoreview: supervisorAutoreviewTool } : {}),
       ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
