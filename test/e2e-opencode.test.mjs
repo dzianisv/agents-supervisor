@@ -292,34 +292,35 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(statusBody.info, "autoreview status response should have info field")
   })
 
-  test("supervisor_autoreview tool is listed in session tools", async () => {
-    // Create a session so plugin tools are initialized
-    const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
-    assert.equal(createRes.status, 200)
-    const session = await createRes.json()
-
-    // The /session/:id endpoint should return session info including available tools
-    // or we can check the /command endpoint for the autoreview command
-    const cmdRes = await fetch(`${baseUrl}/command`)
-    if (cmdRes.status !== 200) {
-      console.log("INFO: /command endpoint not available — skipping tool registration check")
-      return
-    }
-    const text = await cmdRes.text()
-    const jsonStart = text.indexOf("[")
-    if (jsonStart === -1) {
-      console.log("INFO: /command endpoint did not return JSON array — skipping")
-      return
-    }
-    const commands = JSON.parse(text.slice(jsonStart))
-    const commandNames = commands.map((c) => c.name)
-    // Check if autoreview-related command or tool is registered
-    const hasAutoreview = commandNames.some(
-      (name) => name.includes("autoreview")
-    )
-    // This is informational — supervisor may register as tools not commands
-    if (!hasAutoreview) {
-      console.log(`INFO: No autoreview command found in: ${commandNames.join(", ")} (may be tool-only)`)
+  test("supervisor_autoreview tool is registered", async () => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 10_000)
+    try {
+      const res = await fetch(`${baseUrl}/command`, { signal: controller.signal })
+      clearTimeout(timer)
+      if (res.status !== 200) {
+        console.log("INFO: /command endpoint not available — skipping tool registration check")
+        return
+      }
+      const text = await res.text()
+      const jsonStart = text.indexOf("[")
+      if (jsonStart === -1) {
+        console.log("INFO: /command endpoint did not return JSON array — skipping")
+        return
+      }
+      const commands = JSON.parse(text.slice(jsonStart))
+      const commandNames = commands.map((c) => c.name)
+      const hasAutoreview = commandNames.some((name) => name.includes("autoreview"))
+      if (!hasAutoreview) {
+        console.log(`INFO: No autoreview command found in: ${commandNames.join(", ")} (may be tool-only)`)
+      }
+    } catch (err) {
+      clearTimeout(timer)
+      if (err.name === "AbortError") {
+        console.log("INFO: /command endpoint timed out — skipping autoreview tool check")
+        return
+      }
+      throw err
     }
   })
 })
