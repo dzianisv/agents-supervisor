@@ -268,12 +268,13 @@ test('autopilot mode + text WITHOUT AUTOPILOT_EXIT → on-stop blocks with Autop
   assert.match(out.reason, /autopilot/i);
 });
 
-test('autopilot mode + text containing AUTOPILOT_EXIT → on-stop does not block; disables autopilot', () => {
+test('autopilot mode + text containing AUTOPILOT_EXIT on its own line → on-stop does not block; disables autopilot', () => {
   const tmp = mktmp();
   const sid = 'cli-test-ap-exit';
   writeSession(tmp, sid);
   runSupervisor(tmp, ['autopilot', 'on']);
 
+  // AUTOPILOT_EXIT must be on its own line (anchored regex)
   const exitText = 'All done!\nAUTOPILOT_EXIT\nTask complete.';
   const turns = [
     { type: 'user', message: { role: 'user', content: 'do the work' } },
@@ -290,7 +291,7 @@ test('autopilot mode + text containing AUTOPILOT_EXIT → on-stop does not block
 
   const { code, stdout } = runOnStop(payload);
   assert.equal(code, 0);
-  assert.equal(stdout, '', 'should produce no stdout (no block) when AUTOPILOT_EXIT seen');
+  assert.equal(stdout, '', 'should produce no stdout (no block) when AUTOPILOT_EXIT is on its own line');
 
   // Autopilot should be disabled in state
   const state = loadGoalState(tmp, sid);
@@ -298,4 +299,37 @@ test('autopilot mode + text containing AUTOPILOT_EXIT → on-stop does not block
   // After exit, mode should no longer be autopilot
   const mode = state?.mode ?? (state?.autopilot ? 'autopilot' : 'reflection');
   assert.notEqual(mode, 'autopilot', 'autopilot should be disabled after AUTOPILOT_EXIT');
+});
+
+test('autopilot mode + AUTOPILOT_EXIT mentioned inline mid-sentence → on-stop still blocks (no exit)', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-ap-inline-mention';
+  writeSession(tmp, sid);
+  runSupervisor(tmp, ['autopilot', 'on']);
+
+  // Token appears inline in a sentence — NOT on its own line; must NOT trigger exit
+  const inlineText = 'I will output AUTOPILOT_EXIT when done with all the work.';
+  const turns = [
+    { type: 'user', message: { role: 'user', content: 'keep going' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: inlineText }] } },
+  ];
+  const tp = mkTranscript(tmp, turns);
+
+  const payload = {
+    session_id: sid,
+    cwd: tmp,
+    transcript_path: tp,
+    last_assistant_message: inlineText,
+  };
+
+  const { code, stdout } = runOnStop(payload);
+  assert.equal(code, 0);
+  assert.ok(stdout.length > 0, 'should have stdout (block decision) — inline mention must NOT trigger exit');
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block', 'inline mention of AUTOPILOT_EXIT must not stop autopilot loop');
+
+  // Autopilot should still be active in state
+  const state = loadGoalState(tmp, sid);
+  const mode = state?.mode ?? (state?.autopilot ? 'autopilot' : 'reflection');
+  assert.equal(mode, 'autopilot', 'autopilot should still be active when token only appears inline');
 });
