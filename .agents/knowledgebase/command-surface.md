@@ -16,17 +16,19 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Installation is via Claude plugin metadata under `.claude-plugin/`.
 - Runtime enforcement uses the `Stop` hook in `hooks/hooks.json`, which runs `bin/on-stop.mjs`.
 - User-facing skills live under `skills/`.
-- Current skill directories include `status`, `on`, `off`, `goal`, `retry`, and `train`.
-- README documents `/supervisor:status`, `/supervisor:train`, `/supervisor:goal`, and `/supervisor:retry` for Claude Code.
+- Current skill directories include all 8 colon subcommands: `status`, `on`, `off`, `goal`, `retry`, `train`, `autopilot`, and `reflection`.
+- Canonical CLI is `bin/supervisor.mjs` (with `bin/supervisor-goal.mjs` as a back-compat shim).
+- `bin/on-stop.mjs` includes an autopilot fast-path for lightweight continuation.
+- README documents the full unified command set: `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, and `/supervisor:reflection`.
 
 ## OpenCode Surface
 
 - Package name is `opencode-supervisor` in `opencode/package.json`.
 - Plugin entrypoint is `opencode/supervisor.ts`.
 - Slash command files are under `opencode/commands/`.
-- Current command files include `supervisor.md`, `supervisor:goal.md`, `supervisor:retry.md`, and `supervisor:train.md`.
+- Current command files include `supervisor.md` (bare dispatcher) plus all 8 colon subcommands: `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:goal.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, and `supervisor:reflection.md`.
+- README documents the full unified colon-command set and notes OpenCode additionally has the bare `/supervisor <subcommand>` dispatcher.
 - README documents OpenCode tools: `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, and `autopilot_exit`.
-- README documents `/supervisor:autopilot`, but no `opencode/commands/supervisor:autopilot.md` file is present in this repository snapshot.
 
 ## Training And Eval
 
@@ -40,6 +42,20 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - `train/hf_export.mjs` redacts and exports JSONL for HuggingFace format.
 - `train/hf_dataset.py` pushes private `.dataset/` content to a HuggingFace dataset repo.
 - `evals/judge-eval.mjs` runs judge evals.
+
+## Unified Command Set
+
+Both Claude Code and OpenCode expose the same 8 colon subcommands:
+1. `/supervisor:status` — display current patterns and verdicts
+2. `/supervisor:on` — enable supervisor
+3. `/supervisor:off` — disable supervisor
+4. `/supervisor:goal <condition>` — set a mandatory completion condition
+5. `/supervisor:retry N` — set the retry budget
+6. `/supervisor:train` — mine and learn from your sessions
+7. `/supervisor:autopilot` — skip judge, auto-continue until AUTOPILOT_EXIT or budget
+8. `/supervisor:reflection` — return to default completion-judge mode
+
+OpenCode additionally supports a bare `/supervisor <subcommand>` dispatcher as an alternative syntax for the same commands.
 
 ## Install Surfaces
 
