@@ -43,6 +43,13 @@ if (name === 'reflection') {
   args = 'reflection';
 }
 
+// Top-level aliases: `status`, `on`, `off` are supervisor-namespaced in the
+// parser (name==='supervisor' branch). Translate them so the parser sees them.
+if (name === 'status' || name === 'on' || name === 'off') {
+  args = name + (args ? ' ' + args : '');
+  name = 'supervisor';
+}
+
 function currentSession() {
   try {
     return fs.readFileSync(path.join(cwd, '.supervisor', 'current_session'), 'utf8').trim();
