@@ -529,7 +529,7 @@ async function main() {
   // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
   if (mode === 'autopilot' && !goal) {
     const baseVerdict = { session_id, timestamp: new Date().toISOString() };
-    if (/AUTOPILOT_EXIT/.test(ctx.final_assistant_text)) {
+    if (/(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text)) {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
       writeVerdict(session_id, { ...baseVerdict, autopilot: 'exited' }, cwd);
       debug({ msg: 'autopilot_exit', session_id }, cwd);
@@ -537,7 +537,7 @@ async function main() {
     }
     const nextAttempt = attempts + 1;
     writeAttemptCounter(session_id, nextAttempt, cwd);
-    const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output the line AUTOPILOT_EXIT on its own to hand control back.\n\nContinue now.`;
+    const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
     debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt }, cwd);

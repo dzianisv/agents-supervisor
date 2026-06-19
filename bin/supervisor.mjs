@@ -14,7 +14,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   goalStore,
@@ -200,8 +200,7 @@ switch (cmd.kind) {
     // Delegate entirely to bin/status.mjs — it owns the effective-mode line.
     const statusScript = path.join(__dirname, 'status.mjs');
     try {
-      const out = execSync(`node ${JSON.stringify(statusScript)}`, { cwd, encoding: 'utf8' });
-      process.stdout.write(out);
+      execFileSync('node', [statusScript], { cwd, encoding: 'utf8', stdio: 'inherit' });
     } catch (err) {
       // If status.mjs errors, still surface what we have
       if (err.stdout) process.stdout.write(err.stdout);

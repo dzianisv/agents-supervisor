@@ -12,7 +12,7 @@ Enable or disable supervisor autopilot mode, where the supervisor auto-continues
 Run the CLI, passing the user's argument through verbatim:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" autopilot ${ARGUMENTS}
+node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" autopilot "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty, `on`, or `start` → enable autopilot mode.
