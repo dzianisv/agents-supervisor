@@ -38,6 +38,19 @@ const stateDir = path.join(cwd, '.supervisor');
 const cur = (() => { try { return readFileSync(path.join(stateDir, 'current_session'), 'utf8').trim(); } catch { return null; } })();
 line('current session', cur ?? '(none recorded)');
 
+// Effective supervisor mode (from goal state for current session)
+if (cur) {
+  try {
+    const goalState = goalStore.load(cwd, cur);
+    const effectiveMode = resolveSupervisorMode(goalState);
+    line('effective mode', effectiveMode);
+  } catch {
+    line('effective mode', '(unknown)');
+  }
+} else {
+  line('effective mode', 'reflection (default — no session)');
+}
+
 let disabled = [];
 try { disabled = readFileSync(path.join(stateDir, 'disabled'), 'utf8').split('\n').map((l) => l.trim()).filter(Boolean); } catch { /* none */ }
 line('session disabled?', cur && disabled.includes(cur) ? 'YES (supervisor off for this session)' : 'no');
