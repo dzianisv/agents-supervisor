@@ -132,6 +132,13 @@ switch (cmd.kind) {
   // ── mode-set ──────────────────────────────────────────────────────────────
   case 'mode-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
+    // Warn if switching away from goal mode with an active goal (setMode will delete it).
+    if (cmd.mode !== 'goal') {
+      const preSt = goalStore.load(cwd, sid);
+      if (preSt.goal?.status === 'active') {
+        console.log(`⚠ Clearing active goal: "${preSt.goal.condition}"`);
+      }
+    }
     goalStore.setMode(cwd, sid, cmd.mode);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(`mode: ${cmd.mode}`);
@@ -151,6 +158,13 @@ switch (cmd.kind) {
   // ── autopilot-on ──────────────────────────────────────────────────────────
   case 'autopilot-on': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
+    // Warn if there is an active goal (setAutopilot → setMode will delete it).
+    {
+      const preSt = goalStore.load(cwd, sid);
+      if (preSt.goal?.status === 'active') {
+        console.log(`⚠ Clearing active goal: "${preSt.goal.condition}"`);
+      }
+    }
     goalStore.setAutopilot(cwd, sid, true);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log('mode: autopilot');
@@ -183,13 +197,7 @@ switch (cmd.kind) {
 
   // ── supervisor-status ─────────────────────────────────────────────────────
   case 'supervisor-status': {
-    // Print the effective mode line first, then delegate to bin/status.mjs.
-    if (sid) {
-      const st = goalStore.load(cwd, sid);
-      const effective = resolveSupervisorMode(st);
-      console.log(`mode: ${effective}`);
-      console.log();
-    }
+    // Delegate entirely to bin/status.mjs — it owns the effective-mode line.
     const statusScript = path.join(__dirname, 'status.mjs');
     try {
       const out = execSync(`node ${JSON.stringify(statusScript)}`, { cwd, encoding: 'utf8' });
@@ -225,28 +233,6 @@ switch (cmd.kind) {
     const existing = readDisabled();
     if (!existing.includes(sid)) writeDisabled([...existing, sid]);
     console.log(`Supervisor disabled for session: ${sid}`);
-    break;
-  }
-
-  // ── autoreview-* ──────────────────────────────────────────────────────────
-  case 'autoreview-on':
-  case 'autoreview-off':
-  case 'autoreview-status': {
-    // Autoreview is out of scope for this dispatcher — print a status note.
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    const st = goalStore.load(cwd, sid);
-    const arEnabled = st.autoreview !== false; // default on
-    if (cmd.kind === 'autoreview-on') {
-      st.autoreview = true;
-      goalStore.save(cwd, sid, st);
-      console.log('autoreview: on');
-    } else if (cmd.kind === 'autoreview-off') {
-      st.autoreview = false;
-      goalStore.save(cwd, sid, st);
-      console.log('autoreview: off');
-    } else {
-      console.log(`autoreview: ${arEnabled ? 'on' : 'off'}`);
-    }
     break;
   }
 

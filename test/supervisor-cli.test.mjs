@@ -217,6 +217,27 @@ test('supervisor-goal.mjs shim: node bin/supervisor-goal.mjs goal "x" sets a goa
   assert.ok(state?.goal?.condition?.includes('ship it via shim'), 'goal condition should be persisted');
 });
 
+// ── 12. autopilot-on with active goal → warning printed, mode becomes autopilot ──
+
+test('autopilot on with active goal → prints goal-clear warning; mode becomes autopilot', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-ap-goal-warn';
+  writeSession(tmp, sid);
+
+  // Set an active goal first
+  runSupervisor(tmp, ['goal', 'ship it']);
+
+  // Now switch to autopilot — should warn about goal being cleared
+  const { stdout } = runSupervisor(tmp, ['autopilot', 'on']);
+  assert.match(stdout, /⚠.*Clearing active goal.*ship it/i);
+  assert.match(stdout, /mode:\s*autopilot/i);
+
+  // State should be autopilot, no goal
+  const state = loadGoalState(tmp, sid);
+  assert.equal(state?.mode, 'autopilot');
+  assert.equal(state?.goal, undefined);
+});
+
 // ── Autopilot hook tests (via on-stop.mjs) ───────────────────────────────────
 
 test('autopilot mode + text WITHOUT AUTOPILOT_EXIT → on-stop blocks with Autopilot reason', () => {
