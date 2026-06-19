@@ -10,10 +10,10 @@ your own sessions.
 
 Works on two runtimes from one shared core:
 
-| Runtime | Mechanism | Surface |
-|---|---|---|
-| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:goal`, `/supervisor:retry` |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `autopilot_exit` + `/supervisor`, `/supervisor:train` |
+| Runtime | Mechanism | Colon commands | Additional |
+|---|---|---|---|
+| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -33,9 +33,15 @@ The `Stop` hook is active in the next session. Verify:
 claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
 ```
 
-Then, inside any Claude Code session:
+Then, inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
+- `/supervisor:goal <condition>` — set a mandatory completion condition; agent continues until goal is met or budget exhausts
+- `/supervisor:retry N` — set the retry budget (1–100, default 16)
+- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `AUTOPILOT_EXIT` or budget exhaustion
+- `/supervisor:reflection` — return to default completion-judge mode
+- `/supervisor:on` — re-enable for this session
+- `/supervisor:off` — disable for this session
 
 > **Slash commands vs CLI:** `claude plugin ...` runs from your terminal; `/plugin ...` is the equivalent inside an active Claude Code session. Both work — use whichever fits your context.
 
@@ -61,12 +67,24 @@ Add to `opencode.json`:
 ```json
 { "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
 ```
-or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
-- `/supervisor` - status, including enabled state, effective mode, goal, and retry budget
-- `/supervisor autopilot` - continue on every idle without judge latency
-- `/supervisor goal <condition>` - keep pushing until the condition is met
-- `/supervisor reflection` - return to the default completion-judge mode
-- `/supervisor:train` - learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
+or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then, use the same colon-command set as Claude Code:
+- `/supervisor:status` — effective patterns + recent verdicts
+- `/supervisor:train` — learn from your sessions
+- `/supervisor:goal <condition>` — set a mandatory completion condition
+- `/supervisor:retry N` — set the retry budget (1–100)
+- `/supervisor:autopilot` — skip the judge, auto-continue until exit or budget exhaustion
+- `/supervisor:reflection` — return to default completion-judge mode
+- `/supervisor:on` — re-enable for this session
+- `/supervisor:off` — disable for this session
+
+OpenCode also supports a bare `/supervisor <subcommand>` dispatcher as an alternative:
+- `/supervisor status`
+- `/supervisor autopilot`
+- `/supervisor goal <condition>`
+- `/supervisor reflection`
+- `/supervisor on`
+- `/supervisor off`
+- (note: in the web app, use the tool names directly; file commands don't expand in the web UI)
 
 **Switch off / on:**
 ```
@@ -75,15 +93,15 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
 ```
 Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
 
-## Supervisor modes
+## Supervisor modes (both runtimes)
 
-OpenCode exposes three public supervisor modes:
+The supervisor has three public modes, available on both Claude Code and OpenCode:
 
 | Mode | Command | Behavior |
 |---|---|---|
-| `reflection` | `/supervisor reflection` | Default. Runs the normal completion judge on idle. |
-| `goal` | `/supervisor goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
-| `autopilot` | `/supervisor autopilot` | Skips the judge and continues on every idle until `autopilot_exit` or budget exhaustion. |
+| `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
+| `goal` | `/supervisor:goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
+| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
 
 The effective default mode is `reflection`.
 
@@ -112,21 +130,35 @@ In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 sections to override the judge's rubric; otherwise the shipped default is used.
 (Claude Code reads its rubric from `core/patterns.json` ⊕ your user-local patterns.)
 
-## Autopilot mode (OpenCode)
+## Autopilot mode (both runtimes)
 
 Autopilot is a lightweight autonomous mode: the supervisor **skips the judge
 entirely** and re-prompts the agent on every idle until it explicitly signals
 completion. No evaluation overhead, no latency from judge round-trips — just a
 prescriptive nudge to keep working.
 
+**Claude Code:**
 ```
-/supervisor autopilot          # enable
-/supervisor reflection         # disable, return to default mode
+/supervisor:autopilot          # enable
+/supervisor:reflection         # disable, return to default mode
 ```
 
-Or call the tools directly (web app / API):
+**OpenCode (colon-command or dispatcher):**
+```
+/supervisor:autopilot  # or: /supervisor autopilot
+/supervisor:reflection # or: /supervisor reflection
+```
+
+For web app / OpenCode API, call tools directly:
 - `supervisor_autopilot` — toggle on/off (`enabled: true | false`)
 - `autopilot_exit` — the agent calls this when work is genuinely complete
+
+**Autopilot semantics:**
+- Agent continues on every idle **unconditionally** (no judge evaluation)
+- Judge is **bypassed entirely** — no latency from scoring/reflection
+- Agent must call `AUTOPILOT_EXIT` to signal work is complete
+- Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
+- Safety rails still apply: attempt budget, loop detection
 
 **How it differs from the goal loop:**
 
