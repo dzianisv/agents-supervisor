@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
+import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
 
 const cwd = process.cwd();
 const patterns = loadPatterns({ cwd });
