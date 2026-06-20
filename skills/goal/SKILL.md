@@ -14,7 +14,7 @@ demonstrably met or the budget runs out.
 Run the CLI, passing the user's argument through verbatim:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" goal ${ARGUMENTS}
+node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" goal "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty → reports current goal status.

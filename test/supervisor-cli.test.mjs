@@ -189,6 +189,34 @@ test('off adds session to .supervisor/disabled; on removes it', () => {
   assert.ok(!afterOn.includes(sid), 'session should be removed from disabled file after on');
 });
 
+// ── 7b. CLAUDE_SESSION_ID env fallback ───────────────────────────────────────
+
+test('off with no current_session file but CLAUDE_SESSION_ID set → adds env session to disabled', () => {
+  const tmp = mktmp();
+  const sid = 'env-session-fallback';
+  // Deliberately do NOT write .supervisor/current_session
+
+  const { stdout } = runSupervisor(tmp, ['off'], { env: { CLAUDE_SESSION_ID: sid } });
+  assert.match(stdout, /Supervisor disabled for session:/i);
+  const disabledPath = path.join(tmp, '.supervisor', 'disabled');
+  const content = fs.readFileSync(disabledPath, 'utf8');
+  assert.ok(content.includes(sid), 'env session id should appear in disabled file');
+});
+
+test('on with no current_session file but CLAUDE_SESSION_ID set → removes env session from disabled', () => {
+  const tmp = mktmp();
+  const sid = 'env-session-fallback-on';
+  // Pre-populate disabled list with the env session id (simulating it was previously disabled)
+  const dir = path.join(tmp, '.supervisor');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'disabled'), sid + '\n', 'utf8');
+
+  const { stdout } = runSupervisor(tmp, ['on'], { env: { CLAUDE_SESSION_ID: sid } });
+  assert.match(stdout, /Supervisor re-enabled for session:/i);
+  const content = fs.readFileSync(path.join(dir, 'disabled'), 'utf8');
+  assert.ok(!content.includes(sid), 'env session id should be removed from disabled file');
+});
+
 // ── 8. unknown command ────────────────────────────────────────────────────────
 
 test('unknown command → stdout mentions valid commands', () => {
