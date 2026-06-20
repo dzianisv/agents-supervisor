@@ -495,6 +495,9 @@ async function main() {
     }
   } catch (e) {
     debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
+    // Best-effort mode recovery: if load failed transiently, retry once so the
+    // autopilot cleanup path below (setAutopilot false) can still fire correctly.
+    try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
   const attempts = readAttempts(session_id, cwd);
