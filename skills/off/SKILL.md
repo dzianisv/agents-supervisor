@@ -12,20 +12,14 @@ Disable the supervisor hook for the current session only. The plugin stays insta
 1. Get the current session ID and add it to the disabled list:
 
    ```bash
-   node -e "
-   const fs = require('fs'), path = require('path');
-   const dir = path.join(process.cwd(), '.supervisor');
-   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-   const sid = fs.existsSync(path.join(dir, 'current_session'))
-     ? fs.readFileSync(path.join(dir, 'current_session'), 'utf8').trim()
-     : process.env.CLAUDE_SESSION_ID ?? '';
-   if (!sid) { console.log('No session ID found — supervisor already idle or not yet run.'); process.exit(0); }
-   const flag = path.join(dir, 'disabled');
-   const existing = fs.existsSync(flag) ? fs.readFileSync(flag, 'utf8').split('\n').map(l => l.trim()).filter(Boolean) : [];
-   if (!existing.includes(sid)) fs.writeFileSync(flag, [...existing, sid].join('\n') + '\n', 'utf8');
-   console.log('Supervisor disabled for session:', sid);
-   "
+   node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" off
    ```
+
+   The CLI reads the session from `.supervisor/current_session`, falling back to
+   `CLAUDE_SESSION_ID` when the file is absent. It appends the session to
+   `.supervisor/disabled` (newline-delimited) and prints
+   `Supervisor disabled for session: <sid>`.
+   If no session is found it exits with a message indicating nothing to disable.
 
 2. Confirm to the user: "Supervisor disabled for this session. Run `/supervisor:on` to re-enable."
 

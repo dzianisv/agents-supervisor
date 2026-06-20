@@ -54,7 +54,9 @@ function currentSession() {
   try {
     return fs.readFileSync(path.join(cwd, '.supervisor', 'current_session'), 'utf8').trim();
   } catch {
-    return null;
+    // Fall back to env var when .supervisor/current_session is absent (e.g. in skill invocations
+    // where the Stop hook hasn't run yet but CLAUDE_SESSION_ID is available from the shell env).
+    return process.env.CLAUDE_SESSION_ID?.trim() || null;
   }
 }
 
@@ -132,8 +134,8 @@ switch (cmd.kind) {
   // ── mode-set ──────────────────────────────────────────────────────────────
   case 'mode-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    // Warn if switching away from goal mode with an active goal (setMode will delete it).
-    if (cmd.mode !== 'goal') {
+    // Warn if switching modes with an active goal (setMode will delete it).
+    {
       const preSt = goalStore.load(cwd, sid);
       if (preSt.goal?.status === 'active') {
         console.log(`⚠ Clearing active goal: "${preSt.goal.condition}"`);
@@ -149,8 +151,6 @@ switch (cmd.kind) {
       );
     } else if (cmd.mode === 'reflection') {
       console.log('Supervisor back to reflection mode (judge runs on each stop).');
-    } else if (cmd.mode === 'goal') {
-      console.log('Mode set to goal — set a goal with `node bin/supervisor.mjs goal "<condition>"`.');
     }
     break;
   }

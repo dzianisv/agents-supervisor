@@ -11,7 +11,7 @@ goal before giving up.
 ## Steps
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" retry ${ARGUMENTS}
+node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" retry "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty → reports the current budget.
