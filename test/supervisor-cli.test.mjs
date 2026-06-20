@@ -1,6 +1,6 @@
 /**
  * supervisor-cli.test.mjs — integration tests for bin/supervisor.mjs dispatcher
- * and the autopilot fast-path in bin/on-stop.mjs.
+ * and the autopilot fast-path in bin/supervisor-on-stop.mjs.
  *
  * Tests run the real scripts via execFileSync with temp dirs so they exercise
  * the full file-system state contract.
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPERVISOR = path.join(HERE, '..', 'bin', 'supervisor.mjs');
 const SUPERVISOR_GOAL = path.join(HERE, '..', 'bin', 'supervisor-goal.mjs');
-const ON_STOP = path.join(HERE, '..', 'bin', 'on-stop.mjs');
+const ON_STOP = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
 
 /** Create an isolated temp dir for one test. */
 function mktmp() {
@@ -41,7 +41,7 @@ function runSupervisor(tmp, args, opts = {}) {
   return { stdout: (result.stdout || '').trim(), stderr: (result.stderr || '').trim(), status: result.status };
 }
 
-/** Run the on-stop hook with a CC Stop payload on stdin. */
+/** Run the supervisor-on-stop hook with a CC Stop payload on stdin. */
 function runOnStop(payload, env = {}) {
   const r = spawnSync('node', [ON_STOP], {
     input: JSON.stringify(payload),
@@ -266,9 +266,9 @@ test('autopilot on with active goal → prints goal-clear warning; mode becomes 
   assert.equal(state?.goal, undefined);
 });
 
-// ── Autopilot hook tests (via on-stop.mjs) ───────────────────────────────────
+// ── Autopilot hook tests (via supervisor-on-stop.mjs) ───────────────────────────────────
 
-test('autopilot mode + text WITHOUT AUTOPILOT_EXIT → on-stop blocks with Autopilot reason', () => {
+test('autopilot mode + text WITHOUT AUTOPILOT_EXIT → supervisor-on-stop blocks with Autopilot reason', () => {
   const tmp = mktmp();
   const sid = 'cli-test-ap-block';
   // Set up autopilot state
@@ -296,7 +296,7 @@ test('autopilot mode + text WITHOUT AUTOPILOT_EXIT → on-stop blocks with Autop
   assert.match(out.reason, /autopilot/i);
 });
 
-test('autopilot mode + text containing AUTOPILOT_EXIT on its own line → on-stop does not block; disables autopilot', () => {
+test('autopilot mode + text containing AUTOPILOT_EXIT on its own line → supervisor-on-stop does not block; disables autopilot', () => {
   const tmp = mktmp();
   const sid = 'cli-test-ap-exit';
   writeSession(tmp, sid);
@@ -329,7 +329,7 @@ test('autopilot mode + text containing AUTOPILOT_EXIT on its own line → on-sto
   assert.notEqual(mode, 'autopilot', 'autopilot should be disabled after AUTOPILOT_EXIT');
 });
 
-test('autopilot mode + AUTOPILOT_EXIT mentioned inline mid-sentence → on-stop still blocks (no exit)', () => {
+test('autopilot mode + AUTOPILOT_EXIT mentioned inline mid-sentence → supervisor-on-stop still blocks (no exit)', () => {
   const tmp = mktmp();
   const sid = 'cli-test-ap-inline-mention';
   writeSession(tmp, sid);

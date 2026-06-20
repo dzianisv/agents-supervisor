@@ -12,7 +12,7 @@ Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Colon commands | Additional |
 |---|---|---|---|
-| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
+| **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
