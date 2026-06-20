@@ -87,6 +87,15 @@ function writeDisabled(list) {
 
 const cmd = parseSupervisorCommand(name, args);
 
+/** Warn and clear an active goal before a mode switch that would delete it. */
+function clearGoalIfActive(cwd, sid) {
+  const st = goalStore.load(cwd, sid);
+  if (st.goal?.status === 'active') {
+    console.log(`⚠  Clearing active goal: "${st.goal.condition}"`);
+    goalStore.clearGoal(cwd, sid);
+  }
+}
+
 switch (cmd.kind) {
   // ── goal ──────────────────────────────────────────────────────────────────
   case 'goal-set': {
@@ -135,12 +144,7 @@ switch (cmd.kind) {
   case 'mode-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     // Warn if switching modes with an active goal (setMode will delete it).
-    {
-      const preSt = goalStore.load(cwd, sid);
-      if (preSt.goal?.status === 'active') {
-        console.log(`⚠ Clearing active goal: "${preSt.goal.condition}"`);
-      }
-    }
+    clearGoalIfActive(cwd, sid);
     goalStore.setMode(cwd, sid, cmd.mode);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(`mode: ${cmd.mode}`);
@@ -159,12 +163,7 @@ switch (cmd.kind) {
   case 'autopilot-on': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     // Warn if there is an active goal (setAutopilot → setMode will delete it).
-    {
-      const preSt = goalStore.load(cwd, sid);
-      if (preSt.goal?.status === 'active') {
-        console.log(`⚠ Clearing active goal: "${preSt.goal.condition}"`);
-      }
-    }
+    clearGoalIfActive(cwd, sid);
     goalStore.setAutopilot(cwd, sid, true);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log('mode: autopilot');
@@ -200,13 +199,20 @@ switch (cmd.kind) {
     // Delegate entirely to bin/status.mjs — it owns the effective-mode line.
     const statusScript = path.join(__dirname, 'status.mjs');
     try {
-      execFileSync('node', [statusScript], { cwd, encoding: 'utf8', stdio: 'inherit' });
+      execFileSync('node', [statusScript], { cwd, stdio: 'inherit' });
     } catch (err) {
-      // If status.mjs errors, still surface what we have
-      if (err.stdout) process.stdout.write(err.stdout);
-      if (err.stderr) process.stderr.write(err.stderr);
+      // stdio:'inherit' means err.stdout/err.stderr are always null; just propagate exit code.
+      process.exit(err.status ?? 1);
     }
     break;
+  }
+
+  // ── autoreview-on/off/status ──────────────────────────────────────────────
+  case 'autoreview-on':
+  case 'autoreview-off':
+  case 'autoreview-status': {
+    console.log('Use /supervisor:autoreview on|off — not yet wired to this CLI.');
+    process.exit(0);
   }
 
   // ── supervisor-on ─────────────────────────────────────────────────────────
