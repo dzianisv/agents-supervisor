@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/on-stop.mjs",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/supervisor-on-stop.mjs",
             "timeout": 30
           }
         ]

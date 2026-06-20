@@ -5,7 +5,7 @@
 ## Runtime Surfaces
 
 - Claude Code integration uses a `Stop` hook declared in `hooks/hooks.json`.
-- The Claude Code hook command is `bin/on-stop.mjs`.
+- The Claude Code hook command is `bin/supervisor-on-stop.mjs`.
 - OpenCode integration is the plugin entrypoint `opencode/supervisor.ts`.
 - OpenCode plugin package metadata lives in `opencode/package.json`.
 - Claude plugin metadata lives in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.

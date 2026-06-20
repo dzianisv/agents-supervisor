@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * e2e-cc.mjs — end-to-end test of the Claude Code Stop hook (bin/on-stop.mjs).
+ * e2e-cc.mjs — end-to-end test of the Claude Code Stop hook (bin/supervisor-supervisor-on-stop.mjs).
  *
  * Exercises the REAL hook entry point exactly as Claude Code invokes it: a Stop
  * payload on stdin, a real transcript jsonl on disk, and the hook's stdout
@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const HOOK = path.join(HERE, '..', 'bin', 'on-stop.mjs');
+const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
 const LIVE = process.env.SUPERVISOR_CC_LIVE === '1';
 
 let pass = 0;

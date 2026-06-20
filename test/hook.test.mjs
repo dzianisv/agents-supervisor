@@ -8,7 +8,7 @@ import {
   loopGuard, sanitizeCwd, readAttempts, writeAttemptCounter,
   writeVerdict, readTranscriptTail, buildStopContext,
   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
-} from '../bin/on-stop.mjs';
+} from '../bin/supervisor-on-stop.mjs';
 
 // Project root — used by new tests that must not write to /tmp.
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

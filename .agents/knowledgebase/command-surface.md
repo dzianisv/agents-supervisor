@@ -14,11 +14,11 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 ## Claude Code Surface
 
 - Installation is via Claude plugin metadata under `.claude-plugin/`.
-- Runtime enforcement uses the `Stop` hook in `hooks/hooks.json`, which runs `bin/on-stop.mjs`.
+- Runtime enforcement uses the `Stop` hook in `hooks/hooks.json`, which runs `bin/supervisor-on-stop.mjs`.
 - User-facing skills live under `skills/`.
 - Current skill directories include all 8 colon subcommands: `status`, `on`, `off`, `goal`, `retry`, `train`, `autopilot`, and `reflection`.
 - Canonical CLI is `bin/supervisor.mjs` (with `bin/supervisor-goal.mjs` as a back-compat shim).
-- `bin/on-stop.mjs` includes an autopilot fast-path for lightweight continuation.
+- `bin/supervisor-on-stop.mjs` includes an autopilot fast-path for lightweight continuation.
 - README documents the full unified command set: `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, and `/supervisor:reflection`.
 
 ## OpenCode Surface

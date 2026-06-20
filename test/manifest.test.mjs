@@ -20,12 +20,12 @@ test('plugin.json does NOT declare hooks when hooks/hooks.json exists (duplicate
   assert.equal(manifest.name, 'supervisor');
 });
 
-test('hooks/hooks.json registers the Stop hook → bin/on-stop.mjs', () => {
+test('hooks/hooks.json registers the Stop hook → bin/supervisor-on-stop.mjs', () => {
   const h = read('hooks/hooks.json');
   const cmd = h.hooks?.Stop?.[0]?.hooks?.[0]?.command ?? '';
-  assert.match(cmd, /on-stop\.mjs/);
+  assert.match(cmd, /supervisor-on-stop\.mjs/);
   assert.match(cmd, /CLAUDE_PLUGIN_ROOT/);
-  assert.ok(fs.existsSync(path.join(ROOT, 'bin', 'on-stop.mjs')));
+  assert.ok(fs.existsSync(path.join(ROOT, 'bin', 'supervisor-on-stop.mjs')));
 });
 
 test('bundled skills exist with frontmatter names → /supervisor:{train,status,goal,retry}', () => {

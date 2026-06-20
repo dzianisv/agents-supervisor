@@ -1,6 +1,6 @@
 /**
  * goal.mjs — shared goal-loop primitives (canonical JS port of the logic in
- * opencode/supervisor.ts). Used by the Claude Code Stop hook (bin/on-stop.mjs)
+ * opencode/supervisor.ts). Used by the Claude Code Stop hook (bin/supervisor-on-stop.mjs)
  * and the CC goal/retry CLI (bin/supervisor-goal.mjs).
  *
  * A "goal" is a user-set condition the agent must demonstrably meet before the
