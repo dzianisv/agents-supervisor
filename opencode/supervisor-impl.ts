@@ -2033,8 +2033,33 @@ Continue now.`
     }
 
   return {
-    config: async (_config) => {
-      return
+    config: async (cfg: any) => {
+      // Register the /supervisor slash command so users can type
+      // /supervisor [args] directly in the TUI instead of calling the tool.
+      // The template instructs the LLM to route to the appropriate tool call.
+      cfg.command = {
+        ...(cfg.command || {}),
+        supervisor: {
+          description: "Control the supervisor: status | on | off | reflection | autopilot | goal <condition> | goal clear | retry <N> | autoreview on|off",
+          template: `Execute this supervisor command by calling the supervisor tool with the appropriate arguments.
+
+Command: "{{input}}"
+
+Routing rules:
+- empty or "status" → supervisor({ action: "status" })
+- "on" → supervisor({ action: "on" })
+- "off" → supervisor({ action: "off" })
+- "reflection" → supervisor({ mode: "reflection" })
+- "autopilot" → supervisor({ mode: "autopilot" })
+- "goal <condition text>" → supervisor({ action: "goal", condition: "<condition text>" })
+- "goal clear" → supervisor({ action: "goal", clear: true })
+- "retry <N>" → supervisor({ action: "retry", n: N })
+- "autoreview on" → supervisor_autoreview({ enabled: true })
+- "autoreview off" → supervisor_autoreview({ enabled: false })
+
+Call the tool now. Do not explain, just execute the tool call.`
+        }
+      }
     },
     "tool.execute.before": async (input: { tool?: string; sessionID?: string }) => {
       currentSessionId = trackSessionScopedToolSession(currentSessionId, input)
