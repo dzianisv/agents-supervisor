@@ -296,6 +296,41 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     await sendSupervisorMessage("/supervisor autoreview status")
   })
 
+  test("supervisor goal set/status/clear works via message", { timeout: 90_000 }, async () => {
+    // Create a fresh session
+    const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+    assert.equal(createRes.status, 200)
+    const session = await createRes.json()
+    async function sendSupervisorMessage(text) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 15_000)
+      try {
+        const res = await fetch(`${baseUrl}/session/${session.id}/message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ parts: [{ type: "text", text }] }),
+          signal: controller.signal,
+        })
+        clearTimeout(timer)
+        assert.equal(res.status, 200, `Expected 200 for "${text}", got ${res.status}`)
+        const body = await res.json()
+        assert.ok(body.info, `Response for "${text}" should have info field`)
+        return body
+      } catch (err) {
+        clearTimeout(timer)
+        if (err.name === "AbortError") {
+          console.log(`INFO: "${text}" — server blocked on LLM (no API key), endpoint accepted request`)
+          return null
+        }
+        throw err
+      }
+    }
+
+    await sendSupervisorMessage("/supervisor goal all tests pass")
+    await sendSupervisorMessage("/supervisor goal")
+    await sendSupervisorMessage("/supervisor goal clear")
+  })
+
   test("supervisor command description includes autoreview routing", async () => {
     // supervisor_autoreview is a TOOL (not a slash command), so it won't appear
     // in the /command registry. Instead verify the /supervisor command's

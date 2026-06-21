@@ -1720,7 +1720,7 @@ Continue now.`
         // JSON-only.
         const modelList = await loadSupervisorModelList()
         const preferredModel = await loadPreferredModelSpec(directory)
-        const sessionModelSpec = getLastSessionModelSpec(currentMessages || [])
+        const sessionModelSpec = getLastSessionModelSpec(messages || [])
         const assessmentAttempts = modelList.length
           ? modelList
           : preferredModel && !isBlockedJudgeModel(preferredModel)
