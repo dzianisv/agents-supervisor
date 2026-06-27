@@ -1543,14 +1543,18 @@ Do NOT call this tool:
         execute: executeAutopilotExit
       }
     } catch {
-      setSupervisorTool = null
-      supervisorToggleTool = null
-      supervisorTrainTool = null
-      supervisorGoalTool = null
-      supervisorRetryTool = null
-      supervisorAutopilotTool = null
-      supervisorAutoreviewTool = null
-      autopilotExitTool = null
+      // Neither @opencode-ai/plugin/tool nor zod are available (e.g. CI without
+      // npm install, or a bare Node.js environment). Create minimal plain objects
+      // with just execute + description so plugin.tool is always defined and the
+      // execute functions remain callable without schema validation.
+      setSupervisorTool = { description: setSupervisorDescription, args: {}, execute: executeSetSupervisor }
+      supervisorToggleTool = { description: supervisorToggleDescription, args: {}, execute: executeSupervisorToggle }
+      supervisorTrainTool = { description: supervisorTrainDescription, args: {}, execute: executeSupervisorTrain }
+      supervisorGoalTool = { description: supervisorGoalDescription, args: {}, execute: executeSupervisorGoal }
+      supervisorRetryTool = { description: supervisorRetryDescription, args: {}, execute: executeSupervisorRetry }
+      supervisorAutopilotTool = { description: supervisorAutopilotDescription, args: {}, execute: executeSupervisorAutopilot }
+      supervisorAutoreviewTool = { description: supervisorAutoreviewDescription, args: {}, execute: executeSupervisorAutoreview }
+      autopilotExitTool = { description: autopilotExitDescription, args: {}, execute: executeAutopilotExit }
     }
   }
 
