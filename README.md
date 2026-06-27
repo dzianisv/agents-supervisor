@@ -23,11 +23,19 @@ so both runtimes — and the trainer — share one brain.
 
 ### Claude Code
 
-Run in your terminal:
+**From the registry (published release):**
 ```sh
 claude plugin marketplace add dzianisv/agents-supervisor
 claude plugin install supervisor@agents-supervisor
 ```
+
+**From a local clone (development / localhost):**
+```sh
+git clone https://github.com/dzianisv/agents-supervisor
+claude plugin marketplace add /path/to/agents-supervisor
+claude plugin install supervisor@agents-supervisor
+```
+
 The `Stop` hook is active in the next session. Verify:
 ```sh
 claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
@@ -38,12 +46,6 @@ Then, inside any Claude Code session:
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 
 > **Slash commands vs CLI:** `claude plugin ...` runs from your terminal; `/plugin ...` is the equivalent inside an active Claude Code session. Both work — use whichever fits your context.
-
-**Local dev install** (clone first, then):
-```sh
-claude plugin marketplace add /path/to/agents-supervisor
-claude plugin install supervisor@agents-supervisor
-```
 
 **Switch off / on:**
 ```sh

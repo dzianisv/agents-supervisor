@@ -95,7 +95,7 @@ async function sendMessage(baseUrl, sessionId, text, timeoutMs = 60_000, opts = 
 
 const SKIP = !hasOpencode()
 
-describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not in PATH", timeout: 300_000 }, () => {
+describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
   let serverProc
   let baseUrl
   let tmpDir
@@ -103,7 +103,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   before(async () => {
     // 1. Create an isolated temp directory with a minimal opencode.json config.
     //    Only the plugin field is needed — providers come from the global config
-    //    at ~/.config/opencode/opencode.json (github-copilot is pre-authenticated).
+    //    at ~/.config/opencode/opencode.json. LLM calls use github-copilot/gemini-3.5-flash (no separate key needed).
     tmpDir = mkdtempSync(join(tmpdir(), "sup-e2e-oc-"))
     writeFileSync(
       join(tmpDir, "opencode.json"),
@@ -134,8 +134,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
 
     // Collect stderr for debugging if startup fails
     let stderrBuf = ""
+    serverProc.stdout.on("data", (chunk) => {
+      process.stdout.write("[opencode.stdout] " + chunk.toString())
+    })
     serverProc.stderr.on("data", (chunk) => {
-      stderrBuf += chunk.toString()
+      const s = chunk.toString()
+      stderrBuf += s
+      process.stderr.write("[opencode.stderr] " + s)
     })
     // Unref streams and process so node doesn't hang on open pipes after tests
     serverProc.stdout?.unref?.()
@@ -228,18 +233,18 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(sessions.length > 0, "Should have at least one session (from prior test)")
   })
 
-  test("supervisor goal set/status/clear works", { timeout: 300_000 }, async () => {
+  test("supervisor goal set/status/clear works", { timeout: 900_000 }, async () => {
     // Create a fresh session
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
 
     // The goal command triggers an LLM call (slash command → brainstormer agent).
-    // Use a model confirmed available via github-copilot provider.
+    // gemini-3.5-flash via github-copilot: confirmed fast and key-free.
     const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
 
     // 1. Set a goal
-    const setRes = await sendMessage(baseUrl, session.id, "/supervisor goal all tests pass", 90_000, { model })
+    const setRes = await sendMessage(baseUrl, session.id, "/supervisor goal all tests pass", 300_000, { model })
     assert.ok(setRes, "Goal set response should not be null")
     const setContent = JSON.stringify(setRes).toLowerCase()
     assert.ok(
@@ -248,7 +253,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
 
     // 2. Check status — should reflect the active goal
-    const statusRes = await sendMessage(baseUrl, session.id, "/supervisor goal", 90_000, { model })
+    const statusRes = await sendMessage(baseUrl, session.id, "/supervisor goal", 300_000, { model })
     assert.ok(statusRes, "Goal status response should not be null")
     const statusContent = JSON.stringify(statusRes).toLowerCase()
     assert.ok(
@@ -257,7 +262,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
 
     // 3. Clear the goal
-    const clearRes = await sendMessage(baseUrl, session.id, "/supervisor goal clear", 90_000, { model })
+    const clearRes = await sendMessage(baseUrl, session.id, "/supervisor goal clear", 300_000, { model })
     assert.ok(clearRes, "Goal clear response should not be null")
     const clearContent = JSON.stringify(clearRes).toLowerCase()
     assert.ok(
@@ -266,14 +271,16 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
   })
 
-  test("supervisor reflection mode works", { timeout: 120_000 }, async () => {
+  test("supervisor reflection mode works", { timeout: 600_000 }, async () => {
     // Create a fresh session
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
 
+    const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
+
     // Send reflection command
-    const res = await sendMessage(baseUrl, session.id, "/supervisor reflection", 60_000)
+    const res = await sendMessage(baseUrl, session.id, "/supervisor reflection", 300_000, { model })
     assert.ok(res, "Reflection response should not be null")
     const content = JSON.stringify(res).toLowerCase()
     assert.ok(
@@ -292,5 +299,58 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.equal(getRes.status, 200)
     const retrieved = await getRes.json()
     assert.equal(retrieved.id, session.id)
+  })
+
+  describe("autopilot mode", () => {
+    const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
+
+    // Cool down after prior LLM-heavy tests to avoid provider rate limiting.
+    // The goal test makes 3 LLM calls and reflection makes 1 — spacing them
+    // out prevents hitting the opencode provider rate window.
+    before(async () => {
+      await new Promise(r => setTimeout(r, 30_000))
+    })
+
+    test("autopilot lifecycle: enable, status, switch to reflection, switch to goal", { timeout: 900_000 }, async () => {
+      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+      assert.equal(createRes.status, 200)
+      const session = await createRes.json()
+
+      // 1. Enable autopilot via slash command
+      const enableRes = await sendMessage(baseUrl, session.id, "/supervisor autopilot", 300_000, { model })
+      assert.ok(enableRes, "Autopilot enable response should not be null")
+      const enableContent = JSON.stringify(enableRes).toLowerCase()
+      assert.ok(
+        enableContent.includes("autopilot") && (enableContent.includes("enabled") || enableContent.includes("mode")),
+        `Expected autopilot response to mention "autopilot" and "enabled" or "mode". Got: ${JSON.stringify(enableRes).slice(0, 500)}`
+      )
+
+      // 2. Check status — should reflect autopilot mode
+      const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 300_000, { model })
+      assert.ok(statusRes, "Status response should not be null")
+      const statusContent = JSON.stringify(statusRes).toLowerCase()
+      assert.ok(
+        statusContent.includes("autopilot") || statusContent.includes("supervisor") || statusContent.includes("mode") || statusContent.includes("enabled"),
+        `Expected status response to mention supervisor state. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+      )
+
+      // 3. Switch to reflection mode
+      const reflectionRes = await sendMessage(baseUrl, session.id, "/supervisor reflection", 300_000, { model })
+      assert.ok(reflectionRes, "Reflection switch response should not be null")
+      const reflectionContent = JSON.stringify(reflectionRes).toLowerCase()
+      assert.ok(
+        reflectionContent.includes("reflection") || reflectionContent.includes("mode"),
+        `Expected reflection response to mention "reflection" or "mode". Got: ${JSON.stringify(reflectionRes).slice(0, 500)}`
+      )
+
+      // 4. Switch to goal mode (from reflection, proving full mode cycle works)
+      const goalRes = await sendMessage(baseUrl, session.id, "/supervisor goal tests pass", 300_000, { model })
+      assert.ok(goalRes, "Goal switch response should not be null")
+      const goalContent = JSON.stringify(goalRes).toLowerCase()
+      assert.ok(
+        goalContent.includes("goal") || goalContent.includes("supervisor") || goalContent.includes("tests pass"),
+        `Expected goal response to acknowledge the command. Got: ${JSON.stringify(goalRes).slice(0, 500)}`
+      )
+    })
   })
 })
