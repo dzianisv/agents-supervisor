@@ -27,7 +27,8 @@ import {
   getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
   isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
-import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs';
+import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs'
+import { loadParsedRubric } from '../core/rubric-loader.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
 import { goalStore, resolveMaxAttempts, decideGoalTransition } from '../core/goal.mjs';
 
@@ -526,8 +527,10 @@ async function main() {
 
   // 5. Self-assessment via shared pipeline.
   const agents = getAgentsSync(cwd);
+  // Rubric seam: load per-project or global rubric.md if present; null falls back to DEFAULT_RUBRIC
+  const injectedRubric = await loadParsedRubric(cwd);
   const prompt = buildSelfAssessmentPrompt(
-    taskContext, agents, ctx.final_assistant_text, attempts, null, effectiveMax,
+    taskContext, agents, ctx.final_assistant_text, attempts, injectedRubric, effectiveMax,
   );
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
