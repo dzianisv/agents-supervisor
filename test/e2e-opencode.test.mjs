@@ -47,6 +47,97 @@ function findFreePort() {
   })
 }
 
+/**
+ * Query the running opencode server for a free, text-capable model from a
+ * connected provider. Probes each candidate with a brief test message to
+ * verify actual API access (being listed as free does not guarantee access).
+ *
+ * Returns { providerID, modelID } or throws if no working model is found.
+ * Priority: opencode → github-models → others.
+ */
+async function pickFreeModel(baseUrl) {
+  const res = await fetch(`${baseUrl}/provider`)
+  if (!res.ok) throw new Error(`/provider returned ${res.status}`)
+  const { all = [], connected = [] } = await res.json()
+  const connectedSet = new Set(connected)
+
+  const PRIORITY = ["opencode", "github-models"]
+  const candidates = []
+  for (const provider of all) {
+    if (!connectedSet.has(provider.id)) continue
+    for (const [modelId, model] of Object.entries(provider.models || {})) {
+      const { input: inputCost = 999, output: outputCost = 999 } = model.cost || {}
+      if (inputCost !== 0 || outputCost !== 0) continue
+      if (model.status !== "active") continue
+      const inputCaps = (model.capabilities || {}).input || {}
+      const outputCaps = (model.capabilities || {}).output || {}
+      if (inputCaps.text === false || outputCaps.text === false) continue
+      candidates.push({ providerID: provider.id, modelID: modelId })
+    }
+  }
+
+  candidates.sort((a, b) => {
+    const ai = PRIORITY.indexOf(a.providerID)
+    const bi = PRIORITY.indexOf(b.providerID)
+    return (ai === -1 ? Infinity : ai) - (bi === -1 ? Infinity : bi)
+  })
+
+  if (candidates.length === 0) {
+    throw new Error(
+      "No free text-capable model found in connected providers. " +
+      "Configure a provider in ~/.config/opencode/opencode.json"
+    )
+  }
+
+  // Probe each candidate — a model listed as free may still deny access.
+  // Use a 30s timeout per probe; fast API errors (< 2s) let us scan quickly.
+  for (const candidate of candidates) {
+    try {
+      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+      if (!createRes.ok) continue
+      const { id: sessionId } = await createRes.json()
+
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 30_000)
+      let probeOk = false
+      try {
+        const probeRes = await fetch(`${baseUrl}/session/${sessionId}/message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            parts: [{ type: "text", text: "hi" }],
+            model: { providerID: candidate.providerID, modelID: candidate.modelID },
+          }),
+          signal: controller.signal,
+        })
+        if (probeRes.ok) {
+          const data = await probeRes.json()
+          // APIError in the info.error field means no access — skip this model
+          const hasApiError = JSON.stringify(data).includes('"name":"APIError"')
+          probeOk = !hasApiError
+        }
+      } catch {
+        // timeout or network error — model too slow or unreachable, skip
+      } finally {
+        clearTimeout(timer)
+      }
+
+      if (probeOk) {
+        process.stdout.write(`[e2e] model: ${candidate.providerID}/${candidate.modelID}\n`)
+        return candidate
+      }
+      process.stdout.write(`[e2e] skip ${candidate.providerID}/${candidate.modelID} (no access or timeout)\n`)
+    } catch {
+      // skip
+    }
+  }
+
+  throw new Error(
+    "No working free text-capable model found in connected providers. " +
+    "Configure a provider in ~/.config/opencode/opencode.json"
+  )
+}
+
 /** Poll a URL until it responds with status 200 or timeout expires. */
 async function waitForHealth(url, timeoutMs = 15_000, intervalMs = 500) {
   const deadline = Date.now() + timeoutMs
@@ -99,11 +190,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   let serverProc
   let baseUrl
   let tmpDir
+  let model   // auto-discovered free model, set in before()
 
   before(async () => {
     // 1. Create an isolated temp directory with a minimal opencode.json config.
     //    Only the plugin field is needed — providers come from the global config
-    //    at ~/.config/opencode/opencode.json. LLM calls use github-copilot/gemini-3.5-flash (no separate key needed).
+    //    at ~/.config/opencode/opencode.json. The LLM model is auto-discovered
+    //    from connected providers (free, zero-cost, text-capable).
     tmpDir = mkdtempSync(join(tmpdir(), "sup-e2e-oc-"))
     writeFileSync(
       join(tmpDir, "opencode.json"),
@@ -165,6 +258,10 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       serverProc.kill("SIGTERM")
       throw err
     }
+
+    // 5. Discover a free model from the connected providers for LLM-backed tests.
+    model = await pickFreeModel(baseUrl)
+    process.stdout.write(`[e2e] LLM model: ${model.providerID}/${model.modelID}\n`)
   })
 
   after(() => {
@@ -240,8 +337,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     const session = await createRes.json()
 
     // The goal command triggers an LLM call (slash command → brainstormer agent).
-    // gemini-3.5-flash via github-copilot: confirmed fast and key-free.
-    const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
+    // `model` is auto-discovered from connected providers in before().
 
     // 1. Set a goal
     const setRes = await sendMessage(baseUrl, session.id, "/supervisor goal all tests pass", 300_000, { model })
@@ -277,8 +373,6 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
 
-    const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
-
     // Send reflection command
     const res = await sendMessage(baseUrl, session.id, "/supervisor reflection", 300_000, { model })
     assert.ok(res, "Reflection response should not be null")
@@ -302,7 +396,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   })
 
   describe("autopilot mode", () => {
-    const model = { providerID: "github-copilot", modelID: "gemini-3.5-flash" }
+    // Uses the suite-level `model` auto-discovered in before().
 
     // Cool down after prior LLM-heavy tests to avoid provider rate limiting.
     // The goal test makes 3 LLM calls and reflection makes 1 — spacing them
