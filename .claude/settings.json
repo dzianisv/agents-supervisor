@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/engineer/workspace/agents-supervisor/bin/on-stop.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

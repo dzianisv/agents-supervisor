@@ -9,6 +9,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "test:cc": "node test/e2e-cc.mjs",
+    "test:smoke": "node test/smoke-cc.mjs",
     "eval": "node evals/judge-eval.mjs",
     "train": "node train/run-train.mjs"
   },
