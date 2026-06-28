@@ -193,39 +193,65 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   let model   // auto-discovered free model, set in before()
 
   before(async () => {
-    // 1. Create an isolated temp directory with a minimal opencode.json config.
-    //    Only the plugin field is needed — providers come from the global config
-    //    at ~/.config/opencode/opencode.json. The LLM model is auto-discovered
-    //    from connected providers (free, zero-cost, text-capable).
+    // 1. Create an isolated temp directory.
     tmpDir = mkdtempSync(join(tmpdir(), "sup-e2e-oc-"))
-    writeFileSync(
-      join(tmpDir, "opencode.json"),
-      JSON.stringify(
-        {
-          $schema: "https://opencode.ai/config.json",
-          plugin: [PLUGIN_PATH],
-        },
-        null,
-        2
-      )
-    )
 
-    // 2. Pick a free port
+    function writeConfig(modelSpec) {
+      const cfg = { $schema: "https://opencode.ai/config.json", plugin: [PLUGIN_PATH] }
+      if (modelSpec) {
+        cfg.model = modelSpec
+      }
+      writeFileSync(join(tmpDir, "opencode.json"), JSON.stringify(cfg, null, 2))
+    }
+
+    // Phase 1: start a throwaway server in a SEPARATE temp directory to query
+    // /provider and probe for an accessible free model. A separate dir avoids
+    // leaving stale probe-session DB rows that would confuse the real server.
+    // Writing the free model into the real server's config BEFORE starting it
+    // ensures supervisor continuations (no model in body) use it too.
+    const discoverDir = mkdtempSync(join(tmpdir(), "sup-e2e-discover-"))
+    const discoverCfg = { $schema: "https://opencode.ai/config.json", plugin: [PLUGIN_PATH] }
+    writeFileSync(join(discoverDir, "opencode.json"), JSON.stringify(discoverCfg, null, 2))
+    const discoverPort = await findFreePort()
+    const discoverProc = spawn("opencode", ["serve", "--port", String(discoverPort), "--hostname", "127.0.0.1"], {
+      cwd: discoverDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+      env: { ...process.env, HOME: process.env.HOME },
+    })
+    discoverProc.stdout.on("data", (c) => process.stdout.write("[opencode.discover] " + c.toString()))
+    discoverProc.stderr.on("data", (c) => process.stderr.write("[opencode.discover] " + c.toString()))
+    discoverProc.stdout?.unref?.()
+    discoverProc.stderr?.unref?.()
+    discoverProc.unref()
+
+    try {
+      await Promise.race([
+        waitForHealth(`http://127.0.0.1:${discoverPort}/global/health`),
+        new Promise((_, rej) => discoverProc.on("exit", (code) => rej(new Error(`discover server exited (code ${code})`)))),
+      ])
+      model = await pickFreeModel(`http://127.0.0.1:${discoverPort}`)
+    } finally {
+      try { process.kill(-discoverProc.pid, "SIGKILL") } catch { try { discoverProc.kill("SIGKILL") } catch { /* ignore */ } }
+      discoverProc.stdout?.destroy()
+      discoverProc.stderr?.destroy()
+      try { rmSync(discoverDir, { recursive: true, force: true }) } catch { /* ignore */ }
+      await new Promise((r) => setTimeout(r, 400)) // let OS reclaim the port
+    }
+
+    // 2. Write final config with the discovered free model as the session default.
+    writeConfig(`${model.providerID}/${model.modelID}`)
+
+    // 3. Spawn the real server.
     const port = await findFreePort()
     baseUrl = `http://127.0.0.1:${port}`
-
-    // 3. Spawn `opencode serve` pointing at our temp config directory
     serverProc = spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
       cwd: tmpDir,
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
-      env: {
-        ...process.env,
-        HOME: process.env.HOME,
-      },
+      env: { ...process.env, HOME: process.env.HOME },
     })
 
-    // Collect stderr for debugging if startup fails
     let stderrBuf = ""
     serverProc.stdout.on("data", (chunk) => {
       process.stdout.write("[opencode.stdout] " + chunk.toString())
@@ -235,32 +261,25 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       stderrBuf += s
       process.stderr.write("[opencode.stderr] " + s)
     })
-    // Unref streams and process so node doesn't hang on open pipes after tests
     serverProc.stdout?.unref?.()
     serverProc.stderr?.unref?.()
     serverProc.unref()
 
-    // If process exits before health check, fail fast
-    const exitPromise = new Promise((_, reject) => {
-      serverProc.on("exit", (code) => {
-        reject(new Error(`opencode serve exited early (code ${code}). stderr:\n${stderrBuf}`))
-      })
-    })
-
-    // 4. Wait for the health endpoint to respond
+    // 4. Wait for health.
     try {
       await Promise.race([
         waitForHealth(`${baseUrl}/global/health`),
-        exitPromise,
+        new Promise((_, reject) => {
+          serverProc.on("exit", (code) => {
+            reject(new Error(`opencode serve exited early (code ${code}). stderr:\n${stderrBuf}`))
+          })
+        }),
       ])
     } catch (err) {
-      // Clean up if we can't start
       serverProc.kill("SIGTERM")
       throw err
     }
 
-    // 5. Discover a free model from the connected providers for LLM-backed tests.
-    model = await pickFreeModel(baseUrl)
     process.stdout.write(`[e2e] LLM model: ${model.providerID}/${model.modelID}\n`)
   })
 
