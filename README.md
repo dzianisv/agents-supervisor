@@ -8,6 +8,53 @@ your own sessions.
 
 > Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
 
+## Quick Start
+
+### Claude Code
+
+**From GitHub (no clone needed):**
+```sh
+claude plugin marketplace add https://github.com/dzianisv/agents-supervisor
+claude plugin install supervisor@agents-supervisor
+```
+
+**From a local clone:**
+```sh
+git clone https://github.com/dzianisv/agents-supervisor
+claude plugin marketplace add ./agents-supervisor
+claude plugin install supervisor@agents-supervisor
+```
+
+The `Stop` hook is active in the next session. Verify:
+```sh
+claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
+```
+
+### OpenCode
+
+**From GitHub (no clone needed):**
+
+Add to `~/.config/opencode/opencode.json`:
+```json
+{ "plugin": ["github:dzianisv/agents-supervisor/opencode/supervisor.ts"] }
+```
+
+**From a local clone:**
+```sh
+git clone https://github.com/dzianisv/agents-supervisor
+```
+Add to `~/.config/opencode/opencode.json`:
+```json
+{ "plugin": ["file:///path/to/agents-supervisor/opencode/supervisor.ts"] }
+```
+
+Then inside an OpenCode session:
+```
+/supervisor          # status
+/supervisor autopilot   # keep going on every idle
+/supervisor goal <condition>   # stop only when condition is met
+```
+
 Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Surface |
@@ -18,64 +65,6 @@ Works on two runtimes from one shared core:
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
 so both runtimes — and the trainer — share one brain.
-
-## Quickstart (1 minute)
-
-### Claude Code
-
-**From the registry (published release):**
-```sh
-claude plugin marketplace add dzianisv/agents-supervisor
-claude plugin install supervisor@agents-supervisor
-```
-
-**From a local clone (development / localhost):**
-```sh
-git clone https://github.com/dzianisv/agents-supervisor
-claude plugin marketplace add /path/to/agents-supervisor
-claude plugin install supervisor@agents-supervisor
-```
-
-The `Stop` hook is active in the next session. Verify:
-```sh
-claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
-```
-
-Then, inside any Claude Code session:
-- `/supervisor:status` — effective patterns + recent verdicts
-- `/supervisor:train` — learn from your sessions (updates your local patterns)
-
-> **Slash commands vs CLI:** `claude plugin ...` runs from your terminal; `/plugin ...` is the equivalent inside an active Claude Code session. Both work — use whichever fits your context.
-
-**Switch off / on:**
-```sh
-# whole plugin (all sessions) — run in terminal
-claude plugin disable supervisor@agents-supervisor
-claude plugin enable  supervisor@agents-supervisor
-```
-
-Inside an active Claude Code session:
-- `/supervisor:off` — disable for this session
-- `/supervisor:on` — re-enable for this session
-
-### OpenCode
-Add to `opencode.json`:
-```json
-{ "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
-```
-or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
-- `/supervisor` - status, including enabled state, effective mode, goal, and retry budget
-- `/supervisor autopilot` - continue on every idle without judge latency
-- `/supervisor goal <condition>` - keep pushing until the condition is met
-- `/supervisor reflection` - return to the default completion-judge mode
-- `/supervisor:train` - learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
-
-**Switch off / on:**
-```
-/supervisor off     # disable for this session
-/supervisor on      # re-enable
-```
-Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
 
 ## Supervisor modes
 
