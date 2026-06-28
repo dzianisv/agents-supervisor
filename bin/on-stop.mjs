@@ -27,9 +27,17 @@ import {
   getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
   isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
-import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs';
+import { buildSelfAssessmentPrompt, parseSelfAssessmentJson, parseRubric, DEFAULT_RUBRIC } from '../core/assessment.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection } from '../core/goal.mjs';
+
+function extractGoalCondition(content) {
+  // Strip HTML comments
+  let text = content.replace(/<!--[\s\S]*?-->/g, '');
+  // Try ## Goal Condition section
+  const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i);
+  return (match ? match[1] : text).trim();
+}
 
 const STATE_DIR = '.supervisor';
 const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);
@@ -492,6 +500,20 @@ async function main() {
     debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
   }
 
+  // Project-level goal: in reflection mode, read .agents/supervisor/Goal.md
+  let projectGoalSection = '';
+  const effectiveMode = resolveSupervisorMode(goalState);
+  if (effectiveMode !== 'goal' && !goal) {
+    try {
+      const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
+      const goalFileContent = fs.readFileSync(goalFilePath, 'utf8');
+      const cond = extractGoalCondition(goalFileContent);
+      if (cond) projectGoalSection = buildGoalRequirementSection(cond);
+    } catch {
+      // Goal.md not present or unreadable — no project goal
+    }
+  }
+
   const attempts = readAttempts(session_id, cwd);
   if (attempts >= effectiveMax) {
     if (goal) {
@@ -526,8 +548,12 @@ async function main() {
 
   // 5. Self-assessment via shared pipeline.
   const agents = getAgentsSync(cwd);
+  const baseRubric = parseRubric(DEFAULT_RUBRIC);
+  const effectiveRubric = projectGoalSection && !goal
+    ? { ...baseRubric, antipatterns: `${baseRubric.antipatterns}\n\n${projectGoalSection}` }
+    : null;
   const prompt = buildSelfAssessmentPrompt(
-    taskContext, agents, ctx.final_assistant_text, attempts, null, effectiveMax,
+    taskContext, agents, ctx.final_assistant_text, attempts, effectiveRubric, effectiveMax,
   );
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
