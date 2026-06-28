@@ -33,10 +33,34 @@ if (!sid) {
   process.exit(0);
 }
 
+// Handle 'mode' subcommand directly (e.g. node supervisor-goal.mjs mode reflection)
+if (name === 'mode') {
+  const validModes = ['reflection', 'autopilot', 'goal'];
+  const requestedMode = args.trim().toLowerCase();
+  if (!validModes.includes(requestedMode)) {
+    console.log(`Unknown mode: "${requestedMode}". Valid modes: ${validModes.join(', ')}.`);
+    process.exit(0);
+  }
+  goalStore.setMode(cwd, sid, requestedMode);
+  const modeDesc = {
+    reflection: 'judge runs patterns/antipatterns on each stop',
+    autopilot: 'skips judge, always continues (call autopilot_exit when done)',
+    goal: 'requires an active goal condition to be set',
+  };
+  console.log(`Supervisor mode set to ${requestedMode} for session ${sid.slice(0, 8)}… (${modeDesc[requestedMode]}).`);
+  process.exit(0);
+}
+
 const cmd = parseSupervisorCommand(name, args);
 switch (cmd.kind) {
   case 'goal-set': {
     goalStore.setGoal(cwd, sid, cmd.condition);
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up across sessions.
+    try {
+      const goalDir = path.join(cwd, '.agents', 'supervisor');
+      fs.mkdirSync(goalDir, { recursive: true });
+      fs.writeFileSync(path.join(goalDir, 'Goal.md'), cmd.condition, 'utf8');
+    } catch { /* best effort */ }
     console.log(`Goal set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\nThe supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts })}) runs out.`);
     break;
   }

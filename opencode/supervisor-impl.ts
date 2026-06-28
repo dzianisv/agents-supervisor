@@ -232,6 +232,21 @@ export const supervisorStore = {
 // buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
 
 // ---------------------------------------------------------------------------
+// extractGoalCondition — parse goal condition from Goal.md content
+//
+// Strips HTML comments, extracts text under ## Goal Condition header.
+// Falls back to full trimmed content if header not found.
+// ---------------------------------------------------------------------------
+function extractGoalCondition(content: string): string {
+  // Strip HTML comments
+  let text = content.replace(/<!--[\s\S]*?-->/g, "")
+  // Try ## Goal Condition section first
+  const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i)
+  const extracted = match ? match[1].trim() : text.trim()
+  return extracted
+}
+
+// ---------------------------------------------------------------------------
 // decideGoalTransition — pure decision for an active session goal
 //
 // Given the current goal, the judge's verdict, and the budget, decide the next
@@ -979,11 +994,22 @@ async function buildReflectionPromptFromFiles(
     }
   }
 
-  const [systemPromptFile, patternsFile, userFile] = await Promise.all([
+  const [systemPromptFile, patternsFile, userFile, goalFile] = await Promise.all([
     tryRead("SystemPrompt.md"),
     tryRead("Patterns.md"),
     tryRead("User.md"),
+    tryRead("Goal.md"),
   ])
+
+  function extractGoalCondition(content: string | null): string {
+    if (!content) return ""
+    // Strip HTML comments
+    let text = content.replace(/<!--[\s\S]*?-->/g, "")
+    // Try to find ## Goal Condition section
+    const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i)
+    const extracted = match ? match[1].trim() : text.trim()
+    return extracted
+  }
 
   // Build context variables for interpolation
   const safeContext = {
@@ -1003,6 +1029,10 @@ async function buildReflectionPromptFromFiles(
   const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const currentAttempt = attemptCount || 0
 
+  // If no session goal was passed, check Goal.md for a project-level goal
+  const projectGoalCondition = !goalSection ? extractGoalCondition(goalFile) : ""
+  const effectiveGoalSection = goalSection || (projectGoalCondition ? buildGoalRequirementSection(projectGoalCondition) : undefined)
+
   const templateVars: Record<string, string | undefined> = {
     taskSummary: safeContext.taskSummary,
     taskType: safeContext.taskType,
@@ -1015,7 +1045,7 @@ async function buildReflectionPromptFromFiles(
     attemptNumber: String(currentAttempt + 1),
     maxAttempts: String(effectiveCap),
     projectInstructions: agents ? agents.slice(0, 800) : undefined,
-    goalSection: goalSection || undefined,
+    goalSection: effectiveGoalSection || undefined,
   }
 
   // If the system prompt file exists, use the file-based approach
@@ -1034,8 +1064,8 @@ async function buildReflectionPromptFromFiles(
   // Fallback: build prompt using the same logic as buildSelfAssessmentPrompt
   // (for projects that don't have the 3-file structure yet)
   const rubric = parseRubric(DEFAULT_RUBRIC)
-  const effRubric: Rubric = goalSection
-    ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+  const effRubric: Rubric = effectiveGoalSection
+    ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${effectiveGoalSection}` }
     : rubric
   return buildSelfAssessmentPrompt(
     context,
@@ -1353,7 +1383,13 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
     }
     await supervisorStore.setGoal(directory, sid, condition, {})
-    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out).`
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up across sessions.
+    try {
+      const goalDir = join(directory, ".agents", "supervisor")
+      await mkdir(goalDir, { recursive: true })
+      await writeFile(join(goalDir, "Goal.md"), condition, "utf-8")
+    } catch { /* best effort */ }
+    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/Goal.md for reflection mode.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
   const executeSupervisorRetry = async (args: { n?: number }) => {
@@ -1685,8 +1721,21 @@ Continue now.`
         // When a goal is active, its condition is the strongest stated intent and
         // MUST compose with the existing gates.
         const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
-        const effRubric: Rubric = goalSection
-          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+
+        // Reflection mode: also read project-level goal from .agents/supervisor/Goal.md
+        let projectGoalSection = ""
+        if (mode === "reflection" && !goal) {
+          try {
+            const goalFilePath = join(directory, ".agents", "supervisor", "Goal.md")
+            const goalFileContent = await readFile(goalFilePath, "utf-8")
+            const cond = extractGoalCondition(goalFileContent)
+            if (cond) projectGoalSection = buildGoalRequirementSection(cond)
+          } catch {}
+        }
+        const effectiveGoalSection = goalSection || projectGoalSection
+
+        const effRubric: Rubric = effectiveGoalSection
+          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${effectiveGoalSection}` }
           : rubric
 
         // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
@@ -1697,16 +1746,20 @@ Continue now.`
           lastAssistantText,
           currentAttemptCount,
           effectiveMaxAttempts,
-          goalSection || undefined
+          effectiveGoalSection || undefined
         )
         let supervisorPrompt: string
         let effectiveToolSupervisorPrompt: string | null
-        let promptSource: "file" | "tool" | "default" | "goal"
+        let promptSource: "file" | "tool" | "default" | "goal" | "reflection+goal"
         if (goal) {
           // Goal active: use the default (goal-augmented) prompt directly.
           supervisorPrompt = defaultSupervisorPrompt
           effectiveToolSupervisorPrompt = null
           promptSource = "goal"
+        } else if (mode === "reflection" && projectGoalSection) {
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "reflection+goal"
         } else {
           const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
           supervisorPrompt = resolvedPrompt.prompt
