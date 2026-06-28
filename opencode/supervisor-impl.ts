@@ -370,6 +370,9 @@ const POLL_INTERVAL = 2_000
 const ABORT_COOLDOWN = 10_000
 const ABORT_RACE_DELAY = 1_500 // ms to wait for session.error to arrive before running supervisor
 const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "supervisor.yaml")
+// Last-resort fallback when no model is configured. Uses a free opencode model
+// to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
+const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
 const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "set_supervisor"])
 
 export function trackSessionScopedToolSession(
@@ -682,7 +685,7 @@ async function classifyTaskForRoutingWithLLM(
     }
   }
   if (attempts.length === 0) {
-    attempts = sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec) ? [sessionModelSpec] : [""]
+    attempts = sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec) ? [sessionModelSpec] : [JUDGE_FREE_FALLBACK]
   }
 
   const prompt = `CLASSIFY TASK ROUTING\n\nYou are classifying a task into one routing category.\n\nTask summary:\n${context.taskSummary}\n\nTask type: ${context.taskType}\n\nRecent user messages:\n${context.humanMessages.slice(0, 4).join("\n\n")}\n\nChoose exactly one category from: backend, architecture, frontend, default.\nReturn JSON only:\n{\n  "category": "backend|architecture|frontend|default"\n}`
@@ -1063,7 +1066,7 @@ async function analyzeSelfAssessmentWithLLM(
       ? [preferredModel]
       : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
         ? [sessionModelSpec]
-        : [""]
+        : [JUDGE_FREE_FALLBACK]
 
   const prompt = buildJudgePrompt(context, selfAssessment, toolSupervisorPrompt, rubric)
 
@@ -1731,7 +1734,7 @@ Continue now.`
             ? [preferredModel]
             : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
               ? [sessionModelSpec]
-              : [""]
+              : [JUDGE_FREE_FALLBACK]
 
       let selfAssessment: string | null = null
       let assessmentModelSpec: string | null = null
