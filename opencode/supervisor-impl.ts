@@ -2002,15 +2002,6 @@ Continue now.`
           // Log for diagnostics but do NOT apply to active session
           debug("Routing would suggest", routingCategory, "model:", JSON.stringify(routingModel), "(NOT applied to active session)")
         }
-        // Echo the session's own model so the continuation uses the same model
-        // the user was working with, not the global default (which may be OpenAI).
-        // This is NOT task-routing — it preserves the user's existing choice.
-        if (sessionModelSpec) {
-          const _parts = sessionModelSpec.split("/")
-          const _providerID = _parts[0] || ""
-          const _modelID = _parts.slice(1).join("/") || ""
-          if (_providerID && _modelID) feedbackBody.model = { providerID: _providerID, modelID: _modelID }
-        }
 
         try {
           await client.session.promptAsync({
