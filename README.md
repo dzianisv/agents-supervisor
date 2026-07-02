@@ -112,7 +112,10 @@ In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 **Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
 `~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
 sections to override the judge's rubric; otherwise the shipped default is used.
-(Claude Code reads its rubric from `core/patterns.json` ⊕ your user-local patterns.)
+(Claude Code's built-in rubric — `core/assessment.mjs` — pulls its background-subagent
+exemption straight from the shipped `core/patterns.json` at load time, so the Stop hook
+doesn't flag in-flight subagent dispatches as premature; full user-local pattern
+overlays via `.supervisor/patterns.json` are OpenCode-only for now.)
 
 ## Autopilot mode (OpenCode)
 
