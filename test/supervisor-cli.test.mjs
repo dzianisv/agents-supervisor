@@ -160,6 +160,45 @@ test('goal "all tests pass" → status shows goal; goal clear removes it', () =>
   assert.match(afterClear.stdout, /no goal/i);
 });
 
+// ── 5b. SUPERVISOR_GOAL_LABEL → "Goal" vs "Objective" wording ────────────────
+
+test('goal set/status/clear default to "Goal" label when SUPERVISOR_GOAL_LABEL is unset', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-goal-label-default';
+  writeSession(tmp, sid);
+
+  const setOut = runSupervisor(tmp, ['goal', 'ship it']);
+  assert.match(setOut.stdout, /^Goal set for session/);
+
+  const statusOut = runSupervisor(tmp, ['goal']);
+  assert.match(statusOut.stdout, /^Goal \(/);
+
+  const clearOut = runSupervisor(tmp, ['goal', 'clear']);
+  assert.match(clearOut.stdout, /^Goal cleared for session/);
+
+  const afterClear = runSupervisor(tmp, ['goal']);
+  assert.match(afterClear.stdout, /^No goal set/);
+});
+
+test('goal set/status/clear say "Objective" when SUPERVISOR_GOAL_LABEL=Objective', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-goal-label-objective';
+  writeSession(tmp, sid);
+  const env = { SUPERVISOR_GOAL_LABEL: 'Objective' };
+
+  const setOut = runSupervisor(tmp, ['goal', 'ship it'], { env });
+  assert.match(setOut.stdout, /^Objective set for session/);
+
+  const statusOut = runSupervisor(tmp, ['goal'], { env });
+  assert.match(statusOut.stdout, /^Objective \(/);
+
+  const clearOut = runSupervisor(tmp, ['goal', 'clear'], { env });
+  assert.match(clearOut.stdout, /^Objective cleared for session/);
+
+  const afterClear = runSupervisor(tmp, ['goal'], { env });
+  assert.match(afterClear.stdout, /^No objective set/);
+});
+
 // ── 6. retry 7 → budget stored ───────────────────────────────────────────────
 
 test('retry 7 → sets budget; state.maxAttempts === 7', () => {
