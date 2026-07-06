@@ -13,7 +13,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { goalStore, parseSupervisorCommand, resolveMaxAttempts } from '../core/goal.mjs';
+import { goalStore, parseSupervisorCommand, resolveMaxAttempts, writeProjectGoal } from '../core/goal.mjs';
 
 const cwd = process.cwd();
 const name = process.argv[2];
@@ -55,12 +55,9 @@ const cmd = parseSupervisorCommand(name, args);
 switch (cmd.kind) {
   case 'goal-set': {
     goalStore.setGoal(cwd, sid, cmd.condition);
-    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up across sessions.
-    try {
-      const goalDir = path.join(cwd, '.agents', 'supervisor');
-      fs.mkdirSync(goalDir, { recursive: true });
-      fs.writeFileSync(path.join(goalDir, 'Goal.md'), cmd.condition, 'utf8');
-    } catch { /* best effort */ }
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
+    // across sessions. Safe under concurrent writers — see writeProjectGoal.
+    writeProjectGoal(cwd, cmd.condition);
     console.log(`Goal set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\nThe supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts })}) runs out.`);
     break;
   }
