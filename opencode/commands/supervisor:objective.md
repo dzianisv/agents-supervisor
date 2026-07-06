@@ -1,5 +1,5 @@
 ---
-description: Set / check / clear a session objective the supervisor pushes the agent to meet before stopping. Distinct from Claude Code's built-in "/goal".
+description: Set / check / clear a session objective the supervisor pushes the agent to meet before stopping.
 ---
 Manage the supervisor session objective. Setting an objective switches the session to
 `goal` mode; clearing it returns the session to `reflection` mode.

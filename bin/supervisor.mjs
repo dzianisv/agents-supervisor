@@ -65,6 +65,14 @@ const sid = currentSession();
 const NO_SESSION_MSG =
   'No active session yet (.supervisor/current_session missing). Run something first so the Stop hook records the session, then retry.';
 
+// User-facing label for goal-related CLI output. The deprecated `/supervisor:goal`
+// alias invokes this script with no env var set, so it keeps printing "Goal" —
+// its exact, unchanged historical output. The `/supervisor:objective` skill sets
+// SUPERVISOR_GOAL_LABEL=Objective so the confirmation/status text printed back
+// matches the command name the user actually typed; otherwise the rename's own
+// disambiguation goal leaks the old name right back into the first line read.
+const GOAL_LABEL = process.env.SUPERVISOR_GOAL_LABEL === 'Objective' ? 'Objective' : 'Goal';
+
 /**
  * Disabled-list helpers (supervisor on/off).
  * File: <cwd>/.supervisor/disabled — newline-delimited session IDs.
@@ -103,7 +111,7 @@ switch (cmd.kind) {
     goalStore.setGoal(cwd, sid, cmd.condition);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(
-      `Goal set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
+      `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
       `The supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${budget}) runs out.`
     );
     break;
@@ -111,15 +119,15 @@ switch (cmd.kind) {
   case 'goal-clear': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     goalStore.clearGoal(cwd, sid);
-    console.log(`Goal cleared for session ${sid.slice(0, 8)}….`);
+    console.log(`${GOAL_LABEL} cleared for session ${sid.slice(0, 8)}….`);
     break;
   }
   case 'goal-status': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     const st = goalStore.load(cwd, sid);
-    if (!st.goal) console.log('No goal set for this session.');
+    if (!st.goal) console.log(`No ${GOAL_LABEL.toLowerCase()} set for this session.`);
     else console.log(
-      `Goal (${st.goal.status}): ${st.goal.condition}\n` +
+      `${GOAL_LABEL} (${st.goal.status}): ${st.goal.condition}\n` +
       `attempts: ${st.goal.attempts}` +
       (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '')
     );

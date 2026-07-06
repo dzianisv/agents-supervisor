@@ -16,7 +16,7 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Installation is via Claude plugin metadata under `.claude-plugin/`.
 - Runtime enforcement uses the `Stop` hook in `hooks/hooks.json`, which runs `bin/supervisor-on-stop.mjs`.
 - User-facing skills live under `skills/`.
-- Current skill directories include all 9 colon subcommands: `status`, `on`, `off`, `goal` (deprecated alias), `objective`, `retry`, `train`, `autopilot`, and `reflection`.
+- Current skill directories: the 8 canonical colon subcommands — `status`, `on`, `off`, `objective`, `retry`, `train`, `autopilot`, `reflection` — plus `goal`, kept as a deprecated alias directory for back-compat (9 directories total, 8 canonical commands).
 - Canonical CLI is `bin/supervisor.mjs` (with `bin/supervisor-goal.mjs` as a back-compat shim).
 - `bin/supervisor-on-stop.mjs` includes an autopilot fast-path for lightweight continuation.
 - README documents the full unified command set: `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:objective` (with `/supervisor:goal` retained as a deprecated alias), `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, and `/supervisor:reflection`.
@@ -26,7 +26,7 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Package name is `opencode-supervisor` in `opencode/package.json`.
 - Plugin entrypoint is `opencode/supervisor.ts`.
 - Slash command files are under `opencode/commands/`.
-- Current command files include `supervisor.md` (bare dispatcher) plus all 9 colon subcommands: `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:goal.md` (deprecated alias), `supervisor:objective.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, and `supervisor:reflection.md`.
+- Current command files include `supervisor.md` (bare dispatcher) plus the 8 canonical colon subcommands — `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:objective.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, `supervisor:reflection.md` — plus `supervisor:goal.md`, kept as a deprecated alias for back-compat (9 command files total, 8 canonical commands).
 - README documents the full unified colon-command set and notes OpenCode additionally has the bare `/supervisor <subcommand>` dispatcher.
 - README documents OpenCode tools: `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, and `autopilot_exit`.
 
