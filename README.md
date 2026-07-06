@@ -12,8 +12,8 @@ Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Colon commands | Additional |
 |---|---|---|---|
-| **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
+| **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:objective`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:objective`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -36,7 +36,7 @@ claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
 Then, inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
-- `/supervisor:goal <condition>` — set a mandatory completion condition; agent continues until goal is met or budget exhausts
+- `/supervisor:objective <condition>` — set a mandatory completion condition; agent continues until the objective is met or budget exhausts (`/supervisor:goal` still works as a deprecated alias)
 - `/supervisor:retry N` — set the retry budget (1–100, default 16)
 - `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `AUTOPILOT_EXIT` or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
@@ -70,7 +70,7 @@ Add to `opencode.json`:
 or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then, use the same colon-command set as Claude Code:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions
-- `/supervisor:goal <condition>` — set a mandatory completion condition
+- `/supervisor:objective <condition>` — set a mandatory completion condition
 - `/supervisor:retry N` — set the retry budget (1–100)
 - `/supervisor:autopilot` — skip the judge, auto-continue until exit or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
@@ -80,7 +80,7 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then, use th
 OpenCode also supports a bare `/supervisor <subcommand>` dispatcher as an alternative:
 - `/supervisor status`
 - `/supervisor autopilot`
-- `/supervisor goal <condition>`
+- `/supervisor objective <condition>`
 - `/supervisor reflection`
 - `/supervisor on`
 - `/supervisor off`
@@ -100,26 +100,28 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 | Mode | Command | Behavior |
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
-| `goal` | `/supervisor:goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
+| `goal` | `/supervisor:objective <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
 | `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
 
 The effective default mode is `reflection`.
 
-## Goal mode (both runtimes)
+## Objective mode (both runtimes)
 
-Beyond catching premature stops, you can point the supervisor at a **goal** it must
+Beyond catching premature stops, you can point the supervisor at an **objective** it must
 demonstrably meet before it lets the agent stop — it keeps re-prompting (up to a
-retry budget) until the goal's met or the budget runs out.
+retry budget) until the objective's met or the budget runs out. (`/supervisor:goal`
+still works as a deprecated alias for `/supervisor:objective` — same behavior, no
+migration required.)
 
 ```
-/supervisor goal all tests in test/auth pass and the PR is open with green CI
-/supervisor goal clear
+/supervisor objective all tests in test/auth pass and the PR is open with green CI
+/supervisor objective clear
 /supervisor retry 24           # set this session's retry budget (1–100, default 16)
 ```
 
-The goal is injected into the judge as a **mandatory completion requirement** — the
-agent is not allowed to stop until the goal is met (or the budget exhausts). While a
-goal is active the retry budget rises to 16 (vs 3 normally). State is per-session at
+The objective is injected into the judge as a **mandatory completion requirement** — the
+agent is not allowed to stop until the objective is met (or the budget exhausts). While an
+objective is active the retry budget rises to 16 (vs 3 normally). State is per-session at
 `.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
 continuation actually fires.
 
@@ -160,13 +162,13 @@ For web app / OpenCode API, call tools directly:
 - Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
 - Safety rails still apply: attempt budget, loop detection
 
-**How it differs from the goal loop:**
+**How it differs from the objective loop:**
 
-| | Goal loop | Autopilot |
+| | Objective loop | Autopilot |
 |---|---|---|
 | Judge evaluation | Yes (self-assessment + optional cross-model) | No (skipped entirely) |
 | Continuation trigger | Judge says "not done" | Every idle (unconditional) |
-| Stop condition | Goal met or budget exhausted | Agent calls `autopilot_exit` or budget exhausted |
+| Stop condition | Objective met or budget exhausted | Agent calls `autopilot_exit` or budget exhausted |
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:

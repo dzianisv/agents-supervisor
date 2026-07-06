@@ -23,15 +23,17 @@ Only categories representing actionable unfinished work should produce continuat
 
 Arrays and scalars replace wholesale during merge. Objects merge recursively. `/supervisor:train` writes learned patterns outside shipped defaults.
 
-## Goal Loop
+## Objective Loop
 
-- A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop.
-- Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
-- Goal state is stored under `.supervisor/goals/<sessionId>.json`.
-- The default goal retry budget is 16 attempts, clamped to 1-100.
-- Goal state can become active, achieved, or exhausted.
-- A goal exhausts when the attempt budget or deadline is reached.
-- `buildGoalRequirementSection` injects the goal as a mandatory evidence-backed completion requirement.
+> User-facing name is "objective" (`/supervisor:objective`, with `/supervisor:goal` kept as a deprecated alias). Internal identifiers intentionally keep the old `goal` name — `core/goal.mjs`, the `goalStore` object, and the `goal` mode value are not renamed.
+
+- An objective is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop.
+- Objective commands (`/supervisor:objective`, with `/supervisor:goal` as a deprecated alias) parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
+- Objective state is stored under `.supervisor/goals/<sessionId>.json`.
+- The default objective retry budget is 16 attempts, clamped to 1-100.
+- Objective state can become active, achieved, or exhausted.
+- An objective exhausts when the attempt budget or deadline is reached.
+- `buildGoalRequirementSection` injects the objective as a mandatory evidence-backed completion requirement.
 
 ## Autopilot
 
