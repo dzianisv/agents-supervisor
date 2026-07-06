@@ -18,7 +18,7 @@ import {
   resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
   decideGoalTransition, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
-  extractGoalCondition, writeProjectGoal,
+  extractGoalCondition, writeProjectGoal, GOAL_CONDITION_MAX_LEN,
 } from "../core/goal.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
@@ -1357,7 +1357,12 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.clearGoal(directory, sid)
       return `Goal cleared for session ${sid.slice(0, 8)}….`
     }
-    const condition = (args.condition || "").trim()
+    // Truncate to the same GOAL_CONDITION_MAX_LEN the CC CLI path already
+    // enforces (parseSupervisorCommand). Must happen once, here, before the
+    // condition fans out to session state, Goal.md/history, and the reply
+    // string below — otherwise a >4000-char condition would silently diverge
+    // between what setGoal remembers and what writeProjectGoal persists.
+    const condition = (args.condition || "").trim().slice(0, GOAL_CONDITION_MAX_LEN)
     if (!condition) {
       const st = await supervisorStore.load(directory, sid)
       if (!st.goal) return "No goal set for this session."

@@ -302,13 +302,20 @@ describe("integration: supervisor goal loop", () => {
   // would silently destroy one another. Both runtime surfaces (this OpenCode
   // tool AND bin/supervisor-goal.mjs for Claude Code) now delegate the write
   // to the shared, atomic-rename + append-only-history writeProjectGoal() in
-  // core/goal.mjs. This test drives the REAL (non-fs-mocked) executeSupervisorGoal
-  // path — only the opencode client (LLM/session plumbing) is mocked — to prove
-  // the OpenCode surface specifically is wired to the safe path, not just the
-  // CC CLI (which has its own real-OS-process concurrency test in
-  // goal-core.test.mjs).
+  // core/goal.mjs.
+  //
+  // NOTE on what this test does and does NOT prove: writeProjectGoal is fully
+  // synchronous and JS is single-threaded, so a Promise.all over two
+  // in-process calls can never actually interleave inside writeProjectGoal
+  // itself — this is a wiring/plumbing check ("the OpenCode tool really does
+  // call the shared safe writer for both calls"), not an independent proof
+  // that concurrent writes are safe. That proof — real racing OS processes,
+  // the scenario that actually reproduced issue #40 (30 concurrent calls, 29
+  // lost) — lives in goal-core.test.mjs's spawn-based test. Keep both: this
+  // one guards against the OpenCode surface regressing back to an inline
+  // writeFileSync; that one guards the safety mechanism itself.
   // -------------------------------------------------------------------------
-  test("concurrent executeSupervisorGoal calls: both conditions survive in history, current pointer is one of them", async () => {
+  test("executeSupervisorGoal wiring: concurrent calls both delegate to the shared safe writer (not a cross-process concurrency proof — see goal-core.test.mjs for that)", async () => {
     const { client } = createMockClient(makeMessages())
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin["tool.execute.before"]({ tool: "supervisor_goal", sessionID: SESSION_ID })
@@ -329,5 +336,41 @@ describe("integration: supervisor goal loop", () => {
     for (const c of conditions) {
       assert.ok(recovered.has(c), `Condition "${c}" must be recoverable from goal-history.jsonl — lost it would reproduce issue #40`)
     }
+  })
+
+  // -------------------------------------------------------------------------
+  // Behavior-divergence regression (found in code review of the fix above):
+  // executeSupervisorGoal's condition had no length cap, while the CC CLI
+  // path (parseSupervisorCommand) already truncates to GOAL_CONDITION_MAX_LEN
+  // (4000). writeProjectGoal ALSO truncates internally (defense in depth) —
+  // for a >4000-char condition on the OpenCode surface, that meant session
+  // state (supervisorStore, via setGoal) and the tool's reply string kept the
+  // FULL condition while Goal.md/goal-history.jsonl silently got the
+  // truncated one: three "sources of truth" disagreeing. Fixed by truncating
+  // once in executeSupervisorGoal, before the condition fans out to setGoal,
+  // writeProjectGoal, and the reply. This test proves all three now agree.
+  // -------------------------------------------------------------------------
+  test("long condition: session state, Goal.md, history, and reply all agree on the same truncated value", async () => {
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin["tool.execute.before"]({ tool: "supervisor_goal", sessionID: SESSION_ID })
+    const goalTool = plugin.tool.supervisor_goal
+
+    const longCondition = "x".repeat(5000)
+    const expected = longCondition.slice(0, 4000)
+    const result = await goalTool.execute({ condition: longCondition })
+    assert.ok(result.includes(expected), "Reply must echo the truncated condition")
+    assert.ok(!result.includes(longCondition), "Reply must NOT echo the untruncated condition")
+
+    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
+    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    assert.equal(state.goal.condition, expected, "Session state must store the truncated condition, matching Goal.md/history")
+
+    const goalMdPath = join(tmpDir, ".agents", "supervisor", "Goal.md")
+    const goalMd = readFileSync(goalMdPath, "utf8")
+    assert.equal(goalMd, expected, "Goal.md must hold the truncated condition")
+
+    const history = readProjectGoalHistory(tmpDir)
+    assert.equal(history.at(-1).condition, expected, "goal-history.jsonl's latest entry must hold the truncated condition")
   })
 })

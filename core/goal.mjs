@@ -18,6 +18,14 @@ export const DEFAULT_MAX_ATTEMPTS = 16;
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000;
 export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'goal', 'reflection']);
 export const DEFAULT_SUPERVISOR_MODE = 'reflection';
+// Shared cap on a goal condition's length. Single source of truth for BOTH
+// runtime surfaces: parseSupervisorCommand (CC CLI) and executeSupervisorGoal
+// (OpenCode tool) must truncate to the exact same value before the condition
+// is stored anywhere (session state, Goal.md, goal-history.jsonl, and the
+// reply string), or the two would silently disagree on what was saved for
+// conditions longer than this. Also keeps each goal-history.jsonl entry
+// small enough that a single fs.appendFileSync write lands atomically.
+export const GOAL_CONDITION_MAX_LEN = 4000;
 
 const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'cancel']);
 const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
@@ -59,7 +67,7 @@ export function parseSupervisorCommand(name, args) {
   if (name === 'goal') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
-    return { kind: 'goal-set', condition: trimmed.slice(0, 4000) };
+    return { kind: 'goal-set', condition: trimmed.slice(0, GOAL_CONDITION_MAX_LEN) };
   }
   if (name === 'retry') {
     if (trimmed === '') return { kind: 'retry-status' };
@@ -194,8 +202,6 @@ export const goalStore = {
 // destroy each other's condition with no trace. writeProjectGoal() below
 // fixes that without changing the file's shape or the feature's behavior.
 
-const GOAL_CONDITION_MAX_LEN = 4000; // matches parseSupervisorCommand's truncation
-
 function projectGoalDir(cwd) {
   return path.join(cwd, '.agents', 'supervisor');
 }
@@ -222,17 +228,26 @@ export function extractGoalCondition(content) {
  *  1. Append a durable {ts, pid, condition} record to goal-history.jsonl
  *     BEFORE touching the current-pointer file. fs.appendFileSync opens the
  *     file O_APPEND; a single write() of a payload this size (one condition
- *     string, capped at 4000 chars, plus a small envelope) lands as one
- *     whole line even under concurrent writers on a local filesystem — it
- *     never interleaves or is torn. This is the durability net: every
- *     goal-set call's condition is permanently recoverable here regardless
- *     of what happens to the "current" pointer.
+ *     string, plus a small envelope) lands as one whole line even under
+ *     concurrent writers on a local filesystem — it never interleaves or is
+ *     torn. This is the durability net: every goal-set call's condition is
+ *     permanently recoverable here regardless of what happens to the
+ *     "current" pointer.
  *  2. Atomically update the current pointer (Goal.md) via temp-file +
  *     rename — mirrors the existing convention in bin/on-stop.mjs's
  *     writeAttemptCounter. Whichever writer's rename lands last wins the
  *     "current" slot; that's fine now that history means no writer's value
  *     is ever unrecoverable (previously: last-writer-wins AND the loser's
  *     value vanished with no trace anywhere on disk — that was the bug).
+ *
+ * The GOAL_CONDITION_MAX_LEN truncation below is a defensive backstop, not
+ * the primary enforcement point: both callers (bin/supervisor-goal.mjs via
+ * parseSupervisorCommand, and opencode/supervisor-impl.ts's
+ * executeSupervisorGoal) already truncate to this same exported constant
+ * before calling here, specifically so the condition stored in session
+ * state, Goal.md, goal-history.jsonl, and any reply string always agree.
+ * Re-truncating here just means this function is safe even if a future
+ * caller forgets to.
  *
  * Best-effort: never throws. A failure here must not block goal-set.
  */
