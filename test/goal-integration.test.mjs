@@ -13,6 +13,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "nod
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
+import { readProjectGoalHistory } from "../core/goal.mjs"
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -292,5 +293,41 @@ describe("integration: supervisor goal loop", () => {
     // No continuation should have been injected to the active session
     const activePrompts = getActiveSessionPrompts()
     assert.equal(activePrompts.length, 0, `No prompt should be sent to active session after exhaustion, got ${activePrompts.length}`)
+  })
+
+  // -------------------------------------------------------------------------
+  // Concurrency regression (issue #40): executeSupervisorGoal used to persist
+  // .agents/supervisor/Goal.md via a bare writeFileSync overwrite with no
+  // history — two racing goal-set calls against the same project directory
+  // would silently destroy one another. Both runtime surfaces (this OpenCode
+  // tool AND bin/supervisor-goal.mjs for Claude Code) now delegate the write
+  // to the shared, atomic-rename + append-only-history writeProjectGoal() in
+  // core/goal.mjs. This test drives the REAL (non-fs-mocked) executeSupervisorGoal
+  // path — only the opencode client (LLM/session plumbing) is mocked — to prove
+  // the OpenCode surface specifically is wired to the safe path, not just the
+  // CC CLI (which has its own real-OS-process concurrency test in
+  // goal-core.test.mjs).
+  // -------------------------------------------------------------------------
+  test("concurrent executeSupervisorGoal calls: both conditions survive in history, current pointer is one of them", async () => {
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin["tool.execute.before"]({ tool: "supervisor_goal", sessionID: SESSION_ID })
+    const goalTool = plugin.tool.supervisor_goal
+
+    const conditions = ["race-condition-A", "race-condition-B"]
+    const results = await Promise.all(conditions.map((c) => goalTool.execute({ condition: c })))
+    for (const [i, r] of results.entries()) {
+      assert.ok(r.includes(conditions[i]), `Result ${i} should echo its own condition, got: ${r}`)
+    }
+
+    const goalMdPath = join(tmpDir, ".agents", "supervisor", "Goal.md")
+    const goalMd = readFileSync(goalMdPath, "utf8")
+    assert.ok(conditions.includes(goalMd), `Goal.md current pointer must be one of the raced conditions, got: ${JSON.stringify(goalMd)}`)
+
+    const history = readProjectGoalHistory(tmpDir)
+    const recovered = new Set(history.map((h) => h.condition))
+    for (const c of conditions) {
+      assert.ok(recovered.has(c), `Condition "${c}" must be recoverable from goal-history.jsonl — lost it would reproduce issue #40`)
+    }
   })
 })

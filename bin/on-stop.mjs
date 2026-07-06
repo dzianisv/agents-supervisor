@@ -29,15 +29,7 @@ import {
 } from '../core/evaluation.mjs';
 import { buildSelfAssessmentPrompt, parseSelfAssessmentJson, parseRubric, DEFAULT_RUBRIC } from '../core/assessment.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection } from '../core/goal.mjs';
-
-function extractGoalCondition(content) {
-  // Strip HTML comments
-  let text = content.replace(/<!--[\s\S]*?-->/g, '');
-  // Try ## Goal Condition section
-  const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i);
-  return (match ? match[1] : text).trim();
-}
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, extractGoalCondition } from '../core/goal.mjs';
 
 const STATE_DIR = '.supervisor';
 const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);

@@ -18,6 +18,7 @@ import {
   resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
   decideGoalTransition, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
+  extractGoalCondition, writeProjectGoal,
 } from "../core/goal.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
@@ -231,20 +232,8 @@ export const supervisorStore = {
 
 // buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
 
-// ---------------------------------------------------------------------------
-// extractGoalCondition — parse goal condition from Goal.md content
-//
-// Strips HTML comments, extracts text under ## Goal Condition header.
-// Falls back to full trimmed content if header not found.
-// ---------------------------------------------------------------------------
-function extractGoalCondition(content: string): string {
-  // Strip HTML comments
-  let text = content.replace(/<!--[\s\S]*?-->/g, "")
-  // Try ## Goal Condition section first
-  const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i)
-  const extracted = match ? match[1].trim() : text.trim()
-  return extracted
-}
+// extractGoalCondition now imported from ../core/goal.mjs (shared — was
+// duplicated here and in buildReflectionPromptFromFiles below + bin/on-stop.mjs).
 
 // ---------------------------------------------------------------------------
 // decideGoalTransition — pure decision for an active session goal
@@ -1001,15 +990,7 @@ async function buildReflectionPromptFromFiles(
     tryRead("Goal.md"),
   ])
 
-  function extractGoalCondition(content: string | null): string {
-    if (!content) return ""
-    // Strip HTML comments
-    let text = content.replace(/<!--[\s\S]*?-->/g, "")
-    // Try to find ## Goal Condition section
-    const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i)
-    const extracted = match ? match[1].trim() : text.trim()
-    return extracted
-  }
+  // extractGoalCondition now imported from ../core/goal.mjs (shared).
 
   // Build context variables for interpolation
   const safeContext = {
@@ -1383,12 +1364,9 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
     }
     await supervisorStore.setGoal(directory, sid, condition, {})
-    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up across sessions.
-    try {
-      const goalDir = join(directory, ".agents", "supervisor")
-      await mkdir(goalDir, { recursive: true })
-      await writeFile(join(goalDir, "Goal.md"), condition, "utf-8")
-    } catch { /* best effort */ }
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
+    // across sessions. Safe under concurrent writers — see writeProjectGoal.
+    writeProjectGoal(directory, condition)
     return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/Goal.md for reflection mode.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."

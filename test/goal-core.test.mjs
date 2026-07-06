@@ -3,13 +3,18 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   goalStore, resolveMaxAttempts, decideGoalTransition,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
   DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode,
+  extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
 } from '../core/goal.mjs';
 
 const mkcwd = () => fs.mkdtempSync(path.join(tmpdir(), 'sup-goal-'));
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SUPERVISOR_GOAL_BIN = path.join(HERE, '..', 'bin', 'supervisor-goal.mjs');
 
 test('goalStore: setGoal/load/clear round-trip, 0600 perms', () => {
   const d = mkcwd();
@@ -84,4 +89,130 @@ test('goalStore persists supervisor mode and resolves legacy state', () => {
   goalStore.setAutopilot(d, 's3', false);
   assert.equal(goalStore.load(d, 's3').mode, 'reflection');
   assert.equal(goalStore.load(d, 's3').autopilot, false);
+});
+
+// ---------------------------------------------------------------------------
+// extractGoalCondition — consolidated from 3 duplicate implementations
+// (opencode/supervisor-impl.ts x2, bin/on-stop.mjs). Behavior must be
+// unchanged for all 3 former call sites.
+// ---------------------------------------------------------------------------
+
+test('extractGoalCondition: strips HTML comments', () => {
+  const content = '<!-- generated file, do not edit -->\nship the feature';
+  assert.equal(extractGoalCondition(content), 'ship the feature');
+});
+
+test('extractGoalCondition: prefers ## Goal Condition section when present', () => {
+  const content = '# Project Goal\n\nsome preamble\n\n## Goal Condition\nall tests pass and PR is merged\n\n## Notes\nirrelevant';
+  assert.equal(extractGoalCondition(content), 'all tests pass and PR is merged');
+});
+
+test('extractGoalCondition: falls back to whole trimmed text when no section header', () => {
+  assert.equal(extractGoalCondition('  ship it already  \n'), 'ship it already');
+});
+
+test('extractGoalCondition: null/empty content returns "" (matches the tryRead(...) call site)', () => {
+  assert.equal(extractGoalCondition(null), '');
+  assert.equal(extractGoalCondition(''), '');
+  assert.equal(extractGoalCondition(undefined), '');
+});
+
+// ---------------------------------------------------------------------------
+// writeProjectGoal / readProjectGoalHistory — the concurrency fix.
+// Bug: .agents/supervisor/Goal.md was a bare writeFile overwrite, no lock, no
+// history — concurrent goal-set calls silently destroyed each other (proven:
+// 30 concurrent calls in, 1 survivor, 29 gone with zero trace). These tests
+// must fail against the old bare-writeFile behavior and pass against the fix.
+// ---------------------------------------------------------------------------
+
+test('writeProjectGoal: single write — Goal.md + history both contain the condition', () => {
+  const d = mkcwd();
+  writeProjectGoal(d, 'ship the feature');
+  const goalMd = fs.readFileSync(path.join(d, '.agents', 'supervisor', 'Goal.md'), 'utf8');
+  assert.equal(goalMd, 'ship the feature');
+  const history = readProjectGoalHistory(d);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].condition, 'ship the feature');
+  assert.ok(history[0].ts && history[0].pid, 'history entry must carry ts + pid');
+});
+
+test('writeProjectGoal: sequential double-write — current pointer is the last write, history has both', () => {
+  const d = mkcwd();
+  writeProjectGoal(d, 'condition A');
+  writeProjectGoal(d, 'condition B');
+  const goalMd = fs.readFileSync(path.join(d, '.agents', 'supervisor', 'Goal.md'), 'utf8');
+  assert.equal(goalMd, 'condition B', 'current pointer matches today\'s semantics: last write wins');
+  const history = readProjectGoalHistory(d);
+  assert.deepEqual(history.map((h) => h.condition), ['condition A', 'condition B']);
+});
+
+test('writeProjectGoal: history survives even when the current-pointer file is deleted', () => {
+  const d = mkcwd();
+  writeProjectGoal(d, 'condition A');
+  fs.rmSync(path.join(d, '.agents', 'supervisor', 'Goal.md'));
+  writeProjectGoal(d, 'condition B');
+  const history = readProjectGoalHistory(d);
+  assert.deepEqual(history.map((h) => h.condition), ['condition A', 'condition B']);
+});
+
+test('readProjectGoalHistory: missing file returns [] (best effort, never throws)', () => {
+  const d = mkcwd();
+  assert.deepEqual(readProjectGoalHistory(d), []);
+});
+
+test('readProjectGoalHistory: skips a corrupt line instead of failing the whole read', () => {
+  const d = mkcwd();
+  writeProjectGoal(d, 'condition A');
+  fs.appendFileSync(path.join(d, '.agents', 'supervisor', 'goal-history.jsonl'), 'not-json\n');
+  writeProjectGoal(d, 'condition B');
+  const history = readProjectGoalHistory(d);
+  assert.deepEqual(history.map((h) => h.condition), ['condition A', 'condition B']);
+});
+
+// ---------------------------------------------------------------------------
+// Real concurrent OS processes — ports the exact shell repro from
+// .tasks/40/bug.md into the test runner. Sync fs calls within ONE process
+// can never race each other (the JS event loop serializes them by
+// construction) — the actual bug only reproduces across independent
+// processes racing the same file, so this spawns real `node
+// bin/supervisor-goal.mjs` child processes, not in-process calls.
+// ---------------------------------------------------------------------------
+
+function runGoalSet(cwd, condition) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [SUPERVISOR_GOAL_BIN, 'goal', condition], { cwd });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`supervisor-goal.mjs exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+test('concurrent real processes: 0 conditions lost across N racing goal-set calls', { timeout: 60_000 }, async () => {
+  const d = mkcwd();
+  fs.mkdirSync(path.join(d, '.supervisor'), { recursive: true });
+  fs.writeFileSync(path.join(d, '.supervisor', 'current_session'), 'concurrency-test-session', 'utf8');
+
+  const PER_SIDE = 10; // matches the order of magnitude of the manual repro (15+15)
+  const conditions = [];
+  for (let i = 0; i < PER_SIDE; i++) {
+    conditions.push(`condition-A-run${i}`, `condition-B-run${i}`);
+  }
+
+  await Promise.all(conditions.map((c) => runGoalSet(d, c)));
+
+  const history = readProjectGoalHistory(d);
+  const recovered = new Set(history.map((h) => h.condition));
+  const missing = conditions.filter((c) => !recovered.has(c));
+  assert.deepEqual(missing, [], `Lost ${missing.length}/${conditions.length} conditions to the race — history: ${JSON.stringify([...recovered])}`);
+  assert.equal(recovered.size, conditions.length, 'every condition must be independently recoverable, no duplicates collapsing the count');
+
+  // The current pointer must be exactly one of the raced conditions — never
+  // corrupted/blank/partial (atomic rename guarantees this even though which
+  // one wins is non-deterministic).
+  const goalMd = fs.readFileSync(path.join(d, '.agents', 'supervisor', 'Goal.md'), 'utf8');
+  assert.ok(conditions.includes(goalMd), `Goal.md current pointer must be one of the raced conditions, got: ${JSON.stringify(goalMd)}`);
 });
