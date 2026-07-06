@@ -1,13 +1,13 @@
 ---
 name: goal
-description: Set, check, or clear a session goal the supervisor pushes the agent to meet before it stops. Use for "/supervisor:goal", "set a supervisor goal", "keep going until X", "don't stop until <condition>".
+description: Deprecated alias for /supervisor:objective, kept for backward compatibility. Set, check, or clear a session goal the supervisor pushes the agent to meet before it stops. Prefer "/supervisor:objective" going forward.
 ---
 
-# /supervisor:goal — push toward a goal
+# /supervisor:goal — deprecated alias for /supervisor:objective
 
-Set a goal condition the supervisor enforces: while it's active, the Stop hook
-keeps re-prompting the agent (up to the retry budget) until the goal is
-demonstrably met or the budget runs out.
+This command is a deprecated alias. Prefer `/supervisor:objective`, which
+does the same thing under a name that doesn't collide with Claude Code's
+own built-in `/goal` command.
 
 ## Steps
 
