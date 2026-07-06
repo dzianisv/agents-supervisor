@@ -114,9 +114,9 @@ still works as a deprecated alias for `/supervisor:objective` — same behavior,
 migration required.)
 
 ```
-/supervisor objective all tests in test/auth pass and the PR is open with green CI
-/supervisor objective clear
-/supervisor retry 24           # set this session's retry budget (1–100, default 16)
+/supervisor:objective all tests in test/auth pass and the PR is open with green CI
+/supervisor:objective clear
+/supervisor:retry 24           # set this session's retry budget (1–100, default 16)
 ```
 
 The objective is injected into the judge as a **mandatory completion requirement** — the

@@ -17,7 +17,7 @@ Code's built-in `/goal` command.
 Run the CLI, passing the user's argument through verbatim:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" goal "${ARGUMENTS}"
+SUPERVISOR_GOAL_LABEL=Objective node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" goal "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty → reports current objective status.
