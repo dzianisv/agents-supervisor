@@ -16,9 +16,9 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Installation is via Claude plugin metadata under `.claude-plugin/`.
 - Runtime enforcement uses the `Stop` hook in `hooks/hooks.json`, which runs `bin/on-stop.mjs`.
 - User-facing skills live under `skills/`.
-- Current skill directories include `status`, `on`, `off`, `supervisor-goal`, `retry`, and `train`.
-- README documents `/supervisor:status`, `/supervisor:train`, `/supervisor:supervisor-goal`, and `/supervisor:retry` for Claude Code.
-- `supervisor-goal` is deliberately not named `goal` — Claude Code has a native `/goal` command and a bare-named skill would shadow it (see fix/goal-skill-shadows-native-command).
+- Current skill directories include `status`, `on`, `off`, `push-goal`, `retry`, and `train`.
+- README documents `/supervisor:status`, `/supervisor:train`, `/supervisor:push-goal`, and `/supervisor:retry` for Claude Code.
+- `push-goal` is deliberately not named `goal` — Claude Code has a native `/goal` command and a bare-named skill would shadow it (see fix/goal-skill-shadows-native-command). Plugin skills are always namespaced (`/supervisor:<name>`), so the rename only shortens the suffix, not the mandatory `supervisor:` prefix.
 
 ## OpenCode Surface
 

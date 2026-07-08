@@ -12,7 +12,7 @@ Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Surface |
 |---|---|---|
-| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:supervisor-goal`, `/supervisor:retry` |
+| **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:push-goal`, `/supervisor:retry` |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `supervisor_autoreview`, `autopilot_exit` + `/supervisor`, `/supervisor:train` |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
@@ -101,11 +101,11 @@ retry budget) until the goal's met or the budget runs out.
 /supervisor retry 24           # set this session's retry budget (1–100, default 16)
 ```
 
-On Claude Code the skill is `/supervisor:supervisor-goal <condition>` (deliberately
+On Claude Code the skill is `/supervisor:push-goal <condition>` (deliberately
 not named `/goal` — Claude Code ships its own native `/goal` command, and this
 plugin must not shadow it). The two are different features: the native `/goal` is
 evaluated by your configured small fast model with no retry-budget or
-pattern/rubric injection; `/supervisor:supervisor-goal` is this plugin's
+pattern/rubric injection; `/supervisor:push-goal` is this plugin's
 judge-driven equivalent, sharing state and retry budget with the rest of the
 supervisor.
 
