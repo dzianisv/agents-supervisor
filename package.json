@@ -5,7 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "dzianisv",
-  "repository": { "type": "git", "url": "https://github.com/dzianisv/agents-supervisor" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dzianisv/agents-supervisor"
+  },
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "test:cc": "node test/e2e-cc.mjs",

@@ -31,8 +31,7 @@ claude plugin install supervisor@agents-supervisor
 
 **From a local clone (development / localhost):**
 ```sh
-git clone https://github.com/dzianisv/agents-supervisor
-claude plugin marketplace add /path/to/agents-supervisor
+claude plugin marketplace add $(pwd)
 claude plugin install supervisor@agents-supervisor
 ```
 
