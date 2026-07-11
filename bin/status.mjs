@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
+import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
 
 const cwd = process.cwd();
 const patterns = loadPatterns({ cwd });
@@ -36,6 +37,19 @@ console.log();
 const stateDir = path.join(cwd, '.supervisor');
 const cur = (() => { try { return readFileSync(path.join(stateDir, 'current_session'), 'utf8').trim(); } catch { return null; } })();
 line('current session', cur ?? '(none recorded)');
+
+// Effective supervisor mode (from goal state for current session)
+if (cur) {
+  try {
+    const goalState = goalStore.load(cwd, cur);
+    const effectiveMode = resolveSupervisorMode(goalState);
+    line('effective mode', effectiveMode);
+  } catch {
+    line('effective mode', '(unknown)');
+  }
+} else {
+  line('effective mode', 'reflection (default — no session)');
+}
 
 let disabled = [];
 try { disabled = readFileSync(path.join(stateDir, 'disabled'), 'utf8').split('\n').map((l) => l.trim()).filter(Boolean); } catch { /* none */ }

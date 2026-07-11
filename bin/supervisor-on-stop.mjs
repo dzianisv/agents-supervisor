@@ -30,7 +30,7 @@ import {
 import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs'
 import { loadParsedRubric } from '../core/rubric-loader.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode } from '../core/goal.mjs';
 
 const STATE_DIR = '.supervisor';
 const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);
@@ -484,22 +484,34 @@ async function main() {
   let goal = null;
   let goalState = {};
   let effectiveMax = MAX_ATTEMPTS;
+  let mode = 'reflection';
   try {
     goalState = goalStore.load(cwd, session_id);
+    mode = resolveSupervisorMode(goalState);
     if (goalState.goal && goalState.goal.status === 'active') {
       goal = goalState.goal;
+      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
+    } else if (mode === 'autopilot') {
+      // Autopilot gets the higher budget (default 16), not the bare 3.
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
     } else if (typeof goalState.maxAttempts === 'number') {
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
     }
   } catch (e) {
     debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
+    // Best-effort mode recovery: if load failed transiently, retry once so the
+    // autopilot cleanup path below (setAutopilot false) can still fire correctly.
+    try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
   const attempts = readAttempts(session_id, cwd);
   if (attempts >= effectiveMax) {
     if (goal) {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: { ...goal, status: 'exhausted' } }); } catch { /* */ }
+    }
+    // Disable autopilot on budget exhaustion so the next stop is clean.
+    if (mode === 'autopilot') {
+      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
     }
     debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal }, cwd);
     process.exit(0);
@@ -517,6 +529,25 @@ async function main() {
   }
   if (!ctx.final_assistant_text) {
     debug({ msg: 'no_assistant_text_after_poll', session_id, tail_len: tail.length }, cwd);
+    process.exit(0);
+  }
+
+  // 3a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
+  // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
+  if (mode === 'autopilot' && !goal) {
+    const baseVerdict = { session_id, timestamp: new Date().toISOString() };
+    if (/(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text)) {
+      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
+      writeVerdict(session_id, { ...baseVerdict, autopilot: 'exited' }, cwd);
+      debug({ msg: 'autopilot_exit', session_id }, cwd);
+      process.exit(0);
+    }
+    const nextAttempt = attempts + 1;
+    writeAttemptCounter(session_id, nextAttempt, cwd);
+    const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
+    process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
+    debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt }, cwd);
     process.exit(0);
   }
 

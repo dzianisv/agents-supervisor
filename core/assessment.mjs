@@ -5,7 +5,7 @@ import { loadShipped } from './patterns.mjs'
  * Pull the "background subagents/tasks still in flight" exemption straight from
  * core/patterns.json — the same rule (antipattern `passive_watch_locally_pollable`)
  * and few-shots (K, M) already consumed by core/judge-core.mjs and
- * core/feedback-core.mjs — so the Claude Code Stop hook (bin/on-stop.mjs) stops
+ * core/feedback-core.mjs — so the Claude Code Stop hook (bin/supervisor-on-stop.mjs) stops
  * flagging in-flight subagent dispatches as premature stops. Without this, a
  * legitimate pause to wait on background subagents gets blocked because the
  * hand-written DEFAULT_RUBRIC below has no equivalent rule.
