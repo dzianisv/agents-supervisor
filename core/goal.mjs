@@ -18,6 +18,14 @@ export const DEFAULT_MAX_ATTEMPTS = 16;
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000;
 export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'goal', 'reflection']);
 export const DEFAULT_SUPERVISOR_MODE = 'reflection';
+// Shared cap on a goal condition's length. Single source of truth for BOTH
+// runtime surfaces: parseSupervisorCommand (CC CLI) and executeSupervisorGoal
+// (OpenCode tool) must truncate to the exact same value before the condition
+// is stored anywhere (session state, Goal.md, goal-history.jsonl, and the
+// reply string), or the two would silently disagree on what was saved for
+// conditions longer than this. Also keeps each goal-history.jsonl entry
+// small enough that a single fs.appendFileSync write lands atomically.
+export const GOAL_CONDITION_MAX_LEN = 4000;
 
 const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'cancel']);
 const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
@@ -59,7 +67,7 @@ export function parseSupervisorCommand(name, args) {
   if (name === 'goal') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
-    return { kind: 'goal-set', condition: trimmed.slice(0, 4000) };
+    return { kind: 'goal-set', condition: trimmed.slice(0, GOAL_CONDITION_MAX_LEN) };
   }
   if (name === 'retry') {
     if (trimmed === '') return { kind: 'retry-status' };
@@ -183,3 +191,110 @@ export const goalStore = {
     return state;
   },
 };
+
+// --- project-level goal (.agents/supervisor/Goal.md) -----------------------
+//
+// Unlike the per-session store above (safely namespaced by sessionId), the
+// project goal is a single shared file every session in a project directory
+// reads and writes — that's the point (PR #23: a persistent goal that
+// survives into future sessions without being re-set). Concurrent writers
+// (two sessions, or a session + CI job) racing a bare overwrite silently
+// destroy each other's condition with no trace. writeProjectGoal() below
+// fixes that without changing the file's shape or the feature's behavior.
+
+function projectGoalDir(cwd) {
+  return path.join(cwd, '.agents', 'supervisor');
+}
+
+/**
+ * Parse the project-level goal condition out of Goal.md content. Strips HTML
+ * comments, prefers a `## Goal Condition` section if present, otherwise
+ * falls back to the whole trimmed body. Single canonical implementation —
+ * previously duplicated byte-for-byte in opencode/supervisor-impl.ts (x2)
+ * and bin/supervisor-on-stop.mjs, none importing this shared module.
+ */
+export function extractGoalCondition(content) {
+  if (!content) return '';
+  const text = content.replace(/<!--[\s\S]*?-->/g, '');
+  const match = text.match(/##\s+Goal\s+Condition\s*\n([\s\S]*?)(?=\n##\s|$)/i);
+  return (match ? match[1] : text).trim();
+}
+
+/**
+ * Safely persist the project-level goal so concurrent writers never lose a
+ * condition, on either runtime surface (Claude Code's bin/supervisor-goal.mjs
+ * and OpenCode's executeSupervisorGoal both call this):
+ *
+ *  1. Append a durable {ts, pid, condition} record to goal-history.jsonl
+ *     BEFORE touching the current-pointer file. fs.appendFileSync opens the
+ *     file O_APPEND; a single write() of a payload this size (one condition
+ *     string, plus a small envelope) lands as one whole line even under
+ *     concurrent writers on a local filesystem — it never interleaves or is
+ *     torn. This is the durability net: every goal-set call's condition is
+ *     permanently recoverable here regardless of what happens to the
+ *     "current" pointer.
+ *  2. Atomically update the current pointer (Goal.md) via temp-file +
+ *     rename — mirrors the existing convention in bin/supervisor-on-stop.mjs's
+ *     writeAttemptCounter. Whichever writer's rename lands last wins the
+ *     "current" slot; that's fine now that history means no writer's value
+ *     is ever unrecoverable (previously: last-writer-wins AND the loser's
+ *     value vanished with no trace anywhere on disk — that was the bug).
+ *
+ * The GOAL_CONDITION_MAX_LEN truncation below is a defensive backstop, not
+ * the primary enforcement point: both callers (bin/supervisor-goal.mjs via
+ * parseSupervisorCommand, and opencode/supervisor-impl.ts's
+ * executeSupervisorGoal) already truncate to this same exported constant
+ * before calling here, specifically so the condition stored in session
+ * state, Goal.md, goal-history.jsonl, and any reply string always agree.
+ * Re-truncating here just means this function is safe even if a future
+ * caller forgets to.
+ *
+ * Best-effort: never throws. A failure here must not block goal-set.
+ */
+export function writeProjectGoal(cwd, condition) {
+  const trimmed = (condition ?? '').slice(0, GOAL_CONDITION_MAX_LEN);
+  const dir = projectGoalDir(cwd);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    return; // can't even make the dir — give up, best effort
+  }
+  try {
+    const entry = JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, condition: trimmed }) + '\n';
+    fs.appendFileSync(path.join(dir, 'goal-history.jsonl'), entry, 'utf8');
+  } catch {
+    /* history append failed — still attempt the current-pointer write below */
+  }
+  try {
+    const tmp = path.join(dir, `Goal.${process.pid}.${process.hrtime.bigint()}.tmp`);
+    fs.writeFileSync(tmp, trimmed, 'utf8');
+    fs.renameSync(tmp, path.join(dir, 'Goal.md'));
+  } catch {
+    /* best effort, same failure contract as the code this replaces */
+  }
+}
+
+/**
+ * Read back every recorded condition from goal-history.jsonl, oldest first.
+ * Best-effort: returns [] if the file is missing/unreadable; skips any
+ * individually corrupt line rather than failing the whole read.
+ */
+export function readProjectGoalHistory(cwd) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(projectGoalDir(cwd), 'goal-history.jsonl'), 'utf8');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) continue;
+    try {
+      out.push(JSON.parse(trimmedLine));
+    } catch {
+      /* skip corrupt line */
+    }
+  }
+  return out;
+}
