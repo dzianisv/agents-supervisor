@@ -8,6 +8,53 @@ your own sessions.
 
 > Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
 
+## Quick Start
+
+### Claude Code
+
+**From GitHub (no clone needed):**
+```sh
+claude plugin marketplace add https://github.com/dzianisv/agents-supervisor
+claude plugin install supervisor@agents-supervisor
+```
+
+**From a local clone:**
+```sh
+git clone https://github.com/dzianisv/agents-supervisor
+claude plugin marketplace add ./agents-supervisor
+claude plugin install supervisor@agents-supervisor
+```
+
+The `Stop` hook is active in the next session. Verify:
+```sh
+claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
+```
+
+### OpenCode
+
+**From GitHub (no clone needed):**
+
+Add to `~/.config/opencode/opencode.json`:
+```json
+{ "plugin": ["github:dzianisv/agents-supervisor/opencode/supervisor.ts"] }
+```
+
+**From a local clone:**
+```sh
+git clone https://github.com/dzianisv/agents-supervisor
+```
+Add to `~/.config/opencode/opencode.json`:
+```json
+{ "plugin": ["file:///path/to/agents-supervisor/opencode/supervisor.ts"] }
+```
+
+Then inside an OpenCode session:
+```
+/supervisor          # status
+/supervisor autopilot   # keep going on every idle
+/supervisor goal <condition>   # stop only when condition is met
+```
+
 Works on two runtimes from one shared core:
 
 | Runtime | Mechanism | Colon commands | Additional |
@@ -19,28 +66,11 @@ The classification taxonomy (6 categories + mined anti-patterns) and its feedbac
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
 so both runtimes — and the trainer — share one brain.
 
-## Quickstart (1 minute)
+## Commands
 
 ### Claude Code
 
-**From the registry (published release):**
-```sh
-claude plugin marketplace add dzianisv/agents-supervisor
-claude plugin install supervisor@agents-supervisor
-```
-
-**From a local clone (development / localhost):**
-```sh
-claude plugin marketplace add $(pwd)
-claude plugin install supervisor@agents-supervisor
-```
-
-The `Stop` hook is active in the next session. Verify:
-```sh
-claude plugin list   # should show: supervisor@agents-supervisor  ✔ enabled
-```
-
-Then, inside any Claude Code session, use any of these commands:
+Inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met or budget exhausts
@@ -64,11 +94,8 @@ Inside an active Claude Code session:
 - `/supervisor:on` — re-enable for this session
 
 ### OpenCode
-Add to `opencode.json`:
-```json
-{ "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-supervisor"] }
-```
-or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then, use the same colon-command set as Claude Code:
+
+Use the same colon-command set as Claude Code:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions
 - `/supervisor:goal <condition>` — set a mandatory completion condition
@@ -93,7 +120,7 @@ OpenCode also supports a bare `/supervisor <subcommand>` dispatcher as an altern
 /supervisor off     # disable for this session
 /supervisor on      # re-enable
 ```
-Whole plugin off: remove `"opencode-supervisor"` from `opencode.json`, or launch with `opencode --pure`.
+Whole plugin off: remove the plugin entry from `opencode.json`, or launch with `opencode --pure`.
 
 ## Supervisor modes (both runtimes)
 
@@ -145,13 +172,17 @@ model reviews the primary judge's completion verdict for blind spots before
 the supervisor acts on it. Toggle off with `/supervisor autoreview off`; check
 current state with `/supervisor autoreview` or `/supervisor` status.
 
-**Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
-`~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
-sections to override the judge's rubric; otherwise the shipped default is used.
-(Claude Code's built-in rubric — `core/assessment.mjs` — pulls its background-subagent
-exemption straight from the shipped `core/patterns.json` at load time, so the Stop hook
-doesn't flag in-flight subagent dispatches as premature; full user-local pattern
-overlays via `.supervisor/patterns.json` are OpenCode-only for now.)
+**Configurable rubric (both runtimes):** the reflection prompt is built by one
+shared module — `core/reflection-prompt.mjs` — for both Claude Code (Stop hook) and
+OpenCode (session.idle). It reads `.agents/supervisor/{SystemPrompt,Patterns,User}.md`,
+with a project's copy overriding the plugin's shipped defaults. To customize the
+judge, edit those files: `Patterns.md` holds the `## Patterns` / `## Antipatterns`
+rubric, `User.md` appends highest-precedence project overrides, and `SystemPrompt.md`
+is the `{{variable}}` template. When no `SystemPrompt.md` is found anywhere, the
+builder falls back to the embedded `buildSelfAssessmentPrompt` template in
+`core/assessment.mjs`, whose `STATIC_RUBRIC` is kept byte-in-sync with the shipped
+`Patterns.md`. (User-local pattern overlays via `.supervisor/patterns.json` remain
+OpenCode-only for now.)
 
 ## Autopilot mode (both runtimes)
 
