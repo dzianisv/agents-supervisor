@@ -1,66 +1,25 @@
 #!/usr/bin/env node
 /**
- * supervisor-goal.mjs — CLI for the Claude Code goal loop, invoked by the
- * /supervisor:set-goal and /supervisor:retry skills.
+ * supervisor-goal.mjs — thin shim that delegates to bin/supervisor.mjs.
  *
- * Usage:
- *   node supervisor-goal.mjs goal [<condition> | clear | (empty=status)]
- *   node supervisor-goal.mjs retry [<n> | (empty=status)]
- *
- * Session id is read from <cwd>/.supervisor/current_session (written by the Stop
- * hook). State is stored per session via core/goal.mjs (.supervisor/goals/<sid>.json).
+ * Kept for backwards-compatibility: the /supervisor:set-goal and
+ * /supervisor:retry skills call this script directly. All logic now lives
+ * in supervisor.mjs.
  */
 
-import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { goalStore, parseSupervisorCommand, resolveMaxAttempts } from '../core/goal.mjs';
+import { fileURLToPath } from 'node:url';
 
-const cwd = process.cwd();
-const name = process.argv[2];
-const args = process.argv.slice(3).join(' ');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const supervisor = path.join(__dirname, 'supervisor.mjs');
 
-function currentSession() {
-  try {
-    return fs.readFileSync(path.join(cwd, '.supervisor', 'current_session'), 'utf8').trim();
-  } catch {
-    return null;
-  }
-}
-
-const sid = currentSession();
-if (!sid) {
-  console.log('No active session yet (.supervisor/current_session missing). Run something first so the Stop hook records the session, then retry.');
-  process.exit(0);
-}
-
-const cmd = parseSupervisorCommand(name, args);
-switch (cmd.kind) {
-  case 'goal-set': {
-    goalStore.setGoal(cwd, sid, cmd.condition);
-    console.log(`Goal set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\nThe supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts })}) runs out.`);
-    break;
-  }
-  case 'goal-clear': {
-    goalStore.clearGoal(cwd, sid);
-    console.log(`Goal cleared for session ${sid.slice(0, 8)}….`);
-    break;
-  }
-  case 'goal-status': {
-    const st = goalStore.load(cwd, sid);
-    if (!st.goal) console.log('No goal set for this session.');
-    else console.log(`Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ''}`);
-    break;
-  }
-  case 'retry-set': {
-    goalStore.setRetry(cwd, sid, cmd.n);
-    console.log(`Retry budget set to ${resolveMaxAttempts({ sessionOverride: cmd.n })} for session ${sid.slice(0, 8)}….`);
-    break;
-  }
-  case 'retry-status': {
-    const st = goalStore.load(cwd, sid);
-    console.log(`Retry budget (session override): ${st.maxAttempts ?? '(default 16 when a goal is active; 3 otherwise)'}.`);
-    break;
-  }
-  default:
-    console.log(`Unknown supervisor command: ${name}. Use "goal" or "retry".`);
+// Re-dispatch with the same argv array (no shell quoting — args passed directly).
+try {
+  execFileSync('node', [supervisor, ...process.argv.slice(2)], {
+    cwd: process.cwd(),
+    stdio: 'inherit',
+  });
+} catch (err) {
+  process.exit(err.status ?? 1);
 }

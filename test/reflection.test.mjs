@@ -3,23 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { interpolateTemplate } from '../core/reflection-prompt.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SUPERVISOR_DIR = path.join(ROOT, '.agents', 'supervisor');
-
-// --- Reimplement interpolateTemplate (same logic as supervisor.ts) ---
-function interpolateTemplate(template, vars) {
-  let result = template.replace(
-    /\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
-    (_match, key, content) => {
-      const value = vars[key];
-      if (!value) return '';
-      return content.replace(/\{\{(\w+)\}\}/g, (_m, k) => vars[k] ?? '');
-    }
-  );
-  result = result.replace(/\{\{(\w+)\}\}/g, (_match, key) => vars[key] ?? '');
-  return result;
-}
 
 // --- Sample context for prompt assembly ---
 const sampleContext = {

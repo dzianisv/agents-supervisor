@@ -5,16 +5,12 @@ description: Set, check, or clear a session goal the supervisor pushes the agent
 
 # /supervisor goal — push toward a goal
 
-Set a goal condition the supervisor enforces: while it's active, the Stop hook
-keeps re-prompting the agent (up to the retry budget) until the goal is
-demonstrably met or the budget runs out.
-
 ## Steps
 
 Run the CLI, passing the user's argument through verbatim:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor-goal.mjs" goal ${ARGUMENTS}
+node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" goal "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty → reports current goal status.

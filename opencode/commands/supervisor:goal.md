@@ -14,3 +14,8 @@ Interpret `$ARGUMENTS`:
 
 After the tool returns, relay its message. While a goal is active the supervisor
 keeps re-prompting the agent until the goal is met or the retry budget runs out.
+
+After relaying the tool response, if the user asked to set a goal, mention:
+- This is a **session-scoped** goal (lost when the session ends).
+- For a **project-level** persistent goal that applies in reflection mode across
+  all sessions, edit `.agents/supervisor/Goal.md` in the project root.

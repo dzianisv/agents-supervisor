@@ -12,19 +12,14 @@ Remove the current session from the disabled list so the supervisor hook fires a
 1. Remove session ID from the disabled list:
 
    ```bash
-   node -e "
-   const fs = require('fs'), path = require('path');
-   const dir = path.join(process.cwd(), '.supervisor');
-   const flag = path.join(dir, 'disabled');
-   const sid = fs.existsSync(path.join(dir, 'current_session'))
-     ? fs.readFileSync(path.join(dir, 'current_session'), 'utf8').trim()
-     : process.env.CLAUDE_SESSION_ID ?? '';
-   if (!sid || !fs.existsSync(flag)) { console.log('Supervisor already active.'); process.exit(0); }
-   const updated = fs.readFileSync(flag, 'utf8').split('\n').map(l => l.trim()).filter(l => l && l !== sid);
-   fs.writeFileSync(flag, updated.join('\n') + (updated.length ? '\n' : ''), 'utf8');
-   console.log('Supervisor re-enabled for session:', sid);
-   "
+   node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" on
    ```
+
+   The CLI reads the session from `.supervisor/current_session`, falling back to
+   `CLAUDE_SESSION_ID` when the file is absent. It removes the session from
+   `.supervisor/disabled` and prints `Supervisor re-enabled for session: <sid>`.
+   If no session is found it exits with a message indicating the supervisor is
+   already active.
 
 2. Confirm to the user: "Supervisor re-enabled for this session."
 
