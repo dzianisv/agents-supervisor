@@ -13,7 +13,7 @@ Works on two runtimes from one shared core:
 | Runtime | Mechanism | Surface |
 |---|---|---|
 | **Claude Code** | `Stop` hook (`bin/on-stop.mjs`) | plugin + `/supervisor:train`, `/supervisor:status`, `/supervisor:goal`, `/supervisor:retry` |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `autopilot_exit` + `/supervisor`, `/supervisor:train` |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | tools `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, `supervisor_autoreview`, `autopilot_exit` + `/supervisor`, `/supervisor:train` |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -31,8 +31,7 @@ claude plugin install supervisor@agents-supervisor
 
 **From a local clone (development / localhost):**
 ```sh
-git clone https://github.com/dzianisv/agents-supervisor
-claude plugin marketplace add /path/to/agents-supervisor
+claude plugin marketplace add $(pwd)
 claude plugin install supervisor@agents-supervisor
 ```
 
@@ -68,6 +67,7 @@ or drop `opencode/supervisor.ts` into `~/.config/opencode/plugin/`. Then:
 - `/supervisor autopilot` - continue on every idle without judge latency
 - `/supervisor goal <condition>` - keep pushing until the condition is met
 - `/supervisor reflection` - return to the default completion-judge mode
+- `/supervisor autoreview on` / `off` - toggle cross-model review of completion verdicts
 - `/supervisor:train` - learn (web app: call the `supervisor_train` tool; file commands don't expand in the web UI)
 
 **Switch off / on:**
@@ -109,10 +109,19 @@ continuation actually fires.
 
 In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 
+**Cross-model autoreview (OpenCode):** off by default. When enabled with
+`/supervisor autoreview on` (or the `supervisor_autoreview` tool), a second
+model reviews the primary judge's completion verdict for blind spots before
+the supervisor acts on it. Toggle off with `/supervisor autoreview off`; check
+current state with `/supervisor autoreview` or `/supervisor` status.
+
 **Configurable rubric (OpenCode):** drop a `.supervisor/rubric.md` (or
 `~/.config/opencode/supervisor/rubric.md`) with `## Patterns` / `## Antipatterns`
 sections to override the judge's rubric; otherwise the shipped default is used.
-(Claude Code reads its rubric from `core/patterns.json` ⊕ your user-local patterns.)
+(Claude Code's built-in rubric — `core/assessment.mjs` — pulls its background-subagent
+exemption straight from the shipped `core/patterns.json` at load time, so the Stop hook
+doesn't flag in-flight subagent dispatches as premature; full user-local pattern
+overlays via `.supervisor/patterns.json` are OpenCode-only for now.)
 
 ## Autopilot mode (OpenCode)
 

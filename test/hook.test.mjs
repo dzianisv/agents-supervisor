@@ -208,6 +208,98 @@ test('buildTaskContextFromTranscript: detects tool commands from Bash tool_use',
   assert.ok(ctx.detectedSignals.includes('test-command'), `expected test-command in ${ctx.detectedSignals}`);
 });
 
+test('buildTaskContextFromTranscript: Task tool dispatch is visible to the judge (bug 1)', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'refactor the auth module' } },
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Task',
+            input: { description: 'Audit auth module for bugs', prompt: 'Full prompt text goes here...' },
+          },
+          { type: 'text', text: 'Dispatched a subagent to audit auth; waiting on it to report back.' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  // Subagent dispatches must show up in the "Tool Commands Run" summary, otherwise
+  // the judge sees zero evidence a background subagent was launched and flags a
+  // legitimate wait-for-subagent pause as a premature stop.
+  assert.ok(
+    ctx.toolsSummary.includes('Task: Audit auth module for bugs'),
+    `expected Task dispatch in toolsSummary: ${ctx.toolsSummary}`,
+  );
+});
+
+test('buildTaskContextFromTranscript: Agent tool dispatch falls back to prompt when no description (bug 1)', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'kick off some background research' } },
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Agent', input: { prompt: 'Research competitor pricing pages and report back.' } },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  assert.ok(
+    ctx.toolsSummary.includes('Task: Research competitor pricing pages'),
+    `expected Agent dispatch (via prompt fallback) in toolsSummary: ${ctx.toolsSummary}`,
+  );
+});
+
+test('buildTaskContextFromTranscript: requiresPR/requiresCI false for coding-classified task with no code changes (bug 3)', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'create GitHub epic issues for the Q3 roadmap' } },
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'gh issue create --title "Epic: Q3 roadmap"' } },
+          { type: 'text', text: 'Created the epic issues.' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  assert.equal(ctx.taskType, 'coding', `expected task to be classified 'coding': ${ctx.taskType}`);
+  assert.equal(ctx.requiresPR, false, 'issue-only task should not require a PR');
+  assert.equal(ctx.requiresCI, false, 'issue-only task should not require CI');
+});
+
+test('buildTaskContextFromTranscript: requiresPR/requiresCI stay true for coding task with real file edits (bug 3)', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'fix the bug in the parser' } },
+    {
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', name: 'Edit', input: { file_path: '/src/parser.js' } },
+          { type: 'text', text: 'Fixed the parser bug.' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  assert.equal(ctx.taskType, 'coding', `expected task to be classified 'coding': ${ctx.taskType}`);
+  assert.equal(ctx.requiresPR, true, 'real code-change task should still require a PR');
+  assert.equal(ctx.requiresCI, true, 'real code-change task should still require CI');
+});
+
 test('buildTaskContextFromTranscript: multi-message summary uses numbered format', () => {
   const msgs = normalizeTranscriptToMessages([
     { type: 'user', message: { role: 'user', content: 'first task' } },

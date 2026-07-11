@@ -26,7 +26,7 @@ import {
 import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
   detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
-  pushedToDefaultBranch, detectPlanningLoop, shouldApplyPlanningLoop,
+  pushedToDefaultBranch, hasCodeChangeEvidence, detectPlanningLoop, shouldApplyPlanningLoop,
   detectActionLoop, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
 } from "../core/evaluation.mjs"
@@ -891,9 +891,12 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
 
   const requiresTests = taskType === "coding" && (repoSignals.hasTestScript || repoSignals.hasTestsDir || detectedSignals.includes("test-mention"))
   const requiresBuild = taskType === "coding" && (repoSignals.hasBuildScript || detectedSignals.includes("build-mention"))
-  // PR and CI are only required for coding tasks; ops/personal-assistant tasks don't need them
-  const requiresPR = taskType === "coding"
-  const requiresCI = taskType === "coding"
+  // PR and CI are only required for coding tasks that actually changed code — not
+  // merely classified "coding" from a verb like "create" (e.g. "create GitHub epic
+  // issues" has no diff to PR, just gh/API calls). ops/personal-assistant tasks
+  // don't need them either.
+  const requiresPR = taskType === "coding" && hasCodeChangeEvidence(commands)
+  const requiresCI = taskType === "coding" && hasCodeChangeEvidence(commands)
   const requiresLocalTests = requiresTests
   const requiresLocalTestsEvidence = requiresTests && !hasLocalTests
 

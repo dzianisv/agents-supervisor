@@ -212,10 +212,32 @@ export function extractToolCommands(messages) {
   const commands = []
   for (const msg of messages) {
     for (const part of msg.parts || []) {
-      if (part.type === 'tool' && part.tool === 'bash') {
-        const command = part.state?.input?.command
+      if (part.type !== 'tool') continue
+      const toolName = (part.tool || '').toString().toLowerCase()
+      const input = part.state?.input || {}
+
+      if (toolName === 'bash') {
+        const command = input.command
         if (typeof command === 'string' && command.trim()) {
           commands.push(command)
+        }
+      } else if (toolName === 'edit' || toolName === 'write') {
+        // hasCodeChangeEvidence() below keys off this "edited "/"wrote " prefix to
+        // distinguish tasks with real file edits from tasks merely classified 'coding'.
+        const filePath = input.file_path || input.filePath || ''
+        const verb = toolName === 'edit' ? 'edited' : 'wrote'
+        commands.push(`${verb} ${filePath}`.trim())
+      } else if (toolName === 'task' || toolName === 'agent') {
+        // Subagent dispatch (Claude Code's Task tool / opencode's task tool). Without
+        // this, the judge sees zero evidence that background subagents were launched
+        // and flags an in-progress fan-out as a premature stop.
+        const description = input.description
+        const prompt = input.prompt
+        const summary = (typeof description === 'string' && description.trim())
+          ? description.trim()
+          : (typeof prompt === 'string' && prompt.trim() ? prompt.trim().slice(0, 150) : '')
+        if (summary) {
+          commands.push(`Task: ${summary}`)
         }
       }
     }
@@ -265,6 +287,17 @@ export function hasLocalTestCommand(commands) {
     /\bgo\s+test\b/i.test(cmd) ||
     /\bcargo\s+test\b/i.test(cmd)
   )
+}
+
+/**
+ * Whether the tool commands include evidence of an actual source-code change
+ * (Edit/Write tool calls, formatted by extractToolCommands as "edited "/"wrote ").
+ * Used to avoid demanding a PR/CI check for tasks classified as "coding" purely
+ * because the request used a verb like "create" (e.g. "create GitHub epic issues"),
+ * when no file was actually touched.
+ */
+export function hasCodeChangeEvidence(commands) {
+  return commands.some(cmd => /^(edited|wrote)\s/i.test(cmd))
 }
 
 export function pushedToDefaultBranch(commands) {

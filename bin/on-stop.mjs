@@ -25,7 +25,7 @@ import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
-  isPlanMode, evaluateSelfAssessment,
+  hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs'
 import { loadParsedRubric } from '../core/rubric-loader.mjs';
@@ -335,8 +335,11 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
     (repoSignals.hasTestScript || repoSignals.hasTestsDir || detectedSignals.includes('test-mention'));
   const requiresBuild = taskType === 'coding' &&
     (repoSignals.hasBuildScript || detectedSignals.includes('build-mention'));
-  const requiresPR = taskType === 'coding';
-  const requiresCI = taskType === 'coding';
+  // PR/CI are only required when the task actually changed code — not merely
+  // because it was classified "coding" from a verb like "create" (e.g. "create
+  // GitHub epic issues" has no diff to PR, just gh/API calls).
+  const requiresPR = taskType === 'coding' && hasCodeChangeEvidence(commands);
+  const requiresCI = taskType === 'coding' && hasCodeChangeEvidence(commands);
   const requiresLocalTests = requiresTests;
   const requiresLocalTestsEvidence = requiresTests && !hasLocalTests;
   const toolsSummary = commands.slice(-6).join('\n') || '(none)';

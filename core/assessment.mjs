@@ -1,6 +1,29 @@
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+import { loadShipped } from './patterns.mjs'
 
-export const DEFAULT_RUBRIC = `## Patterns
+/**
+ * Pull the "background subagents/tasks still in flight" exemption straight from
+ * core/patterns.json — the same rule (antipattern `passive_watch_locally_pollable`)
+ * and few-shots (K, M) already consumed by core/judge-core.mjs and
+ * core/feedback-core.mjs — so the Claude Code Stop hook (bin/on-stop.mjs) stops
+ * flagging in-flight subagent dispatches as premature stops. Without this, a
+ * legitimate pause to wait on background subagents gets blocked because the
+ * hand-written DEFAULT_RUBRIC below has no equivalent rule.
+ * @param {object} [patterns] defaults to the shipped core/patterns.json
+ * @returns {string} a rubric-formatted bullet, or '' if the rule is unavailable
+ */
+export function buildSubagentExemptionRule(patterns) {
+  const p = patterns ?? loadShipped()
+  const rule = (p?.antipatterns ?? []).find((a) => a.name === 'passive_watch_locally_pollable')?.rule
+  if (!rule) return ''
+  const subagentShots = (p?.few_shots ?? []).filter((ex) => /subagent/i.test(ex?.note ?? ''))
+  const examplesLine = subagentShots.length
+    ? ` Examples: ${subagentShots.map((ex) => `"${ex.final}" -> ${ex.output?.category}`).join(' | ')}`
+    : ''
+  return `- BACKGROUND SUBAGENTS/TASKS STILL RUNNING (do NOT flag as premature; sourced from core/patterns.json): ${rule}${examplesLine}`
+}
+
+const STATIC_RUBRIC = `## Patterns
 - If coding work is complete, confirm tests ran after the latest changes and passed.
 - If local tests are required, provide the exact commands run in this session.
 - If PR exists, verify CI checks and report status.
@@ -20,6 +43,18 @@ PREMATURE-STOP ANTIPATTERNS (mined from 227 real agent stops where the user repl
 - FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a <feature/system>" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
 - LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → status "complete"; do not invent missing work.
 - SEVERITY/STUCK: a single recoverable technical snag mid-task (knows the fix) is not "stuck". But a policy/process violation — pushing to main when a PR was required, skipping mandated tests — is a real failure: status "in_progress" with the corrective action in remaining_work, never "complete".`
+
+function buildDefaultRubric() {
+  let addendum = ''
+  try {
+    addendum = buildSubagentExemptionRule()
+  } catch {
+    /* core/patterns.json unavailable — fall back to the static rubric only */
+  }
+  return addendum ? `${STATIC_RUBRIC}\n${addendum}` : STATIC_RUBRIC
+}
+
+export const DEFAULT_RUBRIC = buildDefaultRubric()
 
 /**
  * @typedef {{ patterns: string, antipatterns: string }} Rubric
