@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { loadShipped, deepMerge } from '../core/patterns.mjs';
 import { buildPrompt, CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { buildFeedback, injectCategories } from '../core/feedback-core.mjs';
+import { buildSubagentExemptionRule, DEFAULT_RUBRIC } from '../core/assessment.mjs';
+import { parseRubric } from '../opencode/supervisor-impl.ts';
 
 const shipped = loadShipped();
 
@@ -67,4 +69,29 @@ test('feedback: non-injecting categories never inject', () => {
   for (const cat of ['complete', 'waiting_for_user_legitimate', 'working', 'TIMEOUT', 'PARSE_ERROR', 'API_ERROR']) {
     assert.equal(buildFeedback(cat, {}, 1, shipped).shouldInject, false, cat);
   }
+});
+
+// ---------------------------------------------------------------------------
+// bug 2 — Claude Code's DEFAULT_RUBRIC (core/assessment.mjs) must pull the same
+// "background subagents still running = not a premature stop" rule that
+// core/judge-core.mjs / core/feedback-core.mjs already read from patterns.json,
+// instead of only the OpenCode path getting it.
+
+test('buildSubagentExemptionRule: derives a non-empty rule from shipped patterns.json', () => {
+  const rule = buildSubagentExemptionRule(shipped);
+  assert.ok(rule, 'expected a non-empty rule string');
+  assert.match(rule, /BACKGROUND SUBAGENTS/);
+  // Should surface the subagent few-shots (K, M) from patterns.json, not just the bare rule text
+  assert.match(rule, /subagent/i);
+});
+
+test('buildSubagentExemptionRule: returns empty string if the antipattern is missing', () => {
+  const stripped = { ...shipped, antipatterns: (shipped.antipatterns || []).filter(a => a.name !== 'passive_watch_locally_pollable') };
+  assert.equal(buildSubagentExemptionRule(stripped), '');
+});
+
+test('DEFAULT_RUBRIC (Claude Code path): includes the patterns.json-sourced subagent exemption', () => {
+  assert.match(DEFAULT_RUBRIC, /BACKGROUND SUBAGENTS/);
+  const parsed = parseRubric(DEFAULT_RUBRIC);
+  assert.match(parsed.antipatterns, /BACKGROUND SUBAGENTS/);
 });
