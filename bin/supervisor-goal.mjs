@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * supervisor-goal.mjs — CLI for the Claude Code goal loop, invoked by the
- * /supervisor:goal and /supervisor:retry skills.
+ * /supervisor:set-goal and /supervisor:retry skills.
  *
  * Usage:
  *   node supervisor-goal.mjs goal [<condition> | clear | (empty=status)]

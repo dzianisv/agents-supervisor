@@ -1,9 +1,9 @@
 ---
-name: goal
-description: Set, check, or clear a session goal the supervisor pushes the agent to meet before it stops. Use for "/supervisor:goal", "set a supervisor goal", "keep going until X", "don't stop until <condition>".
+name: set-goal
+description: Set, check, or clear a session goal the supervisor pushes the agent to meet before it stops. Use for "/supervisor goal", "set a supervisor goal", "keep going until X", "don't stop until <condition>". Distinct from Claude Code's native /goal command.
 ---
 
-# /supervisor:goal — push toward a goal
+# /supervisor goal — push toward a goal
 
 Set a goal condition the supervisor enforces: while it's active, the Stop hook
 keeps re-prompting the agent (up to the retry budget) until the goal is
