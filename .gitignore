@@ -3,7 +3,7 @@
 .tasks/
 .supervisor/
 *.jsonl
-!evals/**/*.example.jsonl
+!evals/cases.example.jsonl
 /tmp/
 stop-candidates/
 session-digests/
