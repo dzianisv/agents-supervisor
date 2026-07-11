@@ -16,8 +16,9 @@ import { execFile } from "child_process"
 // (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
 import {
   resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
-  decideGoalTransition, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_GOAL_DURATION_MS,
+  decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
+  extractGoalCondition, writeProjectGoal, GOAL_CONDITION_MAX_LEN,
 } from "../core/goal.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
@@ -35,6 +36,12 @@ import {
   parseSelfAssessmentJson,
 } from "../core/assessment.mjs"
 import { buildEscalatingFeedback } from "../core/feedback.mjs"
+import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
+
+// Plugin's own shipped .agents/supervisor dir — fallback defaults when a
+// project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
+// supervisor-impl.ts lives in opencode/, so ".." reaches the repo root.
+const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents", "supervisor")
 export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
 export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 export {
@@ -230,6 +237,9 @@ export const supervisorStore = {
 // ---------------------------------------------------------------------------
 
 // buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
+
+// extractGoalCondition now imported from ../core/goal.mjs (shared — was
+// duplicated here and in buildReflectionPrompt + bin/supervisor-on-stop.mjs).
 
 // ---------------------------------------------------------------------------
 // decideGoalTransition — pure decision for an active session goal
@@ -932,124 +942,6 @@ function extractLastAssistantText(messages: any[]): string {
   return ""
 }
 
-/**
- * Interpolate a simple mustache-like template:
- * - {{variable}} → replaced with value
- * - {{#section}}...{{/section}} → included only if variable is truthy
- */
-function interpolateTemplate(template: string, vars: Record<string, string | undefined>): string {
-  // Handle conditional sections: {{#key}}...{{/key}}
-  let result = template.replace(
-    /\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g,
-    (_match, key: string, content: string) => {
-      const value = vars[key]
-      if (!value) return ""
-      // Within the section, also interpolate variables
-      return content.replace(/\{\{(\w+)\}\}/g, (_m: string, k: string) => vars[k] ?? "")
-    }
-  )
-  // Handle remaining simple variables
-  result = result.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => vars[key] ?? "")
-  return result
-}
-
-/**
- * Build the reflection prompt by reading 3 external files and interpolating:
- *   1. .agents/supervisor/SystemPrompt.md — template with {{variable}} placeholders
- *   2. .agents/supervisor/Patterns.md — patterns & antipatterns
- *   3. .agents/supervisor/User.md — user-editable overrides
- *
- * Falls back to embedded defaults (buildSelfAssessmentPrompt equivalent) if files
- * are missing, so the plugin works without the files on disk.
- */
-async function buildReflectionPromptFromFiles(
-  directory: string,
-  context: TaskContext,
-  agents: string,
-  lastAssistantText: string | undefined,
-  attemptCount: number | undefined,
-  maxAttempts: number | undefined,
-  goalSection?: string
-): Promise<string> {
-  const basePath = join(directory, ".agents", "supervisor")
-
-  // Attempt to read each file; null if not found
-  async function tryRead(filename: string): Promise<string | null> {
-    try {
-      return await readFile(join(basePath, filename), "utf-8")
-    } catch {
-      return null
-    }
-  }
-
-  const [systemPromptFile, patternsFile, userFile] = await Promise.all([
-    tryRead("SystemPrompt.md"),
-    tryRead("Patterns.md"),
-    tryRead("User.md"),
-  ])
-
-  // Build context variables for interpolation
-  const safeContext = {
-    ...context,
-    detectedSignals: Array.isArray(context.detectedSignals) ? context.detectedSignals : []
-  }
-
-  const requirements: string[] = []
-  if (safeContext.requiresTests) requirements.push("Tests required (run after latest changes)")
-  if (safeContext.requiresBuild) requirements.push("Build/compile required")
-  if (safeContext.requiresPR) requirements.push("PR required (include link)")
-  if (safeContext.requiresCI) requirements.push("CI checks required (verify status)")
-  if (safeContext.requiresLocalTests) requirements.push("Local tests required (must run in this session)")
-  if (safeContext.pushedToDefaultBranch) requirements.push("Detected direct push to default branch (must be avoided)")
-  if (requirements.length === 0) requirements.push("No explicit workflow gates detected")
-
-  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
-  const currentAttempt = attemptCount || 0
-
-  const templateVars: Record<string, string | undefined> = {
-    taskSummary: safeContext.taskSummary,
-    taskType: safeContext.taskType,
-    agentMode: safeContext.agentMode,
-    requirements: requirements.join("; "),
-    signals: safeContext.detectedSignals.length ? safeContext.detectedSignals.join(", ") : "none",
-    toolsSummary: safeContext.toolsSummary,
-    lastAssistantText: lastAssistantText ? lastAssistantText.slice(0, 4000) : undefined,
-    attemptSection: currentAttempt > 0 ? "true" : undefined,
-    attemptNumber: String(currentAttempt + 1),
-    maxAttempts: String(effectiveCap),
-    projectInstructions: agents ? agents.slice(0, 800) : undefined,
-    goalSection: goalSection || undefined,
-  }
-
-  // If the system prompt file exists, use the file-based approach
-  if (systemPromptFile) {
-    const interpolated = interpolateTemplate(systemPromptFile, templateVars)
-    const parts = [interpolated]
-    if (patternsFile) {
-      parts.push(patternsFile)
-    }
-    if (userFile && userFile.trim() !== "") {
-      parts.push(userFile)
-    }
-    return parts.join("\n\n")
-  }
-
-  // Fallback: build prompt using the same logic as buildSelfAssessmentPrompt
-  // (for projects that don't have the 3-file structure yet)
-  const rubric = parseRubric(DEFAULT_RUBRIC)
-  const effRubric: Rubric = goalSection
-    ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
-    : rubric
-  return buildSelfAssessmentPrompt(
-    context,
-    agents,
-    lastAssistantText,
-    currentAttempt,
-    effRubric,
-    effectiveCap
-  )
-}
-
 async function analyzeSelfAssessmentWithLLM(
   client: any,
   directory: string,
@@ -1100,10 +992,8 @@ async function analyzeSelfAssessmentWithLLM(
       const response = await waitForResponse(client, judgeSession.id)
       if (!response) continue
 
-      const jsonMatch = response.match(/\{[\s\S]*\}/)
-      if (!jsonMatch) continue
-
-      const verdict = JSON.parse(jsonMatch[0]) as any
+      const verdict = parseSelfAssessmentJson(response) as any
+      if (!verdict) continue
       const missing = Array.isArray(verdict.missing) ? verdict.missing : []
       const humanOnlyMissing = missing.filter((item: string) => isHumanOnlyAction(item))
       const actionableMissing = missing.filter((item: string) => !isHumanOnlyAction(item))
@@ -1349,14 +1239,22 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.clearGoal(directory, sid)
       return `Goal cleared for session ${sid.slice(0, 8)}….`
     }
-    const condition = (args.condition || "").trim()
+    // Truncate to the same GOAL_CONDITION_MAX_LEN the CC CLI path already
+    // enforces (parseSupervisorCommand). Must happen once, here, before the
+    // condition fans out to session state, Goal.md/history, and the reply
+    // string below — otherwise a >4000-char condition would silently diverge
+    // between what setGoal remembers and what writeProjectGoal persists.
+    const condition = (args.condition || "").trim().slice(0, GOAL_CONDITION_MAX_LEN)
     if (!condition) {
       const st = await supervisorStore.load(directory, sid)
       if (!st.goal) return "No goal set for this session."
       return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
     }
     await supervisorStore.setGoal(directory, sid, condition, {})
-    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out).`
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
+    // across sessions. Safe under concurrent writers — see writeProjectGoal.
+    writeProjectGoal(directory, condition)
+    return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/Goal.md for reflection mode.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
   const executeSupervisorRetry = async (args: { n?: number }) => {
@@ -1692,28 +1590,46 @@ Continue now.`
         // When a goal is active, its condition is the strongest stated intent and
         // MUST compose with the existing gates.
         const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
-        const effRubric: Rubric = goalSection
-          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${goalSection}` }
+
+        // Reflection mode: also read project-level goal from .agents/supervisor/Goal.md
+        let projectGoalSection = ""
+        if (mode === "reflection" && !goal) {
+          try {
+            const goalFilePath = join(directory, ".agents", "supervisor", "Goal.md")
+            const goalFileContent = await readFile(goalFilePath, "utf-8")
+            const cond = extractGoalCondition(goalFileContent)
+            if (cond) projectGoalSection = buildGoalRequirementSection(cond)
+          } catch {}
+        }
+        const effectiveGoalSection = goalSection || projectGoalSection
+
+        const effRubric: Rubric = effectiveGoalSection
+          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${effectiveGoalSection}` }
           : rubric
 
         // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
-        const defaultSupervisorPrompt = await buildReflectionPromptFromFiles(
+        const defaultSupervisorPrompt = await buildReflectionPrompt({
           directory,
+          defaultsDir,
           context,
           agents,
           lastAssistantText,
-          currentAttemptCount,
-          effectiveMaxAttempts,
-          goalSection || undefined
-        )
+          attemptCount: currentAttemptCount,
+          maxAttempts: effectiveMaxAttempts,
+          goalSection: effectiveGoalSection || undefined,
+        })
         let supervisorPrompt: string
         let effectiveToolSupervisorPrompt: string | null
-        let promptSource: "file" | "tool" | "default" | "goal"
+        let promptSource: "file" | "tool" | "default" | "goal" | "reflection+goal"
         if (goal) {
           // Goal active: use the default (goal-augmented) prompt directly.
           supervisorPrompt = defaultSupervisorPrompt
           effectiveToolSupervisorPrompt = null
           promptSource = "goal"
+        } else if (mode === "reflection" && projectGoalSection) {
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "reflection+goal"
         } else {
           const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
           supervisorPrompt = resolvedPrompt.prompt

@@ -4,7 +4,7 @@
  *
  * Reads the CC Stop payload from stdin (JSON), applies safety rails, reads the
  * transcript tail, normalises it to the shared message format, builds a task
- * context, runs the self-assessment pipeline (buildSelfAssessmentPrompt →
+ * context, runs the self-assessment pipeline (buildReflectionPrompt →
  * callAnthropic → parseSelfAssessmentJson → evaluateSelfAssessment), and
  * injects a continuation prompt when the agent stopped prematurely.
  *
@@ -27,10 +27,15 @@ import {
   getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
-import { buildSelfAssessmentPrompt, parseSelfAssessmentJson } from '../core/assessment.mjs'
-import { loadParsedRubric } from '../core/rubric-loader.mjs';
+import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, extractGoalCondition } from '../core/goal.mjs';
+import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
+
+// Plugin's own shipped .agents/supervisor dir — fallback defaults when a
+// project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
+// on-stop.mjs lives in bin/, so '..' reaches the repo root.
+const defaultsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.agents', 'supervisor');
 
 const STATE_DIR = '.supervisor';
 const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);
@@ -504,6 +509,20 @@ async function main() {
     try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
+  // Project-level goal: in reflection mode, read .agents/supervisor/Goal.md
+  let projectGoalSection = '';
+  const effectiveMode = resolveSupervisorMode(goalState);
+  if (effectiveMode !== 'goal' && !goal) {
+    try {
+      const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
+      const goalFileContent = fs.readFileSync(goalFilePath, 'utf8');
+      const cond = extractGoalCondition(goalFileContent);
+      if (cond) projectGoalSection = buildGoalRequirementSection(cond);
+    } catch {
+      // Goal.md not present or unreadable — no project goal
+    }
+  }
+
   const attempts = readAttempts(session_id, cwd);
   if (attempts >= effectiveMax) {
     if (goal) {
@@ -559,13 +578,22 @@ async function main() {
     process.exit(0);
   }
 
-  // 5. Self-assessment via shared pipeline.
+  // 5. Self-assessment via shared pipeline (same builder OpenCode uses):
+  // reads .agents/supervisor/{SystemPrompt,Patterns,User,Goal}.md (falling
+  // back to this plugin's shipped defaults), and — if a project-level goal
+  // is active and no session goal overrides it — folds the goal requirement
+  // in as a mandatory completion criterion.
   const agents = getAgentsSync(cwd);
-  // Rubric seam: load per-project or global rubric.md if present; null falls back to DEFAULT_RUBRIC
-  const injectedRubric = await loadParsedRubric(cwd);
-  const prompt = buildSelfAssessmentPrompt(
-    taskContext, agents, ctx.final_assistant_text, attempts, injectedRubric, effectiveMax,
-  );
+  const prompt = await buildReflectionPrompt({
+    directory: cwd,
+    defaultsDir,
+    context: taskContext,
+    agents,
+    lastAssistantText: ctx.final_assistant_text,
+    attemptCount: attempts,
+    maxAttempts: effectiveMax,
+    goalSection: (projectGoalSection && !goal) ? projectGoalSection : undefined,
+  });
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
   let assessmentText;
