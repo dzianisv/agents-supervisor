@@ -21,6 +21,7 @@ import {
   parseSupervisorCommand,
   resolveMaxAttempts,
   resolveSupervisorMode,
+  writeProjectGoal,
 } from '../core/goal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +33,22 @@ let args = process.argv.slice(3).join(' ');
 
 // Special-case: `mode <word>` → translate to `supervisor <word>` so the
 // parser's `name==='supervisor'` branch handles mode-set correctly.
+// `mode goal` needs its own path: `supervisor goal` means "goal status" to the
+// parser, so set the mode directly instead (parity with the OpenCode surface,
+// where `/supervisor goal` with no condition also reports status).
+if (name === 'mode' && process.argv[3]?.toLowerCase() === 'goal') {
+  const sidForMode = (() => {
+    try { return fs.readFileSync(path.join(process.cwd(), '.supervisor', 'current_session'), 'utf8').trim(); }
+    catch { return process.env.CLAUDE_SESSION_ID?.trim() || null; }
+  })();
+  if (!sidForMode) {
+    console.log('No active session yet (.supervisor/current_session missing). Run something first so the Stop hook records the session, then retry.');
+    process.exit(0);
+  }
+  goalStore.setMode(process.cwd(), sidForMode, 'goal');
+  console.log(`Supervisor mode set to goal for session ${sidForMode.slice(0, 8)}… (requires an active goal condition to be set).`);
+  process.exit(0);
+}
 if (name === 'mode') {
   name = 'supervisor';
   // args is already the mode word (e.g. "reflection" or "autopilot")
@@ -104,10 +121,14 @@ switch (cmd.kind) {
   case 'goal-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     goalStore.setGoal(cwd, sid, cmd.condition);
+    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
+    // across sessions. Safe under concurrent writers — see writeProjectGoal.
+    writeProjectGoal(cwd, cmd.condition);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
-      `The supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${budget}) runs out.`
+      `The supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${budget}) runs out.\n` +
+      `Also saved to .agents/supervisor/Goal.md for reflection mode.`
     );
     break;
   }
