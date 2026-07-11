@@ -25,9 +25,11 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 
 ## Goal Loop
 
+> User-facing name is `/supervisor:set-goal` on Claude Code and `/supervisor:goal` on OpenCode — Claude Code has a native `/goal` command a bare-named skill would shadow, OpenCode doesn't. Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `goal` mode value.
+
 - A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop.
 - Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
-- Goal state is stored under `.supervisor/goals/<sessionId>.json`.
+- Goal state is stored under `.supervisor/goals/<sessionId>.json` (per-session). A separate project-level goal persists across sessions in `.agents/supervisor/Goal.md` (see `writeProjectGoal`/`extractGoalCondition` in `core/goal.mjs`), with every write also appended to `goal-history.jsonl` so concurrent writers never silently lose a condition.
 - The default goal retry budget is 16 attempts, clamped to 1-100.
 - Goal state can become active, achieved, or exhausted.
 - A goal exhausts when the attempt budget or deadline is reached.
@@ -35,9 +37,9 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 
 ## Autopilot
 
-- Autopilot is OpenCode-specific in the current README.
+- Autopilot is available on both Claude Code and OpenCode.
 - In autopilot mode the supervisor skips judge evaluation and nudges on every idle.
-- Autopilot stops when the agent calls `autopilot_exit` or the retry budget exhausts.
+- Autopilot stops when the agent calls `autopilot_exit` (OpenCode) / outputs `AUTOPILOT_EXIT` (Claude Code) or the retry budget exhausts.
 - Safety rails still include attempt budgets plus planning-loop and action-loop detection.
 - Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
 
