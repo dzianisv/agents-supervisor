@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   test:
@@ -26,7 +27,10 @@ jobs:
         run: node --experimental-strip-types --check opencode/supervisor.ts
       - name: Privacy guard — no mined data committed
         run: |
-          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v '\.example\.jsonl$'; then
+          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v -x 'evals/cases.example.jsonl'; then
             echo "ERROR: private data tracked in git"; exit 1
+          fi
+          if [ "$(wc -c < evals/cases.example.jsonl)" -gt 51200 ]; then
+            echo "ERROR: evals/cases.example.jsonl exceeds 50KB — synthetic cases only, mined data is never committed"; exit 1
           fi
           echo "OK: no private data tracked"
