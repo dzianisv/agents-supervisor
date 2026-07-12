@@ -20,6 +20,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
@@ -43,7 +45,7 @@ const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env
 const DEBUG_ENABLED = (process.env.SUPERVISOR_DEBUG ?? process.env.REFLECTION_CC_DEBUG) === '1';
 const TRANSCRIPT_MAX_BYTES = 200_000;
 const TRANSCRIPT_MAX_ENTRIES = 50;
-const ASSESSMENT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-haiku-4-5';
+const ASSESSMENT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-opus-4-8';
 const ASSESSMENT_TIMEOUT_MS = 20_000;
 // CC allows only 8 consecutive Stop-hook {decision:'block'} responses within
 // one unbroken turn before it overrides the hook and lets the turn end
@@ -350,6 +352,164 @@ export function normalizeTranscriptToMessages(transcriptTail) {
     messages.push({ info: { role }, parts });
   }
   return messages;
+}
+
+// --- Delivered-media resolution -------------------------------------------
+// The judge is a single-shot completion with no tools, so it cannot follow a
+// file path it sees in the transcript. To let it verify visible-media goals we
+// resolve delivered artifacts here and attach them as image content blocks
+// (extracting one frame for video via ffmpeg). When a file can't be inlined we
+// surface a text receipt (path + SendUserFile file_uuid + passing-test JSON)
+// so the judge can still treat delivery + pass as proof.
+const MEDIA_EXT_RE = /\.(?:png|jpe?g|gif|webp|mp4|mov)$/i;
+const IMAGE_MEDIA_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+const MEDIA_MAX_FILES = 4;
+const MEDIA_MAX_BYTES = 4 * 1024 * 1024; // per file
+const MEDIA_TOTAL_BUDGET = 12 * 1024 * 1024; // total inlined base64 source bytes
+
+/**
+ * Walk the transcript tail collecting media the agent DELIVERED or referenced:
+ * SendUserFile tool_use args (path + file_uuid receipt) and any string ending
+ * in an image/video extension. Also captures nearby passing-test evidence.
+ * @returns {{ paths: Array<{path:string,file_uuid?:string}>, receipts: Array<{path?:string,file_uuid?:string}>, testEvidence: string|null }}
+ */
+export function scanTranscriptForMedia(transcriptTail) {
+  const paths = [];
+  const seen = new Set();
+  const receipts = [];
+  let testEvidence = null;
+
+  const addPath = (p, file_uuid) => {
+    if (typeof p !== 'string') return;
+    const m = p.match(/([^\s"'`)]+\.(?:png|jpe?g|gif|webp|mp4|mov))/i);
+    const cand = m ? m[1] : (MEDIA_EXT_RE.test(p) ? p : null);
+    if (!cand) return;
+    if (!seen.has(cand)) { seen.add(cand); paths.push({ path: cand, file_uuid }); }
+    else if (file_uuid) {
+      const existing = paths.find((x) => x.path === cand);
+      if (existing && !existing.file_uuid) existing.file_uuid = file_uuid;
+    }
+  };
+
+  const scanString = (s) => {
+    if (typeof s !== 'string' || !s) return;
+    if (!testEvidence) {
+      const em = s.match(/[^\n]*\bOVERALL\b[^\n]*\bpassed\b[^\n]*\bTrue\b[^\n]*/i)
+        || s.match(/"?passed"?\s*[:=]\s*true/i);
+      if (em) testEvidence = em[0].trim().slice(0, 200);
+    }
+    const re = /([^\s"'`)]+\.(?:png|jpe?g|gif|webp|mp4|mov))/gi;
+    let mm;
+    while ((mm = re.exec(s)) !== null) addPath(mm[1]);
+  };
+
+  for (const entry of Array.isArray(transcriptTail) ? transcriptTail : []) {
+    const content = entry?.message?.content;
+    if (typeof content === 'string') { scanString(content); continue; }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block) continue;
+      if (block.type === 'text') scanString(block.text);
+      else if (block.type === 'tool_use') {
+        const input = block.input ?? {};
+        const isSend = typeof block.name === 'string' && /senduserfile|send_user_file/i.test(block.name);
+        const p = input.path ?? input.file_path ?? input.filepath ?? input.file ?? input.filename;
+        const uuid = input.file_uuid ?? input.fileUuid ?? input.uuid;
+        if (isSend) { if (p) addPath(p, uuid); receipts.push({ path: typeof p === 'string' ? p : undefined, file_uuid: uuid }); }
+        for (const v of Object.values(input)) if (typeof v === 'string') scanString(v);
+      } else if (block.type === 'tool_result') {
+        const c = block.content;
+        if (typeof c === 'string') scanString(c);
+        else if (Array.isArray(c)) for (const b of c) if (b?.type === 'text') scanString(b.text);
+      }
+    }
+  }
+  return { paths, receipts, testEvidence };
+}
+
+function safeUnlink(p) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+
+/** Extract a single frame from a video via ffmpeg → base64 png, or null. */
+export function tryExtractVideoFrame(absPath, runner) {
+  const run = runner || ((input, out) => {
+    try {
+      execFileSync('ffmpeg', ['-i', input, '-frames:v', '1', '-y', out], { stdio: 'ignore', timeout: 15_000 });
+      return true;
+    } catch { return false; }
+  });
+  const tmp = path.join(os.tmpdir(), `supervisor-frame-${process.pid}-${Date.now()}.png`);
+  try {
+    if (!run(absPath, tmp)) { safeUnlink(tmp); return null; }
+    const stat = fs.statSync(tmp);
+    if (!stat.isFile() || stat.size === 0 || stat.size > MEDIA_MAX_BYTES) { safeUnlink(tmp); return null; }
+    const data = fs.readFileSync(tmp).toString('base64');
+    safeUnlink(tmp);
+    return data;
+  } catch { safeUnlink(tmp); return null; }
+}
+
+/**
+ * Resolve delivered media to base64 image blocks (+ a text note for anything
+ * that couldn't be inlined). Pure fallback: on any error or when nothing is
+ * found, returns empty images and no note. opts.runFfmpeg injectable for tests.
+ * @returns {{ images: Array<{media_type:string,data:string}>, note: string|undefined }}
+ */
+export function collectDeliveredMedia(transcriptTail, cwd, opts = {}) {
+  let scan;
+  try { scan = scanTranscriptForMedia(transcriptTail); } catch { return { images: [], note: undefined }; }
+  const { paths, receipts, testEvidence } = scan;
+  const images = [];
+  const noteLines = [];
+  const inlinedAbs = new Set(); // resolved paths successfully attached as images
+  const processedAbs = new Set(); // resolved paths already handled (dedup)
+  let totalBytes = 0;
+
+  for (const { path: rel, file_uuid } of paths) {
+    if (images.length >= MEDIA_MAX_FILES) break;
+    const abs = path.isAbsolute(rel) ? rel : path.resolve(cwd, rel);
+    if (processedAbs.has(abs)) continue; // same file referenced twice (e.g. bare + absolute)
+    let stat;
+    try { stat = fs.statSync(abs); } catch { continue; } // not on disk — skip
+    if (!stat.isFile()) continue;
+    processedAbs.add(abs);
+    const ext = path.extname(abs).slice(1).toLowerCase();
+    const mediaType = IMAGE_MEDIA_TYPES[ext];
+    if (stat.size > MEDIA_MAX_BYTES && mediaType) {
+      noteLines.push(`- delivered image (too large to inline): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+      continue;
+    }
+    if (mediaType) {
+      if (totalBytes + stat.size > MEDIA_TOTAL_BUDGET) break;
+      try {
+        images.push({ media_type: mediaType, data: fs.readFileSync(abs).toString('base64') });
+        totalBytes += stat.size;
+        inlinedAbs.add(abs);
+      } catch { /* unreadable — skip */ }
+    } else if (ext === 'mp4' || ext === 'mov') {
+      const frame = tryExtractVideoFrame(abs, opts.runFfmpeg);
+      if (frame) { images.push({ media_type: 'image/png', data: frame }); inlinedAbs.add(abs); }
+      else noteLines.push(`- delivered video (frame extraction unavailable): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+    }
+  }
+
+  // SendUserFile receipts whose file was NOT inlined as an image still prove
+  // delivery — surface them so the judge sees delivery + pass as proof.
+  for (const r of receipts) {
+    if (!r.file_uuid && !r.path) continue;
+    const abs = r.path ? (path.isAbsolute(r.path) ? r.path : path.resolve(cwd, r.path)) : null;
+    if (abs && inlinedAbs.has(abs)) continue; // already visible to the judge as an image
+    noteLines.push(`- SendUserFile delivery receipt${r.path ? `: ${r.path}` : ''}${r.file_uuid ? ` (file_uuid=${r.file_uuid})` : ''}`);
+  }
+
+  let note;
+  if (noteLines.length || testEvidence) {
+    const parts = [];
+    if (noteLines.length) parts.push('The agent DELIVERED media the supervisor could not inline as an image:', ...noteLines);
+    if (testEvidence) parts.push(`Passing-test evidence found in transcript: ${testEvidence}`);
+    parts.push('A delivered media artifact (SendUserFile receipt / on-disk path) plus passing test results is VALID proof of a visible-media goal. Do NOT ask the agent to base64 or inline the media.');
+    note = parts.join('\n');
+  }
+  return { images, note };
 }
 
 /** Read repo signals synchronously — mirrors getRepoSignals in supervisor-impl.ts. */
@@ -711,7 +871,7 @@ async function main() {
   // is active and no session goal overrides it — folds the goal requirement
   // in as a mandatory completion criterion.
   const agents = getAgentsSync(cwd);
-  const prompt = await buildReflectionPrompt({
+  let prompt = await buildReflectionPrompt({
     directory: cwd,
     defaultsDir,
     context: taskContext,
@@ -721,6 +881,23 @@ async function main() {
     maxAttempts: effectiveMax,
     goalSection: (projectGoalSection && !goal) ? projectGoalSection : undefined,
   });
+
+  // 6.5. Resolve delivered media so the tool-less judge can SEE it. Images are
+  // attached as content blocks; anything that can't be inlined (video without
+  // ffmpeg, oversize, off-disk SendUserFile receipts) is surfaced as a text
+  // note listing the artifact + passing-test evidence. Pure fallback — any
+  // failure leaves the text-only call exactly as before.
+  let mediaImages;
+  try {
+    const media = collectDeliveredMedia(tail, cwd);
+    if (media.images.length) mediaImages = media.images;
+    if (media.note) prompt = `${prompt}\n\n## Delivered Media (supervisor-resolved)\n${media.note}`;
+    if (media.images.length || media.note) {
+      debug({ msg: 'media_resolved', images: media.images.length, hasNote: !!media.note }, cwd);
+    }
+  } catch (e) {
+    debug({ msg: 'media_collect_failed', err: String(e?.message ?? e) }, cwd);
+  }
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
   let assessmentText;
@@ -744,6 +921,7 @@ async function main() {
         model: ASSESSMENT_MODEL,
         maxTokens: 1000,
         timeoutMs: ASSESSMENT_TIMEOUT_MS,
+        images: mediaImages,
       });
       assessmentText = result.text;
     }
