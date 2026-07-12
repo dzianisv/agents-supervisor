@@ -54,6 +54,17 @@ if (cur) {
 let disabled = [];
 try { disabled = readFileSync(path.join(stateDir, 'disabled'), 'utf8').split('\n').map((l) => l.trim()).filter(Boolean); } catch { /* none */ }
 line('session disabled?', cur && disabled.includes(cur) ? 'YES (supervisor off for this session)' : 'no');
+
+// Judge reachability — written by bin/supervisor-on-stop.mjs on every
+// assessment attempt: 'ok' after a successful judge call (real or fake),
+// 'judge_unreachable' when callAnthropic threw (network/API failure).
+try {
+  const health = JSON.parse(readFileSync(path.join(stateDir, 'health.json'), 'utf8'));
+  const detail = health.status === 'judge_unreachable' && health.error ? `  (${health.error})` : '';
+  line('judge health', `${health.status ?? 'unknown'}${detail}  @ ${health.ts ?? '?'}`);
+} catch {
+  line('judge health', '(no signal yet)');
+}
 console.log();
 
 console.log('## recent verdicts');
@@ -67,7 +78,9 @@ try {
   for (const { f } of recent) {
     try {
       const v = JSON.parse(readFileSync(path.join(stateDir, f), 'utf8'));
-      console.log(`  ${v.timestamp ?? '?'}  ${v.category}  inject=${v.injected}  ${v.reason ?? ''}`.slice(0, 160));
+      // CC verdicts carry `status` (e.g. 'complete'/'in_progress'); older/
+      // opencode-shaped records may carry neither — falls back to '?'.
+      console.log(`  ${v.timestamp ?? '?'}  ${v.status ?? v.category ?? '?'}  inject=${v.injected}  ${v.reason ?? ''}`.slice(0, 160));
     } catch { /* skip */ }
   }
 } catch {

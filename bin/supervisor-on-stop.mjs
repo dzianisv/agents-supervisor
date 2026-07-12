@@ -13,9 +13,9 @@
  *
  * Public API (re-exported for unit tests):
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
- *   writeAttemptCounter, writeVerdict, sanitizeCwd, debug,
+ *   writeAttemptCounter, writeVerdict, writeHealthSignal, sanitizeCwd, debug,
  *   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
- *   endsWithTrailingQuestion
+ *   endsWithTrailingQuestion, computeTurnKey
  */
 
 import fs from 'node:fs';
@@ -44,7 +44,26 @@ const DEBUG_ENABLED = (process.env.SUPERVISOR_DEBUG ?? process.env.REFLECTION_CC
 const TRANSCRIPT_MAX_BYTES = 200_000;
 const TRANSCRIPT_MAX_ENTRIES = 50;
 const ASSESSMENT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-haiku-4-5';
-const ASSESSMENT_TIMEOUT_MS = 30_000;
+const ASSESSMENT_TIMEOUT_MS = 20_000;
+// CC allows only 8 consecutive Stop-hook {decision:'block'} responses within
+// one unbroken turn before it overrides the hook and lets the turn end
+// regardless — a 9th injection would be silently discarded. Cap one under
+// that so our own exhaustion handling (goal-exhausted, attempt-cap-reached)
+// fires deterministically instead of being pre-empted by CC. See loopGuard's
+// call site in main() for the full rationale.
+// CLAUDE_CODE_STOP_HOOK_BLOCK_CAP mirrors CC's own override threshold
+// (default 8); the hook always stays ONE UNDER it so a raised harness cap
+// keeps the same safety margin instead of colliding with it.
+const CC_BLOCK_CAP_RAW = parseInt(process.env.CLAUDE_CODE_STOP_HOOK_BLOCK_CAP ?? '8', 10);
+const HARD_CAP = Number.isFinite(CC_BLOCK_CAP_RAW) && CC_BLOCK_CAP_RAW > 1 ? CC_BLOCK_CAP_RAW - 1 : 7;
+// Stamped into every verdict record so session mining can attribute observed
+// behavior to the plugin version that produced it.
+const PLUGIN_VERSION = (() => {
+  try {
+    const manifestPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.claude-plugin', 'plugin.json');
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version ?? 'dev';
+  } catch { return 'dev'; }
+})();
 
 process.on('uncaughtException', (err) => {
   _debugRaw({ msg: 'uncaught_exception', error: String(err), stack: err?.stack });
@@ -106,7 +125,37 @@ export function endsWithTrailingQuestion(text) {
   return lines[lines.length - 1].endsWith('?');
 }
 
-export function readAttempts(session_id, cwd) {
+/**
+ * Fingerprint of the last genuine (non-supervisor-injected) user message —
+ * mirrors opencode's getLastRelevantUserMessageId/getMessageSignature. CC's
+ * normalized messages carry no message IDs/timestamps, so the key is a
+ * truncated text fingerprint of the real user turn. Used to scope the
+ * per-attempt counter to the CURRENT human turn: a new real message means a
+ * new turn_key, which resets the counter, while an autonomous
+ * (goal/autopilot) loop that never sees new human input keeps the same
+ * turn_key across many Stop events. Returns null when no genuine user
+ * message is found (e.g. empty/unreadable transcript) — callers must treat
+ * null as "unknown" and skip turn-key-based reset/dedup rather than forcing
+ * a reset.
+ * @param {Array} normalizedMessages
+ * @returns {string|null}
+ */
+export function computeTurnKey(normalizedMessages) {
+  const messages = Array.isArray(normalizedMessages) ? normalizedMessages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.info?.role !== 'user') continue;
+    for (const part of msg.parts ?? []) {
+      if (part?.type !== 'text' || typeof part.text !== 'string') continue;
+      if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
+      const trimmed = part.text.trim();
+      if (trimmed) return trimmed.slice(0, 300);
+    }
+  }
+  return null;
+}
+
+export function readAttempts(session_id, cwd, turnKey) {
   const file = path.join(cwd, STATE_DIR, `${session_id}_attempts.json`);
   let raw;
   try {
@@ -116,6 +165,11 @@ export function readAttempts(session_id, cwd) {
   }
   try {
     const parsed = JSON.parse(raw);
+    if (turnKey != null && parsed.turn_key != null && parsed.turn_key !== turnKey) {
+      // A new real user message means a new turn — the persisted count
+      // belongs to a prior turn's escalation and does not carry over.
+      return 0;
+    }
     return typeof parsed.count === 'number' ? parsed.count : 0;
   } catch {
     debug({ msg: 'attempts_file_corrupt', file }, cwd);
@@ -123,20 +177,28 @@ export function readAttempts(session_id, cwd) {
   }
 }
 
-export function writeAttemptCounter(session_id, n, cwd) {
+export function writeAttemptCounter(session_id, n, cwd, turnKey) {
   const dir = path.join(cwd, STATE_DIR);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${session_id}_attempts.json`);
   let existingCount = 0;
+  let existingTurnKey;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (typeof parsed.count === 'number') existingCount = parsed.count;
+    existingTurnKey = parsed.turn_key;
   } catch {
     /* missing or corrupt — treat as 0 */
   }
-  if (n <= existingCount) return;
+  // A new turn means the previous count doesn't apply — the monotonic dedup
+  // guard below must not compare against a stale count from an earlier human
+  // turn, or the new turn's first write would be silently dropped.
+  const turnChanged = turnKey != null && existingTurnKey != null && existingTurnKey !== turnKey;
+  if (!turnChanged && n <= existingCount) return;
   const tmp = path.join(dir, `${session_id}_attempts.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify({ count: n, last_iso: new Date().toISOString() }), 'utf8');
+  const record = { count: n, last_iso: new Date().toISOString() };
+  if (turnKey != null) record.turn_key = turnKey;
+  fs.writeFileSync(tmp, JSON.stringify(record), 'utf8');
   fs.renameSync(tmp, file);
 }
 
@@ -144,6 +206,22 @@ export function writeVerdict(session_id, verdictObj, cwd) {
   const dir = path.join(cwd, STATE_DIR);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, `verdict_${session_id}.json`), JSON.stringify(verdictObj, null, 2), 'utf8');
+}
+
+/**
+ * Best-effort judge-reachability signal, surfaced by bin/status.mjs. Never
+ * throws — a health-signal write failure must not crash the hook.
+ */
+export function writeHealthSignal(cwd, obj) {
+  const dir = path.join(cwd, STATE_DIR);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `health.${process.pid}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    fs.renameSync(tmp, path.join(dir, 'health.json'));
+  } catch {
+    /* best-effort observability only */
+  }
 }
 
 export function readTranscriptTail(filePath, maxBytes = TRANSCRIPT_MAX_BYTES) {
@@ -476,10 +554,18 @@ async function main() {
     process.exit(0);
   }
 
-  // 1. Loop guard — must run first.
+  // 1. Stop-hook re-invocation marker — logged only, never an exit gate. CC
+  // sets stop_hook_active=true on every Stop event that follows a prior
+  // {decision:'block'} in the same chain, i.e. on essentially every injected
+  // round-trip. Treating it as an unconditional early-exit (the old
+  // behavior) meant the escalation budget below was unreachable past
+  // attempt 1 in real usage — the second Stop event of any blocked chain
+  // always sees stop_hook_active=true and stood down before ever checking
+  // the attempt counter. The turn-scoped attempt counter (below), hard
+  // capped at min(effectiveMax, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP), is now the
+  // sole continuation gate.
   if (loopGuard(payload)) {
-    debug({ msg: 'loop_guard_triggered', session_id: payload.session_id }, payload.cwd);
-    process.exit(0);
+    debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, payload.cwd);
   }
 
   const { session_id, transcript_path } = payload;
@@ -498,7 +584,15 @@ async function main() {
     }
   } catch { /* not disabled */ }
 
-  // 2. Attempt cap.
+  // 2. Cheap, non-polling transcript read — just enough to compute the
+  // per-turn key (fingerprint of the last real, non-supervisor-injected user
+  // message) before the attempt-cap check below. Deliberately kept separate
+  // from the flush-poll read (step 4): a session that's already at its cap
+  // still fast-exits here without paying the poll's up-to-1s latency.
+  const earlyTail = transcript_path ? readTranscriptTail(transcript_path) : [];
+  const turnKey = computeTurnKey(normalizeTranscriptToMessages(earlyTail));
+
+  // 3. Attempt cap.
   // Goal loop: if a goal is active, raise the retry budget.
   // All goal logic is best-effort — any failure falls back to default.
   let goal = null;
@@ -524,6 +618,14 @@ async function main() {
     try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
+  // Universal per-turn ceiling — see HARD_CAP's definition for the full
+  // rationale. This intentionally tightens autopilot/goal's higher session
+  // budget (default 16) during any single unbroken turn: by design, since
+  // CC's own override already made anything beyond ~8 unreachable in
+  // practice, so this just makes our own exhaustion bookkeeping fire
+  // deterministically instead of being silently pre-empted by CC.
+  effectiveMax = Math.min(effectiveMax, HARD_CAP);
+
   // Project-level goal: in reflection mode, read .agents/supervisor/Goal.md
   let projectGoalSection = '';
   const effectiveMode = resolveSupervisorMode(goalState);
@@ -538,7 +640,7 @@ async function main() {
     }
   }
 
-  const attempts = readAttempts(session_id, cwd);
+  const attempts = readAttempts(session_id, cwd, turnKey);
   if (attempts >= effectiveMax) {
     if (goal) {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: { ...goal, status: 'exhausted' } }); } catch { /* */ }
@@ -551,8 +653,8 @@ async function main() {
     process.exit(0);
   }
 
-  // 3. Transcript tail (poll for flush).
-  let tail = transcript_path ? readTranscriptTail(transcript_path) : [];
+  // 4. Transcript tail (poll for flush).
+  let tail = earlyTail;
   let ctx = buildStopContext(payload, tail);
   const FLUSH_POLL_MS = 100;
   const FLUSH_POLL_MAX = 10;
@@ -566,10 +668,10 @@ async function main() {
     process.exit(0);
   }
 
-  // 3a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
+  // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
   // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
   if (mode === 'autopilot' && !goal) {
-    const baseVerdict = { session_id, timestamp: new Date().toISOString() };
+    const baseVerdict = { session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION };
     if (/(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text)) {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
       writeVerdict(session_id, { ...baseVerdict, autopilot: 'exited' }, cwd);
@@ -577,7 +679,7 @@ async function main() {
       process.exit(0);
     }
     const nextAttempt = attempts + 1;
-    writeAttemptCounter(session_id, nextAttempt, cwd);
+    writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
@@ -585,7 +687,7 @@ async function main() {
     process.exit(0);
   }
 
-  // 3b. Pre-judge guard: a trailing question to the user is a strong signal
+  // 4b. Pre-judge guard: a trailing question to the user is a strong signal
   // the correct status is waiting_for_user — forcing a continuation over an
   // open question would recreate the exact "ignore the human" pattern this
   // supervisor exists to prevent, so skip the judge entirely rather than
@@ -595,7 +697,7 @@ async function main() {
     process.exit(0);
   }
 
-  // 4. Build task context from transcript (shared assessment pipeline).
+  // 5. Build task context from transcript (shared assessment pipeline).
   const normalizedMessages = normalizeTranscriptToMessages(tail);
   const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
   if (!taskContext) {
@@ -603,7 +705,7 @@ async function main() {
     process.exit(0);
   }
 
-  // 5. Self-assessment via shared pipeline (same builder OpenCode uses):
+  // 6. Self-assessment via shared pipeline (same builder OpenCode uses):
   // reads .agents/supervisor/{SystemPrompt,Patterns,User,Goal}.md (falling
   // back to this plugin's shipped defaults), and — if a project-level goal
   // is active and no session goal overrides it — folds the goal requirement
@@ -622,15 +724,20 @@ async function main() {
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
   let assessmentText;
-  if (fakeJudge) {
-    const [category = 'summary_drift_stop'] = fakeJudge.split(':');
-    // Test-only escape hatch: exercises the parse-failure fail-open path
-    // (Fix A.2) without needing a live judge call to actually return garbage.
-    assessmentText = category === 'PARSE_ERROR'
-      ? 'not valid json at all'
-      : JSON.stringify(buildFakeAssessment(taskContext, category));
-  } else {
-    try {
+  try {
+    if (fakeJudge) {
+      const [category = 'summary_drift_stop'] = fakeJudge.split(':');
+      // Test-only escape hatch: exercises the judge_unreachable health-signal
+      // path (Fix C.4) without needing a live judge call to actually fail.
+      if (category === 'JUDGE_UNREACHABLE') {
+        throw new Error('simulated judge-unreachable failure (test-only)');
+      }
+      // Test-only escape hatch: exercises the parse-failure fail-open path
+      // (Fix A.2) without needing a live judge call to actually return garbage.
+      assessmentText = category === 'PARSE_ERROR'
+        ? 'not valid json at all'
+        : JSON.stringify(buildFakeAssessment(taskContext, category));
+    } else {
       const result = await callAnthropic({
         prompt,
         system: 'You are a precise workflow completion evaluator. Output JSON only.',
@@ -639,10 +746,12 @@ async function main() {
         timeoutMs: ASSESSMENT_TIMEOUT_MS,
       });
       assessmentText = result.text;
-    } catch (e) {
-      debug({ msg: 'assessment_threw', err: String(e?.message ?? e) }, cwd);
-      process.exit(0);
     }
+    writeHealthSignal(cwd, { status: 'ok', ts: new Date().toISOString() });
+  } catch (e) {
+    debug({ msg: 'assessment_threw', err: String(e?.message ?? e) }, cwd);
+    writeHealthSignal(cwd, { status: 'judge_unreachable', error: String(e?.message ?? e), ts: new Date().toISOString() });
+    process.exit(0);
   }
 
   const assessment = parseSelfAssessmentJson(assessmentText);
@@ -658,6 +767,7 @@ async function main() {
   const nextAttempt = attempts + 1;
   const verdictRecord = {
     session_id, attempt: nextAttempt, timestamp: new Date().toISOString(), injected: false,
+    plugin_version: PLUGIN_VERSION,
     status: assessment?.status ?? 'in_progress', confidence: assessment?.confidence ?? 0.5,
     complete: analysis.complete, severity: analysis.severity, reason: analysis.reason,
   };
@@ -702,7 +812,7 @@ async function main() {
     if (!analysis.requiresHumanAction) {
       const feedbackMsg = buildAnalysisFeedback();
       const msg = `Goal not yet met: "${goal.condition}". ${feedbackMsg}`;
-      writeAttemptCounter(session_id, nextAttempt, cwd);
+      writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
@@ -722,7 +832,7 @@ async function main() {
   // 6b. Normal (no goal) inject decision.
   if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction) {
     const feedbackMsg = buildAnalysisFeedback();
-    writeAttemptCounter(session_id, nextAttempt, cwd);
+    writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     verdictRecord.injected = true;
     verdictRecord.feedback_reason = 'assessment_continue';
     writeVerdict(session_id, verdictRecord, cwd);

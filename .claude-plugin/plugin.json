@@ -1,7 +1,7 @@
 {
   "name": "supervisor",
   "displayName": "Supervisor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Catches premature agent stops and re-prompts the agent to finish — a dataset-backed Stop-hook supervisor. /supervisor:train learns from your sessions and updates your local patterns.",
   "author": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
   "repository": "https://github.com/dzianisv/agents-supervisor",

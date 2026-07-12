@@ -1,15 +1,1 @@
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/bin/supervisor-on-stop.mjs\"",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
-}
+{}

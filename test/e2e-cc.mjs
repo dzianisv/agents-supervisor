@@ -94,13 +94,41 @@ check('complete → no inject, clean exit, no stdout', () => {
   assert.ok(!verdict || verdict.injected === false);
 });
 
-check('loop guard (stop_hook_active) → no-op, no stdout', () => {
+check('stop_hook_active alone no longer suppresses supervision (per-turn counter is the gate)', () => {
   const { dir, tp } = mkSession(driftTurns);
   const payload = { session_id: 'e2e-loop', cwd: dir, transcript_path: tp,
-    stop_hook_active: true, last_assistant_message: 'x' };
+    stop_hook_active: true, last_assistant_message: driftTurns[1].message.content[1].text };
   const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
   assert.equal(code, 0);
-  assert.equal(stdout, '');
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block', 'the second Stop of a blocked chain must still be supervised');
+});
+
+check('per-turn injection cap: attempts at cap for the same turn → no inject', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const stateDir = path.join(dir, '.supervisor');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'e2e-cap_attempts.json'),
+    JSON.stringify({ count: 7, last_iso: new Date().toISOString(), turn_key: driftTurns[0].message.content }));
+  const payload = { session_id: 'e2e-cap', cwd: dir, transcript_path: tp,
+    stop_hook_active: true, last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'at the per-turn cap the hook must stand down');
+});
+
+check('new user turn resets the budget: stale turn_key at cap → still injects', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const stateDir = path.join(dir, '.supervisor');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'e2e-reset_attempts.json'),
+    JSON.stringify({ count: 7, last_iso: new Date().toISOString(), turn_key: 'a previous, different user turn' }));
+  const payload = { session_id: 'e2e-reset', cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block', 'a new real user message must reset the per-turn budget');
 });
 
 check('parse failure (fail-open) → no inject, no verdict written', () => {
