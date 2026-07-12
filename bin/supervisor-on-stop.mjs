@@ -667,7 +667,7 @@ async function main() {
     return buildEscalatingFeedback(
       nextAttempt,
       analysis.severity,
-      { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason },
+      { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason, confidence: assessment?.confidence },
       false,
       false,
       effectiveMax,
