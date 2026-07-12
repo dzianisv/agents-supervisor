@@ -103,6 +103,34 @@ check('loop guard (stop_hook_active) → no-op, no stdout', () => {
   assert.equal(stdout, '');
 });
 
+check('parse failure (fail-open) → no inject, no verdict written', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const payload = { session_id: 'e2e-parse-fail', cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout, verdict } = runHook(payload, LIVE ? {} : { SUPERVISOR_FAKE_JUDGE: 'PARSE_ERROR' });
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'a garbled judge response must never inject');
+  assert.equal(verdict, null, 'fail-open exits before any verdict is written');
+});
+
+check('trailing question in final message → waiting_for_user guard, no inject, judge never invoked', () => {
+  const questionTurns = [
+    { type: 'user', message: { role: 'user', content: 'add a /health endpoint' } },
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'Edit', input: {} },
+      { type: 'text', text: 'I added the route. Want me to also wire up monitoring for it?' },
+    ] } },
+  ];
+  const { dir, tp } = mkSession(questionTurns);
+  const payload = { session_id: 'e2e-trailing-q', cwd: dir, transcript_path: tp,
+    last_assistant_message: questionTurns[1].message.content[1].text };
+  // Fake-judge env is set but must never be consulted — the guard exits first.
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'a trailing question must never be pushed past');
+  assert.equal(verdict, null, 'guard exits before the assessment pipeline runs');
+});
+
 check('attempt cap → stops injecting after max attempts', () => {
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-cap';

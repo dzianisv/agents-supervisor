@@ -25,6 +25,8 @@ export function buildSubagentExemptionRule(patterns) {
 
 // Fallback only — canonical source is .agents/supervisor/Patterns.md; keep in sync.
 const STATIC_RUBRIC = `## Patterns
+- HEURISTICS, NOT REQUIREMENTS: the "Required checks"/detected-signals list in Task Context and the rules below are heuristics that inform your judgment — they never override what the transcript actually shows the user asked for or agreed to.
+- DECLINED WORK ISN'T REMAINING WORK: if the user explicitly declined an action or said the task is fine as-is ("no", "don't bother", "skip that", "that's fine", "not now"), do not list that action in remaining_work, next_steps, or needs_user_action.
 - If coding work is complete, confirm tests ran after the latest changes and passed.
 - If local tests are required, provide the exact commands run in this session.
 - If PR exists, verify CI checks and report status.
@@ -43,6 +45,7 @@ PREMATURE-STOP ANTIPATTERNS (mined from 284 real agent stops where the user repl
 - VERIFICATION-DEFERRAL: agent wrote/edited code (write/edit tool calls in tool commands) but the response ends without running tests, build, or lint — and the task requires verification. Run verification before stopping. Set status "in_progress" with "run tests/build" in remaining_work.
 - FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a feature/system" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
 - LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) -> status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) -> status "complete"; do not invent missing work.
+- TRAILING QUESTION (do NOT flag as in_progress): if the agent's final message asks the user a question or presents options ("Want me to...?", "Should I...?", "Which approach do you prefer?"), the correct status is "waiting_for_user", not "in_progress" — an open question is not remaining work to push through.
 - SEVERITY/STUCK: a single recoverable technical snag mid-task (knows the fix) is not "stuck". But a policy/process violation — pushing to main when a PR was required, skipping mandated tests — is a real failure: status "in_progress" with the corrective action in remaining_work, never "complete".`
 
 function buildDefaultRubric() {
@@ -120,7 +123,7 @@ Analyze the task context, the agent's last response, and the tool signals to det
 - Summary: ${safeContext.taskSummary}
 - Type: ${safeContext.taskType}
 - Mode: ${safeContext.agentMode}
-- Required checks: ${requirements.join('; ')}
+- Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
 - Detected signals: ${signalSummary}
 
 ## Tool Commands Run

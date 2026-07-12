@@ -8,6 +8,7 @@ import {
   loopGuard, sanitizeCwd, readAttempts, writeAttemptCounter,
   writeVerdict, readTranscriptTail, buildStopContext,
   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
+  endsWithTrailingQuestion,
 } from '../bin/supervisor-on-stop.mjs';
 
 // Project root — used by new tests that must not write to /tmp.
@@ -22,6 +23,21 @@ test('loopGuard fires only when stop_hook_active', () => {
   assert.equal(loopGuard({ stop_hook_active: true }), true);
   assert.equal(loopGuard({ stop_hook_active: false }), false);
   assert.equal(loopGuard({}), false);
+});
+
+test('endsWithTrailingQuestion: true when last non-empty line ends in ?', () => {
+  assert.equal(endsWithTrailingQuestion('I fixed the bug.\n\nWant me to also add a test?'), true);
+  assert.equal(endsWithTrailingQuestion('Should I proceed?'), true);
+  assert.equal(endsWithTrailingQuestion('Which approach do you prefer?\n'), true, 'trailing blank line ignored');
+});
+
+test('endsWithTrailingQuestion: false for statements, non-strings, and empty input', () => {
+  assert.equal(endsWithTrailingQuestion('I fixed the bug and ran the tests.'), false);
+  assert.equal(endsWithTrailingQuestion('Is this right? Yes, it is.'), false, 'question not in final line');
+  assert.equal(endsWithTrailingQuestion(''), false);
+  assert.equal(endsWithTrailingQuestion(undefined), false);
+  assert.equal(endsWithTrailingQuestion(null), false);
+  assert.equal(endsWithTrailingQuestion(42), false);
 });
 
 test('sanitizeCwd rejects relative / traversal paths', () => {

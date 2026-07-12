@@ -14,7 +14,8 @@
  * Public API (re-exported for unit tests):
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
  *   writeAttemptCounter, writeVerdict, sanitizeCwd, debug,
- *   normalizeTranscriptToMessages, buildTaskContextFromTranscript
+ *   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
+ *   endsWithTrailingQuestion
  */
 
 import fs from 'node:fs';
@@ -89,6 +90,20 @@ export function sanitizeCwd(cwd) {
 
 export function loopGuard(stopPayload) {
   return stopPayload?.stop_hook_active === true;
+}
+
+/**
+ * True when the agent's final message is a genuine question to the user
+ * (its last non-empty line ends in '?'). Forcing a continuation over an open
+ * question recreates the "ignore the human" pattern this supervisor exists
+ * to catch — a trailing question means the correct status is
+ * waiting_for_user, so callers should skip the judge entirely.
+ */
+export function endsWithTrailingQuestion(text) {
+  if (typeof text !== 'string') return false;
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines[lines.length - 1].endsWith('?');
 }
 
 export function readAttempts(session_id, cwd) {
@@ -570,6 +585,16 @@ async function main() {
     process.exit(0);
   }
 
+  // 3b. Pre-judge guard: a trailing question to the user is a strong signal
+  // the correct status is waiting_for_user — forcing a continuation over an
+  // open question would recreate the exact "ignore the human" pattern this
+  // supervisor exists to prevent, so skip the judge entirely rather than
+  // risk a heuristic gate overriding it downstream.
+  if (endsWithTrailingQuestion(ctx.final_assistant_text)) {
+    debug({ msg: 'trailing_question_guard', session_id }, cwd);
+    process.exit(0);
+  }
+
   // 4. Build task context from transcript (shared assessment pipeline).
   const normalizedMessages = normalizeTranscriptToMessages(tail);
   const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
@@ -599,7 +624,11 @@ async function main() {
   let assessmentText;
   if (fakeJudge) {
     const [category = 'summary_drift_stop'] = fakeJudge.split(':');
-    assessmentText = JSON.stringify(buildFakeAssessment(taskContext, category));
+    // Test-only escape hatch: exercises the parse-failure fail-open path
+    // (Fix A.2) without needing a live judge call to actually return garbage.
+    assessmentText = category === 'PARSE_ERROR'
+      ? 'not valid json at all'
+      : JSON.stringify(buildFakeAssessment(taskContext, category));
   } else {
     try {
       const result = await callAnthropic({
@@ -617,21 +646,14 @@ async function main() {
   }
 
   const assessment = parseSelfAssessmentJson(assessmentText);
-  const analysis = assessment
-    ? evaluateSelfAssessment(assessment, taskContext)
-    : {
-        complete: false,
-        shouldContinue: true,
-        reason: 'Failed to parse self-assessment',
-        missing: [],
-        nextActions: [],
-        requiresHumanAction: false,
-        severity: 'MEDIUM',
-      };
   if (!assessment) {
+    // Fail-open: a garbage/unparseable judge response is not evidence the
+    // task is incomplete. Do not inject — just record why and stop.
     debug({ msg: 'assessment_parse_failed', session_id, raw: (assessmentText ?? '').slice(0, 200) }, cwd);
+    process.exit(0);
   }
-  debug({ msg: 'assessment', complete: analysis.complete, severity: analysis.severity, status: assessment?.status }, cwd);
+  const analysis = evaluateSelfAssessment(assessment, taskContext);
+  debug({ msg: 'assessment', complete: analysis.complete, severity: analysis.severity, status: assessment.status }, cwd);
 
   const nextAttempt = attempts + 1;
   const verdictRecord = {

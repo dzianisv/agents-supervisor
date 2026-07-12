@@ -7,7 +7,7 @@ Analyze the task context, the agent's last response, and the tool signals to det
 - Summary: {{taskSummary}}
 - Type: {{taskType}}
 - Mode: {{agentMode}}
-- Required checks: {{requirements}}
+- Heuristic signals (repo checks; informative, not binding): {{requirements}}
 - Detected signals: {{signals}}
 
 ## Tool Commands Run
