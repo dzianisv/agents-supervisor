@@ -8,7 +8,9 @@ import {
   loopGuard, sanitizeCwd, readAttempts, writeAttemptCounter,
   writeVerdict, readTranscriptTail, buildStopContext,
   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
+  endsWithTrailingQuestion, computeTurnKey,
 } from '../bin/supervisor-on-stop.mjs';
+import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
 
 // Project root — used by new tests that must not write to /tmp.
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -22,6 +24,21 @@ test('loopGuard fires only when stop_hook_active', () => {
   assert.equal(loopGuard({ stop_hook_active: true }), true);
   assert.equal(loopGuard({ stop_hook_active: false }), false);
   assert.equal(loopGuard({}), false);
+});
+
+test('endsWithTrailingQuestion: true when last non-empty line ends in ?', () => {
+  assert.equal(endsWithTrailingQuestion('I fixed the bug.\n\nWant me to also add a test?'), true);
+  assert.equal(endsWithTrailingQuestion('Should I proceed?'), true);
+  assert.equal(endsWithTrailingQuestion('Which approach do you prefer?\n'), true, 'trailing blank line ignored');
+});
+
+test('endsWithTrailingQuestion: false for statements, non-strings, and empty input', () => {
+  assert.equal(endsWithTrailingQuestion('I fixed the bug and ran the tests.'), false);
+  assert.equal(endsWithTrailingQuestion('Is this right? Yes, it is.'), false, 'question not in final line');
+  assert.equal(endsWithTrailingQuestion(''), false);
+  assert.equal(endsWithTrailingQuestion(undefined), false);
+  assert.equal(endsWithTrailingQuestion(null), false);
+  assert.equal(endsWithTrailingQuestion(42), false);
 });
 
 test('sanitizeCwd rejects relative / traversal paths', () => {
@@ -40,6 +57,71 @@ test('attempt counter: round-trips and is monotonic', () => {
   assert.equal(readAttempts('s1', d), 2);
   writeAttemptCounter('s1', 3, d);
   assert.equal(readAttempts('s1', d), 3);
+});
+
+// ---------------------------------------------------------------------------
+// computeTurnKey + turn-scoped attempt counter (Fix C.1)
+// ---------------------------------------------------------------------------
+
+test('computeTurnKey: fingerprints the last real (non-supervisor) user message', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'fix the bug' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
+  ]);
+  assert.equal(computeTurnKey(msgs), 'fix the bug');
+});
+
+test('computeTurnKey: skips supervisor-injected feedback text, uses the real message underneath', () => {
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'user', message: { role: 'user', content: 'fix the bug' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'working on it' }] } },
+    { type: 'user', message: { role: 'user', content: `${FEEDBACK_MARKER} Task Incomplete\nsome injected text` } },
+  ]);
+  assert.equal(computeTurnKey(msgs), 'fix the bug');
+});
+
+test('computeTurnKey: null when no genuine user message is present', () => {
+  assert.equal(computeTurnKey([]), null);
+  const msgs = normalizeTranscriptToMessages([
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } },
+  ]);
+  assert.equal(computeTurnKey(msgs), null);
+});
+
+test('computeTurnKey: truncates to 300 chars', () => {
+  const long = 'x'.repeat(500);
+  const msgs = normalizeTranscriptToMessages([{ type: 'user', message: { role: 'user', content: long } }]);
+  assert.equal(computeTurnKey(msgs).length, 300);
+});
+
+test('turn-scoped attempt counter: persists across the same turn_key, resets on a new one', () => {
+  const d = mkcwd();
+  writeAttemptCounter('s5', 1, d, 'turn-A');
+  writeAttemptCounter('s5', 2, d, 'turn-A');
+  assert.equal(readAttempts('s5', d, 'turn-A'), 2, 'same turn_key: counter persists');
+  assert.equal(readAttempts('s5', d, 'turn-B'), 0, 'new turn_key: counter resets to 0');
+});
+
+test('writeAttemptCounter: a new turn\'s first write is never dropped by the monotonic dedup guard', () => {
+  const d = mkcwd();
+  writeAttemptCounter('s6', 5, d, 'turn-A');
+  assert.equal(readAttempts('s6', d, 'turn-A'), 5);
+  writeAttemptCounter('s6', 1, d, 'turn-B');
+  assert.equal(readAttempts('s6', d, 'turn-B'), 1, "new turn's first write must not be dropped");
+});
+
+test('turn-key param omitted: behaves exactly as before (backward compat)', () => {
+  const d = mkcwd();
+  writeAttemptCounter('s7', 2, d);
+  assert.equal(readAttempts('s7', d), 2);
+  writeAttemptCounter('s7', 1, d);
+  assert.equal(readAttempts('s7', d), 2);
+});
+
+test('readAttempts: turnKey passed against a file with no turn_key on disk is treated as same-turn (no spurious reset)', () => {
+  const d = mkcwd();
+  writeAttemptCounter('s8', 2, d);
+  assert.equal(readAttempts('s8', d, 'turn-X'), 2, 'missing turn_key on disk must not be treated as a turn change');
 });
 
 test('writeVerdict writes parseable json under .supervisor/', () => {

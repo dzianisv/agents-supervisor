@@ -1907,7 +1907,8 @@ Continue now.`
           {
             feedback: analysis.reason || "Task incomplete",
             missing: analysis.missing,
-            next_actions: analysis.nextActions
+            next_actions: analysis.nextActions,
+            confidence: parsedAssessment?.confidence
           },
           usePlanningLoopMessage,
           actionLoopCheck.detected,

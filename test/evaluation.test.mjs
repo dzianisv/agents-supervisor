@@ -1,0 +1,220 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { evaluateSelfAssessment } from '../core/evaluation.mjs';
+
+// ---------------------------------------------------------------------------
+// evaluateSelfAssessment — decision-table coverage.
+//
+// Policy under test (Fix A): the judge's reported `status` decides; the
+// deterministic requires* gates only INFORM the outcome (populate
+// missing/nextActions for visibility) and must never override a judge
+// verdict of waiting_for_user, nor flip a confident `complete` back to
+// "continue". Only in_progress/blocked/stuck (or low-confidence `complete`)
+// may produce shouldContinue=true, and only when a concrete actionable item
+// remains — with a SPECIFIC reason, never the old generic
+// "Missing required workflow steps".
+// ---------------------------------------------------------------------------
+
+function baseContext(overrides = {}) {
+  return {
+    taskSummary: 'do the thing',
+    taskType: 'coding',
+    agentMode: 'build',
+    humanMessages: ['do the thing'],
+    toolsSummary: '(none)',
+    detectedSignals: [],
+    recentCommands: [],
+    pushedToDefaultBranch: false,
+    requiresTests: false,
+    requiresBuild: false,
+    requiresPR: false,
+    requiresCI: false,
+    requiresLocalTests: false,
+    requiresLocalTestsEvidence: false,
+    ...overrides,
+  };
+}
+
+// (a) waiting_for_user never injects, even with every requires* gate unmet.
+test('waiting_for_user: never continues even with all requires* gates unmet', () => {
+  const assessment = {
+    status: 'waiting_for_user',
+    confidence: 0.9,
+    remaining_work: [],
+    next_steps: [],
+    needs_user_action: ['Need the user to provide an OAuth token'],
+    evidence: {},
+  };
+  const context = baseContext({ requiresTests: true, requiresBuild: true, requiresPR: true, requiresCI: true });
+  const result = evaluateSelfAssessment(assessment, context);
+  assert.equal(result.complete, false);
+  assert.equal(result.shouldContinue, false, 'waiting_for_user must never continue');
+  assert.equal(result.requiresHumanAction, true);
+  assert.match(result.reason, /OAuth token/);
+});
+
+test('waiting_for_user: unconditional — wins even when needs_user_action text has no human-only keyword', () => {
+  // isHumanOnlyAction's keyword heuristic would NOT flag "check the deploy logs"
+  // as human-only, but a judge-reported waiting_for_user status must still win.
+  const assessment = {
+    status: 'waiting_for_user',
+    confidence: 0.9,
+    remaining_work: [],
+    next_steps: [],
+    needs_user_action: ['Please check the deploy logs and confirm'],
+    evidence: {},
+  };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.requiresHumanAction, true);
+});
+
+// (b) complete @ confidence >= 0.6 never continues; unmet gates become an
+// informational note only, never flipping the decision.
+test('complete @ confidence >= 0.6: never continues, unmet gates become an informational note', () => {
+  const assessment = {
+    status: 'complete',
+    confidence: 0.65,
+    remaining_work: [],
+    next_steps: [],
+    needs_user_action: [],
+    evidence: { tests: {}, build: {}, pr: {} },
+  };
+  const context = baseContext({ requiresTests: true });
+  const result = evaluateSelfAssessment(assessment, context);
+  assert.equal(result.complete, true);
+  assert.equal(result.shouldContinue, false);
+  assert.match(result.reason, /heuristic note/i);
+  assert.match(result.reason, /Run tests/);
+});
+
+test('complete @ confidence exactly 0.6 boundary: still treated as confident complete', () => {
+  const assessment = { status: 'complete', confidence: 0.6, remaining_work: [], next_steps: [], needs_user_action: [] };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.complete, true);
+  assert.equal(result.shouldContinue, false);
+});
+
+test('complete with no unmet gates: reason has no heuristic-note suffix', () => {
+  const assessment = { status: 'complete', confidence: 0.95, remaining_work: [], next_steps: [], needs_user_action: [] };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.complete, true);
+  assert.doesNotMatch(result.reason, /heuristic note/i);
+});
+
+// (c) in_progress with a concrete remaining_work item: continues with a
+// SPECIFIC reason — never the old generic "Missing required workflow steps".
+test('in_progress with concrete remaining_work: continues with the SPECIFIC item as reason', () => {
+  const assessment = {
+    status: 'in_progress',
+    confidence: 0.9,
+    remaining_work: ['Wire the new endpoint into the router'],
+    next_steps: [],
+    needs_user_action: [],
+  };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.shouldContinue, true);
+  assert.equal(result.reason, 'Wire the new endpoint into the router');
+  assert.notEqual(result.reason, 'Missing required workflow steps');
+});
+
+test('in_progress with only next_steps (no remaining_work): still gets a specific reason', () => {
+  const assessment = {
+    status: 'in_progress',
+    confidence: 0.9,
+    remaining_work: [],
+    next_steps: ['Run the linter and fix warnings'],
+    needs_user_action: [],
+  };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.shouldContinue, true);
+  assert.equal(result.reason, 'Run the linter and fix warnings');
+});
+
+// (d) in_progress / blocked / stuck with NO concrete actionable items: does
+// not continue (nothing left to name), and is not marked complete.
+test('in_progress with no actionable items at all: does not continue, not complete', () => {
+  const assessment = { status: 'in_progress', confidence: 0.9, remaining_work: [], next_steps: [], needs_user_action: [] };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.complete, false);
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.reason, 'Task not confirmed complete');
+});
+
+test('blocked status with no actionable items: does not continue', () => {
+  const assessment = { status: 'blocked', confidence: 0.8, remaining_work: [], next_steps: [], needs_user_action: [] };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.shouldContinue, false);
+});
+
+// (e) low-confidence "complete": not trusted as complete; behaves like bucket 3.
+test('complete @ low confidence with no actionable items: not complete, does not continue, distinct reason', () => {
+  const assessment = { status: 'complete', confidence: 0.3, remaining_work: [], next_steps: [], needs_user_action: [] };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.complete, false, 'low-confidence complete must not be trusted');
+  assert.equal(result.shouldContinue, false);
+  assert.match(result.reason, /low confidence/i);
+});
+
+test('complete @ low confidence WITH concrete remaining_work: continues with the specific item', () => {
+  const assessment = {
+    status: 'complete',
+    confidence: 0.3,
+    remaining_work: ['Verify the migration ran in production'],
+    next_steps: [],
+    needs_user_action: [],
+  };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.complete, false);
+  assert.equal(result.shouldContinue, true);
+  assert.equal(result.reason, 'Verify the migration ran in production');
+});
+
+// (f) human-only needs_user_action (keyword-detected), with NO other
+// actionable work: pure human block — requiresHumanAction, no continue.
+test('in_progress with only a human-only need_user_action item and nothing else actionable: requiresHumanAction, no continue', () => {
+  const assessment = {
+    status: 'in_progress',
+    confidence: 0.9,
+    remaining_work: [],
+    next_steps: [],
+    needs_user_action: ['Need the user to approve access to the production database'],
+  };
+  const result = evaluateSelfAssessment(assessment, baseContext());
+  assert.equal(result.requiresHumanAction, true);
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.complete, false);
+});
+
+// Mixed case: a human-only need coexists with a separate agent-actionable gate
+// (e.g. requiresTests unmet). shouldContinue reflects the actionable item;
+// requiresHumanAction independently reflects the human-only signal — callers
+// (the CC hook's `!requiresHumanAction` inject-gate; opencode's
+// `requiresHumanAction && !shouldContinue` early-return) combine both flags
+// themselves, so evaluateSelfAssessment must report them independently rather
+// than let one silently overwrite the other.
+test('mixed: human-only need_user_action PLUS an unmet requires* gate — both flags reported independently', () => {
+  const assessment = {
+    status: 'in_progress',
+    confidence: 0.9,
+    remaining_work: [],
+    next_steps: [],
+    needs_user_action: ['Need the user to approve access to the production database'],
+    evidence: { tests: {} },
+  };
+  const context = baseContext({ requiresTests: true });
+  const result = evaluateSelfAssessment(assessment, context);
+  assert.equal(result.shouldContinue, true, 'the unmet test gate is agent-actionable');
+  assert.equal(result.requiresHumanAction, true, 'the human-only need must still surface');
+  assert.match(result.reason, /test/i);
+});
+
+// Gate-population sanity: requires* gates still populate missing/nextActions
+// for visibility even though they can no longer flip the decision alone.
+test('gates still populate missing[] for visibility even when they cannot flip the decision', () => {
+  const assessment = { status: 'complete', confidence: 0.9, remaining_work: [], next_steps: [], needs_user_action: [], evidence: { tests: {} } };
+  const context = baseContext({ requiresTests: true });
+  const result = evaluateSelfAssessment(assessment, context);
+  assert.ok(result.missing.some((m) => /test/i.test(m)), `expected a test-related missing item: ${result.missing}`);
+  assert.equal(result.complete, true, 'gate must not flip a confident complete');
+});

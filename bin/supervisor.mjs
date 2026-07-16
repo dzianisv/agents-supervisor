@@ -22,6 +22,7 @@ import {
   resolveMaxAttempts,
   resolveSupervisorMode,
   writeProjectGoal,
+  writeSolofounderGoal,
 } from '../core/goal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -198,6 +199,24 @@ switch (cmd.kind) {
     break;
   }
 
+  // ── solofounder-on ────────────────────────────────────────────────────────
+  case 'solofounder-on': {
+    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
+    const condition = cmd.condition || '';
+    // Deliberately NOT calling clearGoalIfActive: solofounder-on sets a new
+    // session goal itself (setSolofounder below), it never deletes one.
+    writeSolofounderGoal(cwd, condition);
+    goalStore.setSolofounder(cwd, sid, condition);
+    const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
+    console.log(
+      `mode: solofounder\n` +
+      `Solo-founder drive armed for session ${sid.slice(0, 8)}… — target: $1,000,000 ARR.\n` +
+      `Condition: "${condition}"\n` +
+      `Saved to .agents/supervisor/solofounder.md. The judge runs on every stop and keeps driving the CEO loop until the ARR bar is demonstrably met; the ${budget}-attempt budget resets every human turn instead of exhausting permanently, and the drive has no practical time limit.`
+    );
+    break;
+  }
+
   // ── autopilot-off ─────────────────────────────────────────────────────────
   case 'autopilot-off': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
@@ -271,7 +290,7 @@ switch (cmd.kind) {
     const given = process.argv[2] ?? '(none)';
     console.log(
       `Unknown supervisor command: ${given}.\n` +
-      `Valid commands: status, on, off, goal, retry, autopilot, reflection, mode.`
+      `Valid commands: status, on, off, goal, retry, autopilot, reflection, solofounder, mode.`
     );
     process.exit(1);
   }

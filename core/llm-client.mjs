@@ -67,16 +67,35 @@ export function loadAuth() {
 
 /**
  * Call the Anthropic Messages API.
- * @param {{ prompt: string, system?: string, model: string, maxTokens?: number, timeoutMs?: number, signal?: AbortSignal }} opts
+ *
+ * When `images` is provided and non-empty, the user turn becomes a multimodal
+ * content array (text block + one image block per entry) so the judge can SEE
+ * delivered media. When absent/empty, the request body is byte-for-byte the
+ * legacy single-string form — text-only callers are unaffected.
+ *
+ * @param {{ prompt: string, system?: string, model: string, maxTokens?: number, timeoutMs?: number, signal?: AbortSignal, images?: Array<{ media_type: string, data: string }> }} opts
  * @returns {Promise<{ text: string, usage?: { input_tokens: number, output_tokens: number } }>}
  */
-export async function callAnthropic({ prompt, system, model, maxTokens = 1024, timeoutMs = 30_000, signal } = {}) {
+export async function callAnthropic({ prompt, system, model, maxTokens = 1024, timeoutMs = 30_000, signal, images } = {}) {
   const auth = loadAuth();
+
+  const validImages = Array.isArray(images)
+    ? images.filter((img) => img && typeof img.data === 'string' && img.data && typeof img.media_type === 'string')
+    : [];
+  const content = validImages.length > 0
+    ? [
+        { type: 'text', text: prompt },
+        ...validImages.map((img) => ({
+          type: 'image',
+          source: { type: 'base64', media_type: img.media_type, data: img.data },
+        })),
+      ]
+    : prompt;
 
   const bodyObj = {
     model,
     max_tokens: maxTokens,
-    messages: [{ role: 'user', content: prompt }],
+    messages: [{ role: 'user', content }],
   };
   if (system) bodyObj.system = system;
   const body = JSON.stringify(bodyObj);

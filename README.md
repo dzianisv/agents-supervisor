@@ -241,6 +241,25 @@ The anti-pattern rules that sharpen these (permission-seeking, stopped-with-todo
 false-complete, legitimate-stop) were mined from real agent stops where the user
 had to reply.
 
+### Claude Code: per-turn injection cap
+
+Claude Code allows only **8 consecutive Stop-hook `{decision:'block'}` responses**
+within one unbroken turn before it overrides the hook and lets the turn end
+regardless. To keep the supervisor's own exhaustion handling (attempt-cap-reached,
+goal-exhausted) firing deterministically instead of being silently pre-empted by
+CC, the Stop hook caps its per-turn retry budget at
+`min(effectiveMax, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1)`, where
+`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` mirrors CC's own override threshold (default
+**8**; the hook always stays one under it) and can be overridden via env var if
+you raise CC's limit or a future CC version changes it. This applies uniformly to reflection (default budget 3, unaffected), goal
+mode, and autopilot (default budget 16, tightened to 7 within any single unbroken
+turn — the higher budget still spans multiple turns, it just can't all be spent in
+one uninterrupted block chain, since CC itself wouldn't honor that many).
+
+The retry budget is also scoped **per turn**: it resets whenever a new, genuine
+user message arrives, and persists across Stop events that belong to the same
+turn (e.g. a goal or autopilot loop running without new human input).
+
 ## `/supervisor:train` — learn from your sessions
 
 ```

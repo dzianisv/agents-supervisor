@@ -507,8 +507,7 @@ export function evaluateSelfAssessment(assessment, context) {
   }
 
   const humanOnlyNextSteps = (assessment.next_steps || []).filter(item => isHumanOnlyAction(item))
-  const requiresHumanAction = humanNeeds.length > 0 || humanOnlyNextSteps.length > 0 || missing.some(isHumanOnlyAction) || nextActions.some(isHumanOnlyAction)
-  const complete = status === 'complete' && missing.length === 0 && confidence >= 0.8 && !requiresHumanAction
+  const requiresHumanActionSignal = humanNeeds.length > 0 || humanOnlyNextSteps.length > 0 || missing.some(isHumanOnlyAction) || nextActions.some(isHumanOnlyAction)
 
   let severity = 'NONE'
   const severityItems = missing.length > 0 ? missing : nextActions
@@ -516,7 +515,7 @@ export function evaluateSelfAssessment(assessment, context) {
   else if (severityItems.some(item => /CI|check/i.test(item))) severity = 'MEDIUM'
   else if (severityItems.length > 0) severity = 'LOW'
 
-  if (requiresHumanAction && missing.length === 0 && nextActions.length === 0) severity = 'LOW'
+  if (requiresHumanActionSignal && missing.length === 0 && nextActions.length === 0) severity = 'LOW'
 
   if (assessment.next_steps?.length) {
     for (const step of assessment.next_steps) {
@@ -525,23 +524,96 @@ export function evaluateSelfAssessment(assessment, context) {
   }
 
   const actionableMissing = missing.filter(item => !isHumanOnlyAction(item))
-  const finalActionableNextActions = nextActions.filter(item => !isHumanOnlyAction(item))
-  const finalShouldContinue = actionableMissing.length > 0 || finalActionableNextActions.length > 0
-  const finalReason = complete
-    ? 'Self-assessment confirms completion with required evidence'
-    : requiresHumanAction && !finalShouldContinue
-      ? 'User action required before continuing'
-      : missing.length || finalActionableNextActions.length
-        ? 'Missing required workflow steps'
-        : 'Task not confirmed complete'
+  const actionableNextActions = nextActions.filter(item => !isHumanOnlyAction(item))
 
+  // --- The judge's reported status decides; deterministic repo-signal gates
+  // (requires* above) only INFORM the outcome by populating missing/nextActions
+  // for visibility — they must never override a judge verdict of
+  // waiting_for_user, nor flip a confident complete back to "continue". Only
+  // in_progress/blocked/stuck (or low-confidence complete) may produce
+  // shouldContinue=true, and only when a concrete actionable item remains.
+
+  // 1. waiting_for_user: NEVER continue. No exceptions — a judge that
+  //    explicitly says it is blocked on the user wins unconditionally, even
+  //    if isHumanOnlyAction's keyword heuristic would suggest otherwise.
+  if (status === 'waiting_for_user') {
+    return {
+      complete: false,
+      shouldContinue: false,
+      reason: needsUserAction[0] || humanOnlyNextSteps[0] || 'Waiting for user input before continuing',
+      missing,
+      nextActions,
+      requiresHumanAction: true,
+      severity: 'NONE'
+    }
+  }
+
+  // 2. complete at reasonable confidence: trust the judge. Unmet requires*
+  //    gates are surfaced as an informational note only — they cannot flip
+  //    the decision back to "continue".
+  if (status === 'complete' && confidence >= 0.6) {
+    const unmetNote = actionableMissing.length
+      ? ` (heuristic note: ${actionableMissing.slice(0, 3).join('; ')} — not detected, but judge confirmed completion)`
+      : ''
+    return {
+      complete: true,
+      shouldContinue: false,
+      reason: `Self-assessment confirms completion${unmetNote}`,
+      missing,
+      nextActions,
+      requiresHumanAction: false,
+      severity: 'NONE'
+    }
+  }
+
+  // 3. Everything else (in_progress / blocked / stuck / low-confidence
+  //    "complete" / unrecognized status).
+  const finalShouldContinue = actionableMissing.length > 0 || actionableNextActions.length > 0
+
+  if (!finalShouldContinue) {
+    if (requiresHumanActionSignal) {
+      return {
+        complete: false,
+        shouldContinue: false,
+        reason: humanNeeds[0] || humanOnlyNextSteps[0] || 'User action required before continuing',
+        missing,
+        nextActions,
+        requiresHumanAction: true,
+        severity: 'LOW'
+      }
+    }
+    return {
+      complete: false,
+      shouldContinue: false,
+      reason: status === 'complete'
+        ? 'Completion claimed at low confidence — not confirmed'
+        : 'Task not confirmed complete',
+      missing,
+      nextActions,
+      requiresHumanAction: false,
+      severity
+    }
+  }
+
+  // Specific — never the generic "Missing required workflow steps": name the
+  // actual unmet item (from remaining_work/next_steps, or a deterministic
+  // gate) so it is clear exactly what is outstanding.
+  //
+  // requiresHumanAction reflects the raw human-only signal independently of
+  // shouldContinue (matching the pre-Fix-A contract): a mixed case — some
+  // actionable work AND a human-only item both present — still reports
+  // requiresHumanAction:true here. Callers (bin/supervisor-on-stop.mjs's
+  // `!analysis.requiresHumanAction` inject-gate; opencode's
+  // `requiresHumanAction && !shouldContinue` early-return) combine the two
+  // flags themselves; only a "pure" human block (no actionable work at all,
+  // handled above) short-circuits shouldContinue to false.
   return {
-    complete,
-    shouldContinue: finalShouldContinue,
-    reason: finalReason,
+    complete: false,
+    shouldContinue: true,
+    reason: actionableMissing[0] || actionableNextActions[0],
     missing,
     nextActions,
-    requiresHumanAction,
+    requiresHumanAction: requiresHumanActionSignal,
     severity
   }
 }
