@@ -85,6 +85,29 @@ describe('delivered-media resolver', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  test('a merely-MENTIONED on-disk file (not SendUserFile-delivered) is NOT read or inlined', () => {
+    // Security: the agent runs `ls` and its output mentions an unrelated image
+    // sitting next to real work. That file must never be shipped to the judge.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'media-test-'));
+    const secret = path.join(dir, 'confidential-invoice.png');
+    fs.writeFileSync(secret, Buffer.from('SECRET-BYTES-DO-NOT-EXFILTRATE'));
+    const tail = [{
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'ls' } },
+          { type: 'tool_result', content: `report.txt\nconfidential-invoice.png\n` },
+        ],
+      },
+    }];
+    const scan = scanTranscriptForMedia(tail);
+    assert.ok(scan.paths.some((p) => p.path.endsWith('confidential-invoice.png')), 'path is recorded');
+    assert.ok(!scan.paths.find((p) => p.path.endsWith('confidential-invoice.png'))?.delivered, 'but flagged NOT delivered');
+    const media = collectDeliveredMedia(tail, dir, {});
+    assert.equal(media.images.length, 0, 'mentioned-but-undelivered file is never inlined');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   test('off-disk paths are skipped and produce no images (pure fallback)', () => {
     const media = collectDeliveredMedia(makeTranscriptTail('/nope/missing.mp4'), '/nonexistent-cwd', { runFfmpeg: () => false });
     assert.equal(media.images.length, 0);

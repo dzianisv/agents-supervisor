@@ -368,10 +368,14 @@ const MEDIA_MAX_BYTES = 4 * 1024 * 1024; // per file
 const MEDIA_TOTAL_BUDGET = 12 * 1024 * 1024; // total inlined base64 source bytes
 
 /**
- * Walk the transcript tail collecting media the agent DELIVERED or referenced:
- * SendUserFile tool_use args (path + file_uuid receipt) and any string ending
- * in an image/video extension. Also captures nearby passing-test evidence.
- * @returns {{ paths: Array<{path:string,file_uuid?:string}>, receipts: Array<{path?:string,file_uuid?:string}>, testEvidence: string|null }}
+ * Walk the transcript tail collecting media path references. A path is marked
+ * `delivered: true` ONLY when it comes from a SendUserFile tool_use arg — i.e.
+ * the agent actually handed that file to the user. Paths that merely appear as
+ * strings in text/tool_result (e.g. an `ls` listing) are recorded but flagged
+ * `delivered: false` and are NEVER read/inlined by collectDeliveredMedia — only
+ * delivered files are sent to the judge, so unrelated on-disk files that happen
+ * to be mentioned are not exfiltrated. Also captures nearby passing-test evidence.
+ * @returns {{ paths: Array<{path:string,file_uuid?:string,delivered:boolean}>, receipts: Array<{path?:string,file_uuid?:string}>, testEvidence: string|null }}
  */
 export function scanTranscriptForMedia(transcriptTail) {
   const paths = [];
@@ -379,15 +383,18 @@ export function scanTranscriptForMedia(transcriptTail) {
   const receipts = [];
   let testEvidence = null;
 
-  const addPath = (p, file_uuid) => {
+  const addPath = (p, file_uuid, delivered = false) => {
     if (typeof p !== 'string') return;
     const m = p.match(/([^\s"'`)]+\.(?:png|jpe?g|gif|webp|mp4|mov))/i);
     const cand = m ? m[1] : (MEDIA_EXT_RE.test(p) ? p : null);
     if (!cand) return;
-    if (!seen.has(cand)) { seen.add(cand); paths.push({ path: cand, file_uuid }); }
-    else if (file_uuid) {
+    if (!seen.has(cand)) { seen.add(cand); paths.push({ path: cand, file_uuid, delivered }); }
+    else {
       const existing = paths.find((x) => x.path === cand);
-      if (existing && !existing.file_uuid) existing.file_uuid = file_uuid;
+      if (existing) {
+        if (file_uuid && !existing.file_uuid) existing.file_uuid = file_uuid;
+        if (delivered) existing.delivered = true; // upgrade: a later SendUserFile proves delivery
+      }
     }
   };
 
@@ -415,7 +422,7 @@ export function scanTranscriptForMedia(transcriptTail) {
         const isSend = typeof block.name === 'string' && /senduserfile|send_user_file/i.test(block.name);
         const p = input.path ?? input.file_path ?? input.filepath ?? input.file ?? input.filename;
         const uuid = input.file_uuid ?? input.fileUuid ?? input.uuid;
-        if (isSend) { if (p) addPath(p, uuid); receipts.push({ path: typeof p === 'string' ? p : undefined, file_uuid: uuid }); }
+        if (isSend) { if (p) addPath(p, uuid, true); receipts.push({ path: typeof p === 'string' ? p : undefined, file_uuid: uuid }); }
         for (const v of Object.values(input)) if (typeof v === 'string') scanString(v);
       } else if (block.type === 'tool_result') {
         const c = block.content;
@@ -464,8 +471,12 @@ export function collectDeliveredMedia(transcriptTail, cwd, opts = {}) {
   const processedAbs = new Set(); // resolved paths already handled (dedup)
   let totalBytes = 0;
 
-  for (const { path: rel, file_uuid } of paths) {
+  for (const { path: rel, file_uuid, delivered } of paths) {
     if (images.length >= MEDIA_MAX_FILES) break;
+    // Only inline files the agent actually DELIVERED (SendUserFile). A path that
+    // merely appears in transcript text is never read — prevents shipping
+    // unrelated on-disk files (e.g. a `confidential.png` caught by an `ls`).
+    if (!delivered) continue;
     const abs = path.isAbsolute(rel) ? rel : path.resolve(cwd, rel);
     if (processedAbs.has(abs)) continue; // same file referenced twice (e.g. bare + absolute)
     let stat;
@@ -487,8 +498,15 @@ export function collectDeliveredMedia(transcriptTail, cwd, opts = {}) {
       } catch { /* unreadable — skip */ }
     } else if (ext === 'mp4' || ext === 'mov') {
       const frame = tryExtractVideoFrame(abs, opts.runFfmpeg);
-      if (frame) { images.push({ media_type: 'image/png', data: frame }); inlinedAbs.add(abs); }
-      else noteLines.push(`- delivered video (frame extraction unavailable): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+      if (frame) {
+        const frameBytes = Math.floor((frame.length * 3) / 4); // base64 → source bytes
+        if (totalBytes + frameBytes > MEDIA_TOTAL_BUDGET) break;
+        images.push({ media_type: 'image/png', data: frame });
+        totalBytes += frameBytes;
+        inlinedAbs.add(abs);
+      } else {
+        noteLines.push(`- delivered video (frame extraction unavailable): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+      }
     }
   }
 
