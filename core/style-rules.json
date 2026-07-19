@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "meta": {
+    "source": "user's own stated style contract (~/.agents/AGENTS.md communication_style)",
+    "note": "Shipped defaults for the plainspeak plugin. Regex-detectable fluff only — 'conclusion buried under three reasons', 'restates the question', and 'structurally overcomplicated' are deliberately NOT encoded here; they are regex-blind and reserved for the LLM style judge (see core/verbosity.mjs buildStylePrompt)."
+  },
+  "thresholds": {
+    "shortReplyWords": 40,
+    "openerWindowChars": 100,
+    "suspectWordFloor": 120,
+    "suspectParagraphFloor": 3,
+    "bulletRatioGood": 0.15,
+    "avgSentenceWordsSuspect": 22,
+    "avgSentenceWordsVerbose": 30,
+    "verboseScore": 0.5,
+    "suspectScore": 0.2,
+    "severityWeight": { "high": 0.4, "medium": 0.2, "low": 0.1 }
+  },
+  "rules": [
+    {
+      "id": "filler_opener",
+      "description": "Reply opens with hedge/filler/throat-clearing instead of the conclusion.",
+      "severity": "high",
+      "anchor": "start",
+      "flags": "i",
+      "patterns": [
+        "^\\s*honestly\\b,?",
+        "^\\s*on reflection\\b,?",
+        "^\\s*to be fair\\b,?",
+        "^\\s*great question\\b!?",
+        "^\\s*i think\\b"
+      ],
+      "corrective": "Cut the filler opener. Start with the conclusion."
+    },
+    {
+      "id": "hedge",
+      "description": "Qualifier that softens a claim instead of stating it plainly.",
+      "severity": "medium",
+      "flags": "i",
+      "patterns": [
+        "\\barguably\\b",
+        "\\bsomewhat\\b",
+        "\\ba bit\\b",
+        "\\bit seems\\b",
+        "\\bkind of\\b"
+      ],
+      "corrective": "Cut the qualifiers. State it plainly."
+    },
+    {
+      "id": "praise",
+      "description": "Unprompted praise of the user instead of reporting facts.",
+      "severity": "medium",
+      "flags": "i",
+      "patterns": [
+        "\\byou'?re right\\b",
+        "\\bgreat (?:point|idea|question|catch)\\b",
+        "\\bthat'?s a great\\b"
+      ],
+      "corrective": "Drop the praise. Report facts and recommendations only."
+    },
+    {
+      "id": "apology",
+      "description": "Apology in place of a direct correction or answer.",
+      "severity": "medium",
+      "flags": "i",
+      "patterns": [
+        "\\bi apologi[sz]e\\b",
+        "\\bmy apologies\\b",
+        "\\bsorry (?:about|for)\\b"
+      ],
+      "corrective": "Drop the apology. Report facts and recommendations only."
+    },
+    {
+      "id": "self_doubt",
+      "description": "Self-doubt hedge instead of a committed, critically-checked answer.",
+      "severity": "medium",
+      "flags": "i",
+      "patterns": [
+        "\\bi could be wrong\\b",
+        "\\bi might be wrong\\b",
+        "\\bi'?m not (?:100% |fully |entirely )?sure\\b"
+      ],
+      "corrective": "Drop the self-doubt. Think critically and commit to the answer."
+    },
+    {
+      "id": "self_narration",
+      "description": "Narrating a change of mind instead of just giving the current answer.",
+      "severity": "medium",
+      "flags": "i",
+      "patterns": [
+        "\\bon second thought\\b",
+        "\\bi'?d walk (?:that |this )?back\\b",
+        "\\blet me reconsider\\b",
+        "\\bi take that back\\b"
+      ],
+      "corrective": "Cut the self-narration about changing your mind. Just give the current answer."
+    }
+  ]
+}

@@ -31,8 +31,8 @@ import {
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, extractGoalCondition } from '../core/goal.mjs';
+import { buildEscalatingFeedback, buildCeoDirective } from '../core/feedback.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, extractGoalCondition, readSolofounderGoal } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
@@ -368,10 +368,14 @@ const MEDIA_MAX_BYTES = 4 * 1024 * 1024; // per file
 const MEDIA_TOTAL_BUDGET = 12 * 1024 * 1024; // total inlined base64 source bytes
 
 /**
- * Walk the transcript tail collecting media the agent DELIVERED or referenced:
- * SendUserFile tool_use args (path + file_uuid receipt) and any string ending
- * in an image/video extension. Also captures nearby passing-test evidence.
- * @returns {{ paths: Array<{path:string,file_uuid?:string}>, receipts: Array<{path?:string,file_uuid?:string}>, testEvidence: string|null }}
+ * Walk the transcript tail collecting media path references. A path is marked
+ * `delivered: true` ONLY when it comes from a SendUserFile tool_use arg — i.e.
+ * the agent actually handed that file to the user. Paths that merely appear as
+ * strings in text/tool_result (e.g. an `ls` listing) are recorded but flagged
+ * `delivered: false` and are NEVER read/inlined by collectDeliveredMedia — only
+ * delivered files are sent to the judge, so unrelated on-disk files that happen
+ * to be mentioned are not exfiltrated. Also captures nearby passing-test evidence.
+ * @returns {{ paths: Array<{path:string,file_uuid?:string,delivered:boolean}>, receipts: Array<{path?:string,file_uuid?:string}>, testEvidence: string|null }}
  */
 export function scanTranscriptForMedia(transcriptTail) {
   const paths = [];
@@ -379,15 +383,18 @@ export function scanTranscriptForMedia(transcriptTail) {
   const receipts = [];
   let testEvidence = null;
 
-  const addPath = (p, file_uuid) => {
+  const addPath = (p, file_uuid, delivered = false) => {
     if (typeof p !== 'string') return;
     const m = p.match(/([^\s"'`)]+\.(?:png|jpe?g|gif|webp|mp4|mov))/i);
     const cand = m ? m[1] : (MEDIA_EXT_RE.test(p) ? p : null);
     if (!cand) return;
-    if (!seen.has(cand)) { seen.add(cand); paths.push({ path: cand, file_uuid }); }
-    else if (file_uuid) {
+    if (!seen.has(cand)) { seen.add(cand); paths.push({ path: cand, file_uuid, delivered }); }
+    else {
       const existing = paths.find((x) => x.path === cand);
-      if (existing && !existing.file_uuid) existing.file_uuid = file_uuid;
+      if (existing) {
+        if (file_uuid && !existing.file_uuid) existing.file_uuid = file_uuid;
+        if (delivered) existing.delivered = true; // upgrade: a later SendUserFile proves delivery
+      }
     }
   };
 
@@ -415,7 +422,7 @@ export function scanTranscriptForMedia(transcriptTail) {
         const isSend = typeof block.name === 'string' && /senduserfile|send_user_file/i.test(block.name);
         const p = input.path ?? input.file_path ?? input.filepath ?? input.file ?? input.filename;
         const uuid = input.file_uuid ?? input.fileUuid ?? input.uuid;
-        if (isSend) { if (p) addPath(p, uuid); receipts.push({ path: typeof p === 'string' ? p : undefined, file_uuid: uuid }); }
+        if (isSend) { if (p) addPath(p, uuid, true); receipts.push({ path: typeof p === 'string' ? p : undefined, file_uuid: uuid }); }
         for (const v of Object.values(input)) if (typeof v === 'string') scanString(v);
       } else if (block.type === 'tool_result') {
         const c = block.content;
@@ -464,8 +471,12 @@ export function collectDeliveredMedia(transcriptTail, cwd, opts = {}) {
   const processedAbs = new Set(); // resolved paths already handled (dedup)
   let totalBytes = 0;
 
-  for (const { path: rel, file_uuid } of paths) {
+  for (const { path: rel, file_uuid, delivered } of paths) {
     if (images.length >= MEDIA_MAX_FILES) break;
+    // Only inline files the agent actually DELIVERED (SendUserFile). A path that
+    // merely appears in transcript text is never read — prevents shipping
+    // unrelated on-disk files (e.g. a `confidential.png` caught by an `ls`).
+    if (!delivered) continue;
     const abs = path.isAbsolute(rel) ? rel : path.resolve(cwd, rel);
     if (processedAbs.has(abs)) continue; // same file referenced twice (e.g. bare + absolute)
     let stat;
@@ -487,8 +498,15 @@ export function collectDeliveredMedia(transcriptTail, cwd, opts = {}) {
       } catch { /* unreadable — skip */ }
     } else if (ext === 'mp4' || ext === 'mov') {
       const frame = tryExtractVideoFrame(abs, opts.runFfmpeg);
-      if (frame) { images.push({ media_type: 'image/png', data: frame }); inlinedAbs.add(abs); }
-      else noteLines.push(`- delivered video (frame extraction unavailable): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+      if (frame) {
+        const frameBytes = Math.floor((frame.length * 3) / 4); // base64 → source bytes
+        if (totalBytes + frameBytes > MEDIA_TOTAL_BUDGET) break;
+        images.push({ media_type: 'image/png', data: frame });
+        totalBytes += frameBytes;
+        inlinedAbs.add(abs);
+      } else {
+        noteLines.push(`- delivered video (frame extraction unavailable): ${rel}${file_uuid ? ` (receipt file_uuid=${file_uuid})` : ''}`);
+      }
     }
   }
 
@@ -765,6 +783,19 @@ async function main() {
     if (goalState.goal && goalState.goal.status === 'active') {
       goal = goalState.goal;
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
+      // Solofounder's attempt budget is per-human-turn, not cumulative for
+      // the whole session (unlike plain 'goal' mode): once turnKey moves —
+      // a new real user message arrived — the previous turn's escalation no
+      // longer applies, so goal.attempts resets to 0 instead of marching
+      // toward decideGoalTransition's exhausted cap forever. lastTurnKey is
+      // only null on the very first stop after arming (setSolofounder), so
+      // that first observation just stamps it without a spurious reset.
+      if (mode === 'solofounder' && turnKey != null && goal.lastTurnKey !== turnKey) {
+        const shouldReset = goal.lastTurnKey != null;
+        goal = { ...goal, lastTurnKey: turnKey, ...(shouldReset ? { attempts: 0 } : {}) };
+        goalState = { ...goalState, goal };
+        try { goalStore.save(cwd, session_id, goalState); } catch { /* best effort */ }
+      }
     } else if (mode === 'autopilot') {
       // Autopilot gets the higher budget (default 16), not the bare 3.
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
@@ -789,7 +820,7 @@ async function main() {
   // Project-level goal: in reflection mode, read .agents/supervisor/Goal.md
   let projectGoalSection = '';
   const effectiveMode = resolveSupervisorMode(goalState);
-  if (effectiveMode !== 'goal' && !goal) {
+  if (effectiveMode !== 'goal' && effectiveMode !== 'solofounder' && !goal) {
     try {
       const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
       const goalFileContent = fs.readFileSync(goalFilePath, 'utf8');
@@ -800,16 +831,43 @@ async function main() {
     }
   }
 
+  // Solofounder: the judge must actually see the $1M ARR condition + evidence
+  // rule as a MANDATORY completion requirement (unlike plain 'goal' mode,
+  // which only surfaces goal.condition in the continuation feedback text, not
+  // the judge prompt itself) — source it from solofounder.md, falling back to
+  // the shared Goal.md pointer if a drive was armed before that file existed.
+  let solofounderGoalSection = '';
+  if (mode === 'solofounder') {
+    try {
+      let cond = readSolofounderGoal(cwd);
+      if (!cond) {
+        const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
+        cond = extractGoalCondition(fs.readFileSync(goalFilePath, 'utf8'));
+      }
+      if (cond) solofounderGoalSection = buildGoalRequirementSection(cond);
+    } catch {
+      // Neither file present/readable — fall back to goal.condition below.
+    }
+  }
+
   const attempts = readAttempts(session_id, cwd, turnKey);
   if (attempts >= effectiveMax) {
-    if (goal) {
+    // Solofounder's per-turn budget hitting its cap is NOT permanent
+    // exhaustion — the file-based `attempts` counter above already resets on
+    // the next turnKey (a new human message), so leave goal.status 'active'
+    // and just stand down for the rest of THIS turn. Marking it 'exhausted'
+    // here would permanently disable the drive: the goal-active branch above
+    // (where lastTurnKey/attempts get reset) never re-fires once status
+    // leaves 'active', so a solofounder goal that hit this per-turn cap once
+    // would never resume on a later turn.
+    if (goal && mode !== 'solofounder') {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: { ...goal, status: 'exhausted' } }); } catch { /* */ }
     }
     // Disable autopilot on budget exhaustion so the next stop is clean.
     if (mode === 'autopilot') {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
     }
-    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal }, cwd);
+    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal, mode }, cwd);
     process.exit(0);
   }
 
@@ -879,7 +937,9 @@ async function main() {
     lastAssistantText: ctx.final_assistant_text,
     attemptCount: attempts,
     maxAttempts: effectiveMax,
-    goalSection: (projectGoalSection && !goal) ? projectGoalSection : undefined,
+    goalSection: mode === 'solofounder'
+      ? (solofounderGoalSection || (goal ? buildGoalRequirementSection(goal.condition) : undefined))
+      : ((projectGoalSection && !goal) ? projectGoalSection : undefined),
   });
 
   // 6.5. Resolve delivered media so the tool-less judge can SEE it. Images are
@@ -975,8 +1035,11 @@ async function main() {
     if (t.action === 'achieved') {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.goal = 'achieved';
+      if (mode === 'solofounder') {
+        verdictRecord.message = `$1M ARR condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
+      }
       writeVerdict(session_id, verdictRecord, cwd);
-      debug({ msg: 'goal_achieved', session_id }, cwd);
+      debug({ msg: mode === 'solofounder' ? 'solofounder_achieved' : 'goal_achieved', session_id, message: verdictRecord.message }, cwd);
       process.exit(0);
     }
     if (t.action === 'exhausted') {
@@ -988,16 +1051,20 @@ async function main() {
     }
     // continue — but never override a genuine human-only block.
     if (!analysis.requiresHumanAction) {
-      const feedbackMsg = buildAnalysisFeedback();
-      const msg = `Goal not yet met: "${goal.condition}". ${feedbackMsg}`;
+      // Solofounder gets a CEO directive (pick a lever, spawn doers, evaluate,
+      // integrate) instead of the generic Missing/Next-Actions feedback plain
+      // 'goal' mode uses — same escalation slot, different framing.
+      const msg = mode === 'solofounder'
+        ? buildCeoDirective({ goalCondition: goal.condition, analysis, attempt: nextAttempt, effectiveMax })
+        : `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
-      verdictRecord.feedback_reason = 'goal_continue';
+      verdictRecord.feedback_reason = mode === 'solofounder' ? 'ceo_directive_continue' : 'goal_continue';
       writeVerdict(session_id, verdictRecord, cwd);
       process.stdout.write(JSON.stringify({ decision: 'block', reason: msg }));
-      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity }, cwd);
+      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity, mode }, cwd);
       process.exit(0);
     }
     // Human action required with active goal → legit pause, don't burn budget.

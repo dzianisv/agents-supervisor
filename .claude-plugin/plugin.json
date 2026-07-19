@@ -1,8 +1,8 @@
 {
   "name": "supervisor",
   "displayName": "Supervisor",
-  "version": "0.2.1",
-  "description": "Catches premature agent stops and re-prompts the agent to finish — a dataset-backed Stop-hook supervisor. /supervisor:train learns from your sessions and updates your local patterns.",
+  "version": "0.3.0",
+  "description": "Catches premature agent stops and re-prompts the agent to finish — a dataset-backed Stop-hook supervisor. Ships with plainspeak, a second Stop hook that catches fluffy replies and injects a plain-English rewrite directive. /supervisor:train learns from your sessions and updates your local patterns.",
   "author": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
   "repository": "https://github.com/dzianisv/agents-supervisor",
   "license": "MIT"

@@ -91,3 +91,48 @@ ${nextActions}
 
 ${closing}`
 }
+
+/**
+ * Solofounder-mode continuation message — same escalation SLOT as
+ * buildEscalatingFeedback's calm template, but framed as a CEO directive
+ * instead of generic "Missing/Next Actions" feedback: restate the $1M ARR
+ * bar, then instruct the agent to run the CEO loop (pick the highest-leverage
+ * workstream, spawn parallel doers, evaluate on a rubric, integrate) rather
+ * than just "address these issues". MUST start with FEEDBACK_MARKER — the
+ * Stop hook's computeTurnKey fingerprints the last user message NOT
+ * containing that marker, so any injected text lacking the exact prefix
+ * corrupts the per-turn attempt counter.
+ * @param {object} opts
+ * @param {string} opts.goalCondition — the $1M ARR condition text
+ * @param {import('./evaluation.mjs').SupervisorAnalysis} [opts.analysis]
+ * @param {number} [opts.attempt]
+ * @param {number} [opts.effectiveMax]
+ * @returns {string}
+ */
+export function buildCeoDirective({ goalCondition, analysis, attempt, effectiveMax }) {
+  const safeAnalysis = analysis ?? {}
+  const missingItems = (Array.isArray(safeAnalysis.missing) ? safeAnalysis.missing : []).map(rewriteIfDestructive)
+  const nextActionItems = (Array.isArray(safeAnalysis.nextActions) ? safeAnalysis.nextActions : []).map(rewriteIfDestructive)
+  const reason = safeAnalysis.reason || ''
+  const missing = missingItems.length
+    ? `\n### Missing\n${missingItems.map((m) => `- ${m}`).join('\n')}`
+    : ''
+  const nextActions = nextActionItems.length
+    ? `\n### Next Actions\n${nextActionItems.map((a) => `- ${a}`).join('\n')}`
+    : ''
+  const attemptSuffix = attempt !== undefined && effectiveMax !== undefined ? ` (attempt ${attempt}/${effectiveMax})` : ''
+
+  return `${FEEDBACK_MARKER} CEO Directive${attemptSuffix}
+
+The $1M ARR bar is not yet met: "${goalCondition}"
+${reason ? `\n${reason}` : ''}
+${missing}${nextActions}
+
+Run the CEO loop now — you are the operator, not an assistant waiting for a task:
+1. Pick the ONE highest-leverage unblocked workstream (engineering / product / growth / content) toward the ARR bar.
+2. Spawn parallel doer subagents on narrow, named scopes — never a vague "audit the repo".
+3. Evaluate each doer's output against a rubric: did it ship real, verifiable work — not a stub, not narration.
+4. Integrate what passes, record workstream state, and rotate to the next lever.
+
+Never nudge a destructive or wasteful action (force-push, hard reset, history rewrite, branch deletion, rm -rf, unapproved spend) — flag those to the user instead of doing them.`
+}

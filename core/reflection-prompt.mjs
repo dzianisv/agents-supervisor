@@ -8,12 +8,20 @@
  * prompt string. Falls back to buildSelfAssessmentPrompt when no
  * SystemPrompt.md is found anywhere, so callers work without the file
  * structure on disk.
+ *
+ * Also loads a `.supervisor/rubric.md` project override (or the
+ * `~/.config/agents-supervisor/rubric.md` global one) via
+ * core/rubric-loader.mjs, which — when present — REPLACES Patterns.md
+ * wholesale (never merges), matching opencode's loadRubric() semantics. This
+ * is what wires the project rubric into BOTH runtimes' Stop/idle hooks, since
+ * both call buildReflectionPrompt with the project directory.
  */
 
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { extractGoalCondition, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt } from './assessment.mjs'
+import { loadParsedRubric, formatRubricMarkdown } from './rubric-loader.mjs'
 
 /**
  * Interpolate a simple mustache-like template:
@@ -96,6 +104,16 @@ export async function buildReflectionPrompt({
     readSupervisorFile(directory, defaultsDir, 'Goal.md'),
   ])
 
+  // rubric.md override (core/rubric-loader.mjs): <cwd>/.supervisor/rubric.md,
+  // falling back to ~/.config/agents-supervisor/rubric.md, takes precedence
+  // over Patterns.md when present — same file both runtimes' rubric override
+  // docs point users at (see .supervisor/rubric.md's own header). This is a
+  // REPLACE, not a merge: a valid override with either section fully
+  // supersedes patternsFile, matching opencode's loadRubric() semantics.
+  // Fails open to patternsFile on any missing/unreadable/malformed file.
+  const projectRubric = directory ? await loadParsedRubric(directory) : null
+  const effectivePatternsFile = projectRubric ? formatRubricMarkdown(projectRubric) : patternsFile
+
   // Build context variables for interpolation
   const safeContext = {
     ...context,
@@ -137,8 +155,8 @@ export async function buildReflectionPrompt({
   if (systemPromptFile) {
     const interpolated = interpolateTemplate(systemPromptFile, templateVars)
     const parts = [interpolated]
-    if (patternsFile) {
-      parts.push(patternsFile)
+    if (effectivePatternsFile) {
+      parts.push(effectivePatternsFile)
     }
     if (userFile && userFile.trim() !== '') {
       parts.push(userFile)
@@ -147,8 +165,9 @@ export async function buildReflectionPrompt({
   }
 
   // Fallback: build prompt using the same logic as buildSelfAssessmentPrompt
-  // (for projects that don't have the 3-file structure yet)
-  const rubric = parseRubric(DEFAULT_RUBRIC)
+  // (for projects that don't have the 3-file structure yet). Still honors the
+  // rubric.md override ahead of the shipped DEFAULT_RUBRIC.
+  const rubric = projectRubric ?? parseRubric(DEFAULT_RUBRIC)
   const effRubric = effectiveGoalSection
     ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${effectiveGoalSection}` }
     : rubric
