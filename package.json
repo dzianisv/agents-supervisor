@@ -14,6 +14,7 @@
     "test:cc": "node test/e2e-cc.mjs",
     "test:smoke": "node test/smoke-cc.mjs",
     "eval": "node evals/judge-eval.mjs",
+    "eval:plainspeak": "node evals/plainspeak-eval.mjs",
     "train": "node train/run-train.mjs"
   },
   "dependencies": {

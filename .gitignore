@@ -2,6 +2,7 @@
 .dataset/
 .tasks/
 .supervisor/
+.plainspeak/
 *.jsonl
 !evals/cases.example.jsonl
 /tmp/

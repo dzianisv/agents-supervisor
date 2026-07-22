@@ -293,12 +293,54 @@ First `--push-hf` run needs `hf auth login` and `pip install -U huggingface_hub`
 2. `~/.config/agents-supervisor/patterns.json` (user, written by train)
 3. `<project>/.supervisor/patterns.json` (project, `--scope=project`)
 
+## Plainspeak (Claude Code only)
+
+A second Stop hook. It catches a fluffy final reply and blocks with a rewrite
+directive instead of letting it stand.
+
+Detection is two-stage:
+1. `scoreVerbosity` (deterministic, free) scores the reply against
+   `core/style-rules.json` — filler openers, hedges, praise, apology,
+   self-narration — plus a structural check (long, low-bullet, long-sentence
+   prose). Below 40 prose words, it always exits silently: never fire on a
+   short reply.
+2. At or above that floor, a cheap model (`claude-haiku-4-5-20251001`,
+   override with `PLAINSPEAK_MODEL`) judges what regex can't see: buried
+   conclusions, restated questions, overcomplicated structure. A
+   deterministically confirmed verbose verdict (a high-severity hit, e.g. a
+   filler opener) skips the LLM call — it's already confirmed.
+
+On confirmed verbose, it blocks with one directive: named offenses, one
+corrective, same facts, fewer words. Nothing else.
+
+Real numbers, `evals/verbosity-cases.jsonl` (200 rows, 16 real human style
+complaints): `npm run eval:plainspeak`. Gold-complaint recall: 50%, 100%
+precision, 0 false positives. Cost: an LLM call on 141 of 200 rows. Set
+`PLAINSPEAK_STRICT_TERSE_EXIT=1` for the cheaper, blinder mode (skip the LLM
+on any `terse` verdict, not just below-floor ones) — gold recall drops to
+12.5%. Default trades LLM-call volume for catching real complaints, because on
+this corpus the cheap mode misses seven of every eight.
+
+Safety rails:
+- **Never fights supervisor.** Defers if a supervisor goal/autopilot is
+  active, and again if `.supervisor/verdict_<session_id>.json` shows
+  supervisor just blocked this same turn. Finishing the work beats polishing
+  the prose.
+- **One rewrite per turn.** Hard cap, persisted under `.plainspeak/`. A second
+  Stop for the same turn is always silent.
+- **Never mid-work.** A trailing question to the user exits silently — style
+  is judged only on a final delivered reply.
+- **Fails open.** Any error, timeout, or missing auth exits silently. A broken
+  judge never blocks a turn.
+- Kill switch: `.plainspeak/disabled` or `PLAINSPEAK_DISABLED=1`.
+
 ## Develop / test
 
 ```
-npm test            # unit tests (core + hook + train derivation), node:test
-npm run test:cc     # Claude Code end-to-end (real claude -p, no mocks)
-npm run eval        # OpenCode judge eval (promptfoo)
+npm test                 # unit tests (core + hook + train derivation), node:test
+npm run test:cc          # Claude Code end-to-end (real claude -p, no mocks)
+npm run eval             # OpenCode judge eval (promptfoo)
+npm run eval:plainspeak  # plainspeak detector eval (verbosity-cases.jsonl)
 ```
 
 ## License
