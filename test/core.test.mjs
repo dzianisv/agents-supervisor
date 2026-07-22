@@ -1,12 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadShipped, deepMerge } from '../core/patterns.mjs';
 import { buildPrompt, CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { buildFeedback, injectCategories } from '../core/feedback-core.mjs';
 import { buildSubagentExemptionRule, DEFAULT_RUBRIC } from '../core/assessment.mjs';
-import { parseRubric } from '../opencode/supervisor-impl.ts';
+import { parseRubric, buildTaskContext } from '../opencode/supervisor-impl.ts';
 
 const shipped = loadShipped();
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 test('shipped patterns: 6 categories, correct inject set', () => {
   assert.deepEqual(CATEGORY_NAMES(shipped), [
@@ -94,4 +97,40 @@ test('DEFAULT_RUBRIC (Claude Code path): includes the patterns.json-sourced suba
   assert.match(DEFAULT_RUBRIC, /BACKGROUND SUBAGENTS/);
   const parsed = parseRubric(DEFAULT_RUBRIC);
   assert.match(parsed.antipatterns, /BACKGROUND SUBAGENTS/);
+});
+
+// ---------------------------------------------------------------------------
+// buildTaskContext (OpenCode) — <task-notification> exclusion, mirrors the
+// CC-side buildTaskContextFromTranscript coverage in test/hook.test.mjs.
+// ---------------------------------------------------------------------------
+
+test('buildTaskContext: skips a leading task-notification part and picks up the real text', async () => {
+  const messages = [
+    {
+      info: { role: 'user' },
+      parts: [
+        { type: 'text', text: '<task-notification>Agent X finished with status: done</task-notification>' },
+        { type: 'text', text: 'ship the fix' },
+      ],
+    },
+    { info: { role: 'assistant' }, parts: [] },
+  ];
+  const ctx = await buildTaskContext(messages, PROJECT_ROOT);
+  assert.ok(ctx, 'should return a context object');
+  assert.deepEqual(ctx.humanMessages, ['ship the fix']);
+  assert.match(ctx.taskSummary, /ship the fix/);
+  assert.doesNotMatch(ctx.taskSummary, /<task-notification>/);
+});
+
+test('buildTaskContext: returns null when the only user part is a task-notification', async () => {
+  const messages = [
+    {
+      info: { role: 'user' },
+      parts: [
+        { type: 'text', text: '<task-notification>Agent X finished with status: done</task-notification>' },
+      ],
+    },
+  ];
+  const ctx = await buildTaskContext(messages, PROJECT_ROOT);
+  assert.equal(ctx, null);
 });

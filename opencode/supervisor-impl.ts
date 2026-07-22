@@ -49,7 +49,7 @@ export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, g
 export {
   buildEscalatingFeedback,
   getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
-  DEFAULT_RUBRIC, parseRubric,
+  DEFAULT_RUBRIC, parseRubric, buildTaskContext,
 }
 
 // Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
@@ -878,6 +878,7 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
       for (const part of msg.parts || []) {
         if (part.type === "text" && part.text) {
           if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue
+          if (part.text.trim().startsWith("<task-notification>")) continue // async notification metadata, not user task instructions
           humanMessages.push(part.text)
           break
         }

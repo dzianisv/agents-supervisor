@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as evaluation from '../core/evaluation.mjs';
 
-const { evaluateSelfAssessment, summarizeToolActivity, describeToolActivity } = evaluation;
+const { evaluateSelfAssessment, summarizeToolActivity, describeToolActivity, isTestRunnerCommand, hasLocalTestCommand } = evaluation;
 
 // ---------------------------------------------------------------------------
 // evaluateSelfAssessment — decision-table coverage.
@@ -270,4 +270,74 @@ test('summarizeToolActivity is pure count telemetry; describeToolActivity stays 
   assert.match(note, /informational only, not a verdict/i);
   assert.doesNotMatch(note, /\bSTOP\b/i);
   assert.doesNotMatch(note, /Planning Loop|Action Loop|detected/i);
+});
+
+// ---------------------------------------------------------------------------
+// isTestRunnerCommand / hasLocalTestCommand — recognizing actual test-runner
+// invocations (not mere mentions of a test tool's name in an install, config
+// read, or search command).
+// ---------------------------------------------------------------------------
+
+test('isTestRunnerCommand: recognizes newly-added ecosystems (positive cases)', () => {
+  const positives = [
+    'node --test',
+    'node --experimental-strip-types --test test/*.test.mjs',
+    'vitest',
+    'vitest run',
+    'npx vitest',
+    'jest',
+    'npx jest',
+    'mocha',
+    'npx mocha',
+    'deno test',
+    'bun test',
+  ];
+  for (const cmd of positives) {
+    assert.equal(isTestRunnerCommand(cmd), true, `expected isTestRunnerCommand to match: ${cmd}`);
+  }
+});
+
+test('isTestRunnerCommand: retains regression coverage for pre-existing ecosystems', () => {
+  const positives = [
+    'npm test',
+    'npm run test',
+    'pnpm test',
+    'yarn test',
+    'pytest',
+    'go test',
+    'cargo test',
+  ];
+  for (const cmd of positives) {
+    assert.equal(isTestRunnerCommand(cmd), true, `expected isTestRunnerCommand to match: ${cmd}`);
+  }
+});
+
+test('isTestRunnerCommand: does not match install/config-read/search false positives', () => {
+  const negatives = [
+    'npm install --save-dev vitest',
+    'npm i -D jest',
+    'pnpm add mocha',
+    'cat vitest.config.ts',
+    'cat jest.config.js',
+    'grep -r jest src/',
+    'find . -name "*.test.js"',
+    'which mocha',
+    'npm ls jest',
+  ];
+  for (const cmd of negatives) {
+    assert.equal(isTestRunnerCommand(cmd), false, `expected isTestRunnerCommand NOT to match: ${cmd}`);
+  }
+});
+
+test('isTestRunnerCommand: matches a test runner invoked after a chained shell operator', () => {
+  assert.equal(
+    isTestRunnerCommand('cd project && npm run build && node --test test/foo.test.mjs'),
+    true
+  );
+});
+
+test('hasLocalTestCommand: delegates to isTestRunnerCommand across a command list', () => {
+  assert.equal(hasLocalTestCommand(['git status', 'npx vitest run']), true);
+  assert.equal(hasLocalTestCommand(['git status', 'npm install --save-dev vitest']), false);
+  assert.equal(hasLocalTestCommand([]), false);
 });

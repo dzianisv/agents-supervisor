@@ -8,7 +8,7 @@ import {
   loopGuard, sanitizeCwd, readAttempts, writeAttemptCounter,
   writeVerdict, readTranscriptTail, buildStopContext,
   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
-  endsWithTrailingQuestion, computeTurnKey,
+  endsWithTrailingQuestion, computeTurnKey, buildFakeAssessment,
 } from '../bin/supervisor-on-stop.mjs';
 import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
 
@@ -407,4 +407,106 @@ test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
     'requiresLocalTests', 'requiresLocalTestsEvidence']) {
     assert.ok(field in ctx, `missing field: ${field}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// buildTaskContextFromTranscript — <task-notification> exclusion.
+// Async task-notification blocks are status metadata, not user task
+// instructions, and must not leak into taskSummary/humanMessages/combinedText.
+// ---------------------------------------------------------------------------
+
+test('buildTaskContextFromTranscript: skips a leading task-notification part and picks up the real text', () => {
+  const msgs = normalizeTranscriptToMessages([
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<task-notification>Agent X finished with status: done</task-notification>' },
+          { type: 'text', text: 'please review the PR' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx, 'should return a context object');
+  assert.deepEqual(ctx.humanMessages, ['please review the PR']);
+  assert.match(ctx.taskSummary, /please review the PR/);
+  assert.doesNotMatch(ctx.taskSummary, /<task-notification>/);
+});
+
+test('buildTaskContextFromTranscript: returns null when the only user part is a task-notification', () => {
+  const msgs = normalizeTranscriptToMessages([
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<task-notification>Agent X finished with status: done</task-notification>' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.equal(ctx, null);
+});
+
+test('buildTaskContextFromTranscript: task-notification with leading whitespace is still excluded', () => {
+  const msgs = normalizeTranscriptToMessages([
+    {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '  <task-notification>Agent X finished with status: done</task-notification>' },
+          { type: 'text', text: 'ship the fix' },
+        ],
+      },
+    },
+  ]);
+  const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
+  assert.ok(ctx);
+  assert.deepEqual(ctx.humanMessages, ['ship the fix']);
+});
+
+// ---------------------------------------------------------------------------
+// buildFakeAssessment — test-only fake-judge escape hatch (SUPERVISOR_FAKE_JUDGE)
+// ---------------------------------------------------------------------------
+
+function baseFakeTaskContext(overrides = {}) {
+  return {
+    taskSummary: 'do the thing',
+    taskType: 'coding',
+    agentMode: 'build',
+    humanMessages: ['do the thing'],
+    toolsSummary: '(none)',
+    detectedSignals: [],
+    recentCommands: [],
+    pushedToDefaultBranch: false,
+    requiresTests: true,
+    requiresBuild: false,
+    requiresPR: false,
+    requiresCI: false,
+    requiresLocalTests: true,
+    requiresLocalTestsEvidence: false,
+    ...overrides,
+  };
+}
+
+test('buildFakeAssessment: recentTestCommands includes real test-runner invocations and excludes install commands', () => {
+  const ctx = baseFakeTaskContext({
+    recentCommands: ['npm install vitest', 'vitest run', 'node --test test/foo.test.mjs', 'git status'],
+  });
+  const assessment = buildFakeAssessment(ctx, 'complete');
+  assert.deepEqual(assessment.evidence.tests.commands, ['vitest run', 'node --test test/foo.test.mjs']);
+  assert.equal(assessment.evidence.tests.ran, true);
+});
+
+test('buildFakeAssessment: no matching test commands leaves tests.commands empty', () => {
+  const ctx = baseFakeTaskContext({
+    recentCommands: ['npm install vitest', 'git status'],
+  });
+  const assessment = buildFakeAssessment(ctx, 'complete');
+  assert.deepEqual(assessment.evidence.tests.commands, []);
+  assert.equal(assessment.evidence.tests.ran, false);
 });

@@ -15,7 +15,7 @@
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
  *   writeAttemptCounter, writeVerdict, writeHealthSignal, sanitizeCwd, debug,
  *   normalizeTranscriptToMessages, buildTaskContextFromTranscript,
- *   endsWithTrailingQuestion, computeTurnKey
+ *   endsWithTrailingQuestion, computeTurnKey, buildFakeAssessment
  */
 
 import fs from 'node:fs';
@@ -27,7 +27,7 @@ import { callAnthropic } from '../core/llm-client.mjs';
 import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER,
   inferTaskType, extractToolCommands, detectSignals,
-  getRecentCommands, hasLocalTestCommand, pushedToDefaultBranch,
+  getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
@@ -578,6 +578,7 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
       for (const part of msg.parts ?? []) {
         if (part.type === 'text' && part.text) {
           if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
+          if (part.text.trim().startsWith('<task-notification>')) continue; // async notification metadata, not user task instructions
           humanMessages.push(part.text);
           break;
         }
@@ -629,10 +630,8 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
   };
 }
 
-function buildFakeAssessment(taskContext, category) {
-  const recentTestCommands = taskContext.recentCommands.filter((command) =>
-    /\bnpm\s+test\b|\bnpm\s+run\s+test\b|\bpnpm\s+test\b|\byarn\s+test\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+test\b/i.test(command)
-  );
+export function buildFakeAssessment(taskContext, category) {
+  const recentTestCommands = taskContext.recentCommands.filter(isTestRunnerCommand);
 
   if (category === 'complete') {
     return {

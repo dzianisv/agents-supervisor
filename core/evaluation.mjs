@@ -230,17 +230,46 @@ export function getRecentCommands(commands, limit = 20) {
   return commands.map(normalizeCommand).slice(-limit)
 }
 
-export function hasLocalTestCommand(commands) {
-  return commands.some(cmd =>
-    /\bnpm\s+test\b/i.test(cmd) ||
-    /\bnpm\s+run\s+test\b/i.test(cmd) ||
-    /\bnpm\s+run\s+typecheck\b/i.test(cmd) ||
-    /\bpnpm\s+test\b/i.test(cmd) ||
-    /\byarn\s+test\b/i.test(cmd) ||
-    /\bpytest\b/i.test(cmd) ||
-    /\bgo\s+test\b/i.test(cmd) ||
-    /\bcargo\s+test\b/i.test(cmd)
+// Matches the start of a command string, right after a shell separator (&&, ||, ;, |),
+// or right after a package-runner prefix (npx, yarn/pnpm dlx, pnpm/npm exec) — i.e. a
+// position where the next token is actually being invoked, not merely mentioned.
+const INVOCATION_PREFIX = '(?:^|[;&|]\\s*|\\bnpx\\s+|\\byarn\\s+dlx\\s+|\\bpnpm\\s+dlx\\s+|\\bpnpm\\s+exec\\s+|\\bnpm\\s+exec\\s+)'
+
+/**
+ * Whether a single command string represents an actual test-runner invocation
+ * (as opposed to merely mentioning a test tool's name — e.g. reading its config
+ * file, installing it as a dependency, or grepping/searching for it).
+ *
+ * Covers: npm/pnpm/yarn test scripts, pytest, go test, cargo test, Node's native
+ * test runner (`node --test` / `node --experimental-strip-types --test ...`),
+ * Vitest, Jest, Mocha, Deno test, Bun test.
+ *
+ * Bare-word runners that collide with common package/config names (vitest, jest,
+ * mocha, and node's `--test` flag) are anchored to an invocation position via
+ * INVOCATION_PREFIX so that `cat vitest.config.ts`, `npm install --save-dev jest`,
+ * `pnpm add mocha`, `grep -r jest src/`, and similar non-invocations do not match.
+ */
+export function isTestRunnerCommand(command) {
+  return (
+    /\bnpm\s+test\b/i.test(command) ||
+    /\bnpm\s+run\s+test\b/i.test(command) ||
+    /\bnpm\s+run\s+typecheck\b/i.test(command) ||
+    /\bpnpm\s+test\b/i.test(command) ||
+    /\byarn\s+test\b/i.test(command) ||
+    /\bpytest\b/i.test(command) ||
+    /\bgo\s+test\b/i.test(command) ||
+    /\bcargo\s+test\b/i.test(command) ||
+    /\bdeno\s+test\b/i.test(command) ||
+    /\bbun\s+test\b/i.test(command) ||
+    new RegExp(INVOCATION_PREFIX + 'node(?:\\.js)?\\s+(?:\\S+\\s+)*--test\\b', 'i').test(command) ||
+    new RegExp(INVOCATION_PREFIX + 'vitest\\b(?!\\.config)', 'i').test(command) ||
+    new RegExp(INVOCATION_PREFIX + 'jest\\b(?!\\.config)', 'i').test(command) ||
+    new RegExp(INVOCATION_PREFIX + 'mocha\\b', 'i').test(command)
   )
+}
+
+export function hasLocalTestCommand(commands) {
+  return commands.some(isTestRunnerCommand)
 }
 
 /**
