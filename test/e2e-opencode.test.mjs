@@ -1,9 +1,33 @@
 /**
  * e2e-opencode.test.mjs — End-to-end test of the supervisor plugin loaded by
- * a real `opencode serve` process using the globally-configured providers.
+ * a real `opencode serve` process.
  *
  * Proves the plugin registers its tools and commands correctly, and that
- * supervisor slash commands produce real LLM-backed responses.
+ * supervisor slash commands drive real tool execution through a real,
+ * spawned opencode server.
+ *
+ * Isolation: the spawned server gets a throwaway $HOME (no
+ * ~/.config/opencode/opencode.json, no ~/.local/share/opencode/auth.json) so
+ * it never merges in the ambient user's global plugins/MCP servers/model
+ * config (opencode merges — not replaces — global and project config; see
+ * https://opencode.ai/docs/config/#locations and
+ * https://opencode.ai/docs/plugins/#load-order). Without this, the spawned
+ * server would ALSO load the user's other global opencode plugins and even
+ * a second, stale copy of THIS plugin from the real (non-worktree) repo path
+ * if one happens to be configured globally — silently testing a mix of old
+ * and new plugin code instead of only the worktree under test.
+ *
+ * The model behind the server is a local, deterministic, OpenAI-compatible
+ * fixture (test/helpers/opencode-fixture-llm.mjs) configured as a custom
+ * `npm: "@ai-sdk/openai-compatible"` provider — the same mechanism
+ * opencode's own docs use for local models. This replaces the previous
+ * approach of discovering and calling a live, free, remote model from
+ * whatever provider happened to be connected in the ambient environment,
+ * which was both non-deterministic and prone to real "Streaming response
+ * failed" failures from that third party — a dependency outside this test's
+ * isolation boundary and unrelated to the code under test here. The real
+ * opencode server, the real plugin, and the real tool implementations are
+ * still exercised end to end over real HTTP.
  *
  * Run: node --experimental-strip-types --test test/e2e-opencode.test.mjs
  */
@@ -11,15 +35,29 @@
 import { describe, test, before, after } from "node:test"
 import assert from "node:assert/strict"
 import { spawn, execSync } from "node:child_process"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { createServer } from "node:net"
+import { startFixtureLlmServer } from "./helpers/opencode-fixture-llm.mjs"
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url))
 const REPO_ROOT = join(__dirname, "..")
 const PLUGIN_PATH = join(REPO_ROOT, "opencode", "supervisor.ts")
+
+// Ambient credential env vars known to auto-enable real remote providers in
+// this environment (GitHub Copilot/Models via gh CLI token, Cloudflare AI
+// Gateway, etc). Stripped from the spawned server's env as defense in depth
+// on top of the isolated $HOME — belt and suspenders so the isolated server
+// can never reach a real provider even by accident. This does NOT touch the
+// user's actual global config/credentials; it only affects this child
+// process's environment.
+const AMBIENT_PROVIDER_ENV_VARS = [
+  "GITHUB_TOKEN", "GH_TOKEN", "CLOUDFLARE_API_TOKEN",
+  "AZURE_DEV_AI_API_KEY", "AZURE_DEV_AI_BASE_URL",
+  "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+]
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,97 +85,6 @@ function findFreePort() {
   })
 }
 
-/**
- * Query the running opencode server for a free, text-capable model from a
- * connected provider. Probes each candidate with a brief test message to
- * verify actual API access (being listed as free does not guarantee access).
- *
- * Returns { providerID, modelID } or throws if no working model is found.
- * Priority: opencode → github-models → others.
- */
-async function pickFreeModel(baseUrl) {
-  const res = await fetch(`${baseUrl}/provider`)
-  if (!res.ok) throw new Error(`/provider returned ${res.status}`)
-  const { all = [], connected = [] } = await res.json()
-  const connectedSet = new Set(connected)
-
-  const PRIORITY = ["opencode", "github-models"]
-  const candidates = []
-  for (const provider of all) {
-    if (!connectedSet.has(provider.id)) continue
-    for (const [modelId, model] of Object.entries(provider.models || {})) {
-      const { input: inputCost = 999, output: outputCost = 999 } = model.cost || {}
-      if (inputCost !== 0 || outputCost !== 0) continue
-      if (model.status !== "active") continue
-      const inputCaps = (model.capabilities || {}).input || {}
-      const outputCaps = (model.capabilities || {}).output || {}
-      if (inputCaps.text === false || outputCaps.text === false) continue
-      candidates.push({ providerID: provider.id, modelID: modelId })
-    }
-  }
-
-  candidates.sort((a, b) => {
-    const ai = PRIORITY.indexOf(a.providerID)
-    const bi = PRIORITY.indexOf(b.providerID)
-    return (ai === -1 ? Infinity : ai) - (bi === -1 ? Infinity : bi)
-  })
-
-  if (candidates.length === 0) {
-    throw new Error(
-      "No free text-capable model found in connected providers. " +
-      "Configure a provider in ~/.config/opencode/opencode.json"
-    )
-  }
-
-  // Probe each candidate — a model listed as free may still deny access.
-  // Use a 30s timeout per probe; fast API errors (< 2s) let us scan quickly.
-  for (const candidate of candidates) {
-    try {
-      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
-      if (!createRes.ok) continue
-      const { id: sessionId } = await createRes.json()
-
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 30_000)
-      let probeOk = false
-      try {
-        const probeRes = await fetch(`${baseUrl}/session/${sessionId}/message`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            parts: [{ type: "text", text: "hi" }],
-            model: { providerID: candidate.providerID, modelID: candidate.modelID },
-          }),
-          signal: controller.signal,
-        })
-        if (probeRes.ok) {
-          const data = await probeRes.json()
-          // APIError in the info.error field means no access — skip this model
-          const hasApiError = JSON.stringify(data).includes('"name":"APIError"')
-          probeOk = !hasApiError
-        }
-      } catch {
-        // timeout or network error — model too slow or unreachable, skip
-      } finally {
-        clearTimeout(timer)
-      }
-
-      if (probeOk) {
-        process.stdout.write(`[e2e] model: ${candidate.providerID}/${candidate.modelID}\n`)
-        return candidate
-      }
-      process.stdout.write(`[e2e] skip ${candidate.providerID}/${candidate.modelID} (no access or timeout)\n`)
-    } catch {
-      // skip
-    }
-  }
-
-  throw new Error(
-    "No working free text-capable model found in connected providers. " +
-    "Configure a provider in ~/.config/opencode/opencode.json"
-  )
-}
-
 /** Poll a URL until it responds with status 200 or timeout expires. */
 async function waitForHealth(url, timeoutMs = 15_000, intervalMs = 500) {
   const deadline = Date.now() + timeoutMs
@@ -154,7 +101,7 @@ async function waitForHealth(url, timeoutMs = 15_000, intervalMs = 500) {
 }
 
 /**
- * Send a message to a session and wait for the full LLM response.
+ * Send a message to a session and wait for the full response.
  * Treats timeout as FAILURE (not a false-positive success).
  * @param {object} [opts] - Optional settings
  * @param {object} [opts.model] - Model override: {providerID, modelID}
@@ -190,66 +137,61 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   let serverProc
   let baseUrl
   let tmpDir
-  let model   // auto-discovered free model, set in before()
+  let isolatedHome
+  let fixtureLlm
+  const model = { providerID: "test-fixture", modelID: "fixture-model" }
 
   before(async () => {
-    // 1. Create an isolated temp directory.
+    // 1. Isolated project directory (server cwd / project config root).
     tmpDir = mkdtempSync(join(tmpdir(), "sup-e2e-oc-"))
 
-    function writeConfig(modelSpec) {
-      const cfg = { $schema: "https://opencode.ai/config.json", plugin: [PLUGIN_PATH] }
-      if (modelSpec) {
-        cfg.model = modelSpec
-      }
-      writeFileSync(join(tmpDir, "opencode.json"), JSON.stringify(cfg, null, 2))
+    // 2. Isolated $HOME — no global opencode.json, no auth.json, no global
+    //    plugins. See the module docstring above for why this matters.
+    isolatedHome = mkdtempSync(join(tmpdir(), "sup-e2e-home-"))
+
+    // 3. Local deterministic fixture LLM (see test/helpers/opencode-fixture-llm.mjs).
+    fixtureLlm = await startFixtureLlmServer()
+
+    // 4. Project config: only this worktree's plugin, and a custom
+    //    OpenAI-compatible provider pointing at the fixture (same mechanism
+    //    documented at https://opencode.ai/docs/providers/#atomic-chat).
+    const cfg = {
+      $schema: "https://opencode.ai/config.json",
+      plugin: [PLUGIN_PATH],
+      model: `${model.providerID}/${model.modelID}`,
+      provider: {
+        [model.providerID]: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Test Fixture (local, deterministic)",
+          options: {
+            baseURL: fixtureLlm.baseURL,
+            apiKey: "fixture-key",
+          },
+          models: {
+            [model.modelID]: {
+              name: "Fixture Model",
+              tool_call: true,
+              cost: { input: 0, output: 0 },
+              limit: { context: 32_000, output: 4096 },
+            },
+          },
+        },
+      },
     }
+    writeFileSync(join(tmpDir, "opencode.json"), JSON.stringify(cfg, null, 2))
 
-    // Phase 1: start a throwaway server in a SEPARATE temp directory to query
-    // /provider and probe for an accessible free model. A separate dir avoids
-    // leaving stale probe-session DB rows that would confuse the real server.
-    // Writing the free model into the real server's config BEFORE starting it
-    // ensures supervisor continuations (no model in body) use it too.
-    const discoverDir = mkdtempSync(join(tmpdir(), "sup-e2e-discover-"))
-    const discoverCfg = { $schema: "https://opencode.ai/config.json", plugin: [PLUGIN_PATH] }
-    writeFileSync(join(discoverDir, "opencode.json"), JSON.stringify(discoverCfg, null, 2))
-    const discoverPort = await findFreePort()
-    const discoverProc = spawn("opencode", ["serve", "--port", String(discoverPort), "--hostname", "127.0.0.1"], {
-      cwd: discoverDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-      env: { ...process.env, HOME: process.env.HOME },
-    })
-    discoverProc.stdout.on("data", (c) => process.stdout.write("[opencode.discover] " + c.toString()))
-    discoverProc.stderr.on("data", (c) => process.stderr.write("[opencode.discover] " + c.toString()))
-    discoverProc.stdout?.unref?.()
-    discoverProc.stderr?.unref?.()
-    discoverProc.unref()
-
-    try {
-      await Promise.race([
-        waitForHealth(`http://127.0.0.1:${discoverPort}/global/health`),
-        new Promise((_, rej) => discoverProc.on("exit", (code) => rej(new Error(`discover server exited (code ${code})`)))),
-      ])
-      model = await pickFreeModel(`http://127.0.0.1:${discoverPort}`)
-    } finally {
-      try { process.kill(-discoverProc.pid, "SIGKILL") } catch { try { discoverProc.kill("SIGKILL") } catch { /* ignore */ } }
-      discoverProc.stdout?.destroy()
-      discoverProc.stderr?.destroy()
-      try { rmSync(discoverDir, { recursive: true, force: true }) } catch { /* ignore */ }
-      await new Promise((r) => setTimeout(r, 400)) // let OS reclaim the port
-    }
-
-    // 2. Write final config with the discovered free model as the session default.
-    writeConfig(`${model.providerID}/${model.modelID}`)
-
-    // 3. Spawn the real server.
+    // 5. Spawn the real server with the isolated $HOME and without ambient
+    //    provider credentials.
     const port = await findFreePort()
     baseUrl = `http://127.0.0.1:${port}`
+    const childEnv = { ...process.env, HOME: isolatedHome }
+    for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
+
     serverProc = spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
       cwd: tmpDir,
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
-      env: { ...process.env, HOME: process.env.HOME },
+      env: childEnv,
     })
 
     let stderrBuf = ""
@@ -265,7 +207,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     serverProc.stderr?.unref?.()
     serverProc.unref()
 
-    // 4. Wait for health.
+    // 6. Wait for health.
     try {
       await Promise.race([
         waitForHealth(`${baseUrl}/global/health`),
@@ -280,10 +222,10 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       throw err
     }
 
-    process.stdout.write(`[e2e] LLM model: ${model.providerID}/${model.modelID}\n`)
+    process.stdout.write(`[e2e] fixture model: ${model.providerID}/${model.modelID} @ ${fixtureLlm.baseURL}\n`)
   })
 
-  after(() => {
+  after(async () => {
     // Kill the process group (detached spawn uses its own group)
     if (serverProc && !serverProc.killed) {
       try {
@@ -295,10 +237,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     // Destroy remaining pipe streams to prevent hanging
     serverProc?.stdout?.destroy()
     serverProc?.stderr?.destroy()
-    // Clean up temp directory
-    if (tmpDir) {
-      rmSync(tmpDir, { recursive: true, force: true })
+    // Close the fixture LLM server.
+    if (fixtureLlm) {
+      try { await fixtureLlm.close() } catch { /* ignore */ }
     }
+    // Clean up temp directories.
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true })
+    if (isolatedHome) rmSync(isolatedHome, { recursive: true, force: true })
     // Force exit after a brief delay if node won't quit
     setTimeout(() => process.exit(0), 500).unref()
   })
@@ -349,14 +294,41 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(sessions.length > 0, "Should have at least one session (from prior test)")
   })
 
+  // Runs BEFORE any test that sets a goal (below), so the project has no
+  // .agents/supervisor/Goal.md or goal.md yet — required for the "no
+  // existing goal" branch of deriveAndSetGoal (opencode/supervisor-impl.ts)
+  // to actually trigger instead of short-circuiting on a pre-existing goal.
+  test("supervisor goal command with no condition derives and persists .agents/supervisor/goal.md", { timeout: 300_000 }, async () => {
+    const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+    assert.equal(createRes.status, 200)
+    const session = await createRes.json()
+
+    // Give the session a task to derive a goal FROM (deriveAndSetGoal reads
+    // the session transcript via buildTaskContext).
+    await sendMessage(baseUrl, session.id, "Add input validation to the login form.", 120_000, { model })
+
+    // No condition, no existing session/project goal — must attempt LLM
+    // derivation (align-supervisor-modes binding contract) rather than
+    // silently no-op or fabricate a default.
+    const goalRes = await sendMessage(baseUrl, session.id, "/supervisor goal", 120_000, { model })
+    assert.ok(goalRes, "Goal derivation response should not be null")
+    const goalContent = JSON.stringify(goalRes)
+
+    const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
+    assert.ok(existsSync(goalMdPath), `Expected derived goal to be persisted at ${goalMdPath}`)
+    const persisted = readFileSync(goalMdPath, "utf8").trim()
+    assert.ok(persisted.length > 0, "Derived goal.md should not be empty")
+    assert.ok(
+      goalContent.toLowerCase().includes("derived") || goalContent.includes(persisted),
+      `Expected goal response to acknowledge derivation or echo the persisted condition. Got: ${goalContent.slice(0, 500)}`
+    )
+  })
+
   test("supervisor goal set/status/clear works", { timeout: 900_000 }, async () => {
     // Create a fresh session
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
-
-    // The goal command triggers an LLM call (slash command → brainstormer agent).
-    // `model` is auto-discovered from connected providers in before().
 
     // 1. Set a goal
     const setRes = await sendMessage(baseUrl, session.id, "/supervisor goal all tests pass", 300_000, { model })
@@ -415,13 +387,54 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   })
 
   describe("autopilot mode", () => {
-    // Uses the suite-level `model` auto-discovered in before().
+    // Uses the suite-level fixture `model` — no cooldown needed since the
+    // fixture is local and instantaneous (no remote rate limiting to avoid).
 
-    // Cool down after prior LLM-heavy tests to avoid provider rate limiting.
-    // The goal test makes 3 LLM calls and reflection makes 1 — spacing them
-    // out prevents hitting the opencode provider rate window.
-    before(async () => {
-      await new Promise(r => setTimeout(r, 30_000))
+    // Proves the real `autopilot_exit` tool (opencode/supervisor-impl.ts,
+    // executeAutopilotExit) round-trips end to end: enabling autopilot makes
+    // the tool available to the model; a plain, non-"/supervisor"
+    // continuation-style message (standing in for the nudge the plugin's own
+    // session.idle handler injects) causes the fixture to call it, the real
+    // server executes it, and supervisorStore records autopilot as disabled
+    // for the session — the concrete mechanism by which "the agent must call
+    // autopilot_exit to stop" (see the tool's own description string) works.
+    test("autopilot_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
+      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+      assert.equal(createRes.status, 200)
+      const session = await createRes.json()
+
+      const enableRes = await sendMessage(baseUrl, session.id, "/supervisor autopilot", 120_000, { model })
+      assert.ok(JSON.stringify(enableRes).toLowerCase().includes("autopilot"))
+
+      // Plain continuation nudge — no "/supervisor" prefix, tools available.
+      // The fixture routes this to autopilot_exit (see
+      // test/helpers/opencode-fixture-llm.mjs), exactly as a real model is
+      // instructed to once "genuinely completed ALL work" (see the
+      // autopilotExitDescription / continuation-nudge prompt text in
+      // opencode/supervisor-impl.ts).
+      const exitRes = await sendMessage(baseUrl, session.id, "Continue with the next step.", 120_000, { model })
+      const exitContent = JSON.stringify(exitRes).toLowerCase()
+      assert.ok(
+        exitContent.includes("exit") || exitContent.includes("autopilot completed"),
+        `Expected autopilot_exit tool round-trip to be reflected in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
+      )
+
+      // Confirm the mode was actually flipped off server-side (not merely
+      // that the tool call text was echoed) by checking status afterward.
+      // executeAutopilotExit -> supervisorStore.setAutopilot(..., false) ->
+      // setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
+      // (core/goal.mjs), so the status report's "mode:" line must read
+      // "reflection", never "autopilot".
+      const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 120_000, { model })
+      const statusContent = JSON.stringify(statusRes).toLowerCase()
+      assert.ok(
+        statusContent.includes("mode: reflection"),
+        `Expected mode: reflection after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+      )
+      assert.ok(
+        !statusContent.includes("mode: autopilot"),
+        `Expected autopilot to be disabled after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+      )
     })
 
     test("autopilot lifecycle: enable, status, switch to reflection, switch to goal", { timeout: 900_000 }, async () => {
