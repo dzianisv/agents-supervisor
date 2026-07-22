@@ -125,7 +125,7 @@ Analyze the task context, the agent's last response, and the tool signals to det
 - Mode: ${safeContext.agentMode}
 - Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
 - Detected signals: ${signalSummary}
-
+${safeContext.toolActivityNote ? `- ${safeContext.toolActivityNote}\n` : ''}
 ## Tool Commands Run
 ${safeContext.toolsSummary}
 ${assistantSection}${attemptSection}

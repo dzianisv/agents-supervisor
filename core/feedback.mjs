@@ -23,12 +23,23 @@ function rewriteIfDestructive(item) {
   return isDestructiveAction(item) ? `Flag to the user for approval: ${item}` : item
 }
 
+/**
+ * Build the single continuation message the reflection judge's verdict is
+ * rendered into. IMPORTANT: this function has exactly ONE authority over
+ * completion feedback — the judge's own verdict (missing/next_actions/
+ * feedback/confidence). It must never substitute a deterministic,
+ * judge-independent "STOP" script (e.g. a planning-loop or action-loop
+ * watchdog) for that verdict — doing so previously let a heuristic tool-call
+ * ratio override genuine judge output. Deterministic tool-call telemetry may
+ * still inform the judge as non-binding evidence upstream (see
+ * core/evaluation.mjs's describeToolActivity, threaded into the judge prompt
+ * via TaskContext.toolActivityNote) — it just never bypasses this function's
+ * output.
+ */
 export function buildEscalatingFeedback(
   attemptCount,
   severity,
   verdict,
-  isPlanningLoop,
-  isActionLoop,
   maxAttempts
 ) {
   const safeVerdict = verdict ?? {}
@@ -37,35 +48,6 @@ export function buildEscalatingFeedback(
   const feedbackStr = safeVerdict.feedback || ''
   const confidence = typeof safeVerdict.confidence === 'number' ? safeVerdict.confidence : undefined
   const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
-  if (isPlanningLoop) {
-    return `${FEEDBACK_MARKER} STOP: Planning Loop Detected
-
-You have been reading files, checking git status, and creating todo lists without writing any code.
-
-DO NOT:
-- Run git status or git log again
-- Create another todo list
-- Read more files "for context"
-- Say "let me get right to work" without actually working
-
-DO NOW:
-Pick the FIRST item from your existing todo list and implement it. Open a file with Edit or Write and make changes. If you don't know where to start, create the simplest possible file first.
-
-Start coding NOW. No more planning.`
-  }
-
-  if (isActionLoop) {
-    return `${FEEDBACK_MARKER} STOP: Action Loop Detected (attempt ${attemptCount}/${effectiveCap})
-
-You are repeating the same commands without making progress. Running the same deploy/test/build cycle again will produce the same result.
-
-STOP and do ONE of these:
-1. If the same test/eval keeps failing, analyze the failure output and fix the root cause before re-running.
-2. If you cannot fix the root cause, explain what is blocking you and ask the user for help.
-3. Try a completely different approach (e.g., test locally instead of via deployment).
-
-Do NOT re-run the same command hoping for a different result.`
-  }
 
   // One calm template, always — no attempt-count escalation tiers. Nothing
   // here ever claims this is a "final" or "last" chance; only the reason

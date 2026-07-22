@@ -13,6 +13,9 @@ The supervisor resolves media the agent delivered and may attach it directly to 
 - Heuristic signals (repo checks; informative, not binding): {{requirements}}
 - Detected signals: {{signals}}
 
+{{#toolActivityNote}}
+- {{toolActivityNote}}
+{{/toolActivityNote}}
 ## Tool Commands Run
 {{toolsSummary}}
 

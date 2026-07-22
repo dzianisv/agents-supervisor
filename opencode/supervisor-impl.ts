@@ -18,7 +18,9 @@ import {
   resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
-  extractGoalCondition, writeProjectGoal, GOAL_CONDITION_MAX_LEN,
+  writeProjectGoal, GOAL_CONDITION_MAX_LEN,
+  readProjectGoalCondition, writeDerivedProjectGoal,
+  buildGoalDerivationPrompt, parseDerivedGoalResponse,
 } from "../core/goal.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
@@ -28,7 +30,7 @@ import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
   detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
   pushedToDefaultBranch, hasCodeChangeEvidence, detectPlanningLoop, shouldApplyPlanningLoop,
-  detectActionLoop, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
+  detectActionLoop, describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
 } from "../core/evaluation.mjs"
 import {
@@ -316,6 +318,14 @@ interface TaskContext extends WorkflowRequirements {
   detectedSignals: string[]
   recentCommands: string[]
   pushedToDefaultBranch: boolean
+  /**
+   * Neutral, factual, non-binding description of recent tool-call activity
+   * (see core/evaluation.mjs's describeToolActivity). NEVER a verdict —
+   * bounded to a recent message window, threaded into prompts purely as
+   * evidence the judge (or the autopilot nudge) MAY cite, never as
+   * something that decides or overrides completion/progress on its own.
+   */
+  toolActivityNote?: string
 }
 
 interface SelfAssessment {
@@ -912,6 +922,15 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
 
   const toolsSummary = commands.slice(-6).join("\n") || "(none)"
 
+  // Bounded (recent-only, not full-session) telemetry — purely descriptive,
+  // never a judgment. See core/evaluation.mjs's describeToolActivity: this
+  // is the ONLY thing autopilot's static nudge or the reflection judge
+  // prompt may cite as "recent activity has been read-heavy" style context;
+  // neither surface may use it to decide completion/progress or to swap in
+  // a scripted verdict. Bounded to a recent window of messages (not the
+  // full historical session) so the note stays factual and current.
+  const toolActivityNote = describeToolActivity(detectPlanningLoop(messages.slice(-20)))
+
   return {
     taskSummary,
     taskType,
@@ -926,7 +945,8 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
     requiresPR,
     requiresCI,
     requiresLocalTests,
-    requiresLocalTestsEvidence
+    requiresLocalTestsEvidence,
+    toolActivityNote: toolActivityNote || undefined
   }
 }
 
@@ -1019,6 +1039,110 @@ async function analyzeSelfAssessmentWithLLM(
         await client.session.delete({ path: { id: judgeSession.id }, query: { directory } })
       } catch {}
       judgeSessionIds.delete(judgeSession.id)
+    }
+  }
+
+  return null
+}
+
+/**
+ * LLM goal-derivation for `goal` mode invoked with no explicit condition and
+ * no existing session/project goal. Binding contract (align-supervisor-modes):
+ * goal mode is not allowed to fabricate a static default — on ANY failure
+ * (no model available, session/network error, unparseable response, or a
+ * response that fails strict falsifiability/injection validation via
+ * core/goal.mjs's parseDerivedGoalResponse) this returns null and the caller
+ * MUST surface an explicit "please set a goal manually" message rather than
+ * inventing one. This function owns only the runtime plumbing — spawning an
+ * ephemeral judge-style session per candidate model, mirroring the same
+ * model cascade used by analyzeSelfAssessmentWithLLM above — the actual
+ * prompt construction and response validation live in core/goal.mjs so both
+ * are independently unit-testable without a network call.
+ */
+async function deriveGoalWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  agents: string,
+  sessionMessages: any[],
+  judgeSessionIds: Set<string>
+): Promise<{ condition: string; rationale: string } | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
+  // Named modelAttempts (NOT `attempts`) — the SupervisorPlugin closure
+  // already declares `attempts` as the per-message attempt-count Map; this
+  // function is standalone (not nested in that closure) so there is no
+  // actual shadowing bug, but the distinct name avoids any confusion when
+  // reading this alongside that closure.
+  const modelAttempts = modelList.length
+    ? modelList
+    : preferredModel && !isBlockedJudgeModel(preferredModel)
+      ? [preferredModel]
+      : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+        ? [sessionModelSpec]
+        : [JUDGE_FREE_FALLBACK]
+
+  // Transcript excerpt is untrusted data — see buildGoalDerivationPrompt's
+  // fencing/security framing in core/goal.mjs. Bounded to the last few
+  // messages so a long session can't blow the prompt budget.
+  const transcriptExcerpt = (sessionMessages || [])
+    .slice(-10)
+    .map((m: any) => {
+      const role = m.info?.role || "unknown"
+      const text = (m.parts || [])
+        .filter((p: any) => p.type === "text" && p.text)
+        .map((p: any) => p.text)
+        .join(" ")
+      return text ? `${role}: ${text.slice(0, 500)}` : ""
+    })
+    .filter(Boolean)
+    .join("\n")
+
+  const prompt = buildGoalDerivationPrompt({
+    taskSummary: context.taskSummary,
+    transcriptExcerpt,
+    agentsExcerpt: agents,
+  })
+
+  for (const modelSpec of modelAttempts) {
+    let derivationSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      derivationSession = data
+    } catch {
+      return null
+    }
+    if (!derivationSession?.id) return null
+    judgeSessionIds.add(derivationSession.id)
+
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: derivationSession.id },
+        body
+      })
+
+      const response = await waitForResponse(client, derivationSession.id)
+      if (!response) continue
+
+      const derived = parseDerivedGoalResponse(response)
+      if (!derived) continue
+      return derived
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "goal-derivation-session" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: derivationSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(derivationSession.id)
     }
   }
 
@@ -1247,14 +1371,58 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const condition = (args.condition || "").trim().slice(0, GOAL_CONDITION_MAX_LEN)
     if (!condition) {
       const st = await supervisorStore.load(directory, sid)
-      if (!st.goal) return "No goal set for this session."
-      return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+      if (st.goal) {
+        return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+      }
+      const projectCondition = readProjectGoalCondition(directory)
+      if (projectCondition) {
+        return `No session goal set, but a project-level goal exists (.agents/supervisor/Goal.md or goal.md): "${projectCondition}". Reflection mode will already enforce it; call supervisor_goal with an explicit condition to set a session-level goal instead.`
+      }
+      // Binding contract (align-supervisor-modes): goal mode invoked with no
+      // condition AND no existing session/project goal MUST attempt an LLM
+      // derivation rather than silently no-op-ing. On any failure/invalid
+      // result, do NOT fabricate a default — ask the user to set one.
+      return await deriveAndSetGoal(sid)
     }
     await supervisorStore.setGoal(directory, sid, condition, {})
     // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
     // across sessions. Safe under concurrent writers — see writeProjectGoal.
     writeProjectGoal(directory, condition)
     return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/Goal.md for reflection mode.`
+  }
+
+  /**
+   * Derive a concise, falsifiable goal via LLM when goal mode is invoked
+   * with no condition and nothing is set yet (see deriveGoalWithLLM above
+   * for the model cascade / ephemeral-session plumbing, and
+   * core/goal.mjs's buildGoalDerivationPrompt / parseDerivedGoalResponse for
+   * the prompt-injection-resistant prompt + strict validation). On success,
+   * persists to BOTH session state (so the goal loop starts enforcing it
+   * immediately) and the project-level goal.md (so it survives across
+   * sessions the same way a manually-set goal does). On failure/invalid
+   * derivation, sets nothing and says so explicitly — never a fabricated
+   * default.
+   */
+  const deriveAndSetGoal = async (sid: string): Promise<string> => {
+    let messages: any[] = []
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      messages = Array.isArray(data) ? data : []
+    } catch {
+      return "Could not derive a goal: failed to read the session transcript. Set one manually: /supervisor:goal <condition>"
+    }
+    const context = await buildTaskContext(messages, directory)
+    if (!context) {
+      return "Could not derive a goal: no task context yet (session has no user message). Set one manually: /supervisor:goal <condition>"
+    }
+    const agents = await getAgentsFile(directory)
+    const derived = await deriveGoalWithLLM(client, directory, context, agents, messages, judgeSessionIds)
+    if (!derived) {
+      return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:goal <condition>"
+    }
+    await supervisorStore.setGoal(directory, sid, derived.condition, {})
+    writeDerivedProjectGoal(directory, derived.condition)
+    return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/goal.md.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
   const executeSupervisorRetry = async (args: { n?: number }) => {
@@ -1522,9 +1690,14 @@ Do NOT call this tool:
         const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
 
         // ── Autopilot fast-path ──────────────────────────────────────────
-        // When autopilot is on, skip the judge entirely and inject a
-        // prescriptive nudge directly into the active session. Still honour
-        // the attempt budget and loop detectors as safety rails.
+        // Binding contract: autopilot is a STATIC nudge loop only. It never
+        // determines whether there is a planning/action loop, never decides
+        // progress/completion, and never emits a deterministic STOP verdict
+        // — only the agent's own autopilot_exit tool call and this budget
+        // check may stop the loop. Neutral, bounded tool-activity telemetry
+        // (context.toolActivityNote) may enrich the nudge as factual
+        // context, but it is never branched on to change what the nudge
+        // says or to author a judgment.
         if (mode === "autopilot") {
           const autopilotAttempt = (attempts.get(attemptKey) || 0) + 1
           attempts.set(attemptKey, autopilotAttempt)
@@ -1537,38 +1710,12 @@ Do NOT call this tool:
             return
           }
 
-          const loopCheck = detectPlanningLoop(messages)
-          const usePlanningLoopMsg = shouldApplyPlanningLoop(context.taskType, loopCheck.detected)
-          const actionLoopCheck = detectActionLoop(messages)
-
-          if (usePlanningLoopMsg || actionLoopCheck.detected) {
-            // Loop detected — use the normal escalating feedback for loops
-            const loopFeedback = buildEscalatingFeedback(
-              autopilotAttempt,
-              "HIGH",
-              { feedback: "Autopilot loop detected — take concrete action.", missing: [], next_actions: [] },
-              usePlanningLoopMsg,
-              actionLoopCheck.detected,
-              effectiveMaxAttempts
-            )
-            try {
-              await client.session.promptAsync({
-                path: { id: sessionId },
-                body: { parts: [{ type: "text", text: loopFeedback }] }
-              })
-            } catch (e: any) {
-              debug("promptAsync failed (autopilot loop):", e?.message || e)
-              reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot-loop" })
-            }
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
-            return
-          }
-
-          // Normal autopilot nudge — no judge, just continue
+          // Normal autopilot nudge — no judge, no loop verdict, just continue.
+          const activityLine = context.toolActivityNote ? `\n${context.toolActivityNote}\n` : ""
           const nudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
 
 You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
-
+${activityLine}
 When you have genuinely completed ALL work (not just one step), call the autopilot_exit tool to hand control back.
 
 Continue now.`
@@ -1591,13 +1738,14 @@ Continue now.`
         // MUST compose with the existing gates.
         const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
 
-        // Reflection mode: also read project-level goal from .agents/supervisor/Goal.md
+        // Reflection mode: also read project-level goal from
+        // .agents/supervisor/Goal.md (or the lower-case goal.md — see
+        // core/goal.mjs's readProjectGoalCondition / writeDerivedProjectGoal,
+        // which shares this same lookup order with the LLM-derivation path).
         let projectGoalSection = ""
         if (mode === "reflection" && !goal) {
           try {
-            const goalFilePath = join(directory, ".agents", "supervisor", "Goal.md")
-            const goalFileContent = await readFile(goalFilePath, "utf-8")
-            const cond = extractGoalCondition(goalFileContent)
+            const cond = readProjectGoalCondition(directory)
             if (cond) projectGoalSection = buildGoalRequirementSection(cond)
           } catch {}
         }
@@ -1898,9 +2046,15 @@ Continue now.`
           return
         }
 
-        const loopCheck = detectPlanningLoop(preFeedbackMessages || messages)
-        const usePlanningLoopMessage = shouldApplyPlanningLoop(context.taskType, loopCheck.detected)
-        const actionLoopCheck = detectActionLoop(preFeedbackMessages || messages)
+        // Reflection is the SOLE completion/progress judgement authority.
+        // buildEscalatingFeedback is driven purely by the judge's own
+        // verdict fields (analysis.severity/reason/missing/nextActions) —
+        // no deterministic planning/action-loop detector may compute or
+        // substitute a "STOP: Loop Detected" script here anymore.
+        // Deterministic tool-call telemetry (context.toolActivityNote) is
+        // already threaded upstream as non-binding evidence INTO the judge's
+        // own prompt (see buildReflectionPrompt/buildSelfAssessmentPrompt) —
+        // it never bypasses the judge to construct feedback directly.
         const feedbackText = buildEscalatingFeedback(
           nextAttemptCount,
           analysis.severity || "MEDIUM",
@@ -1910,8 +2064,6 @@ Continue now.`
             next_actions: analysis.nextActions,
             confidence: parsedAssessment?.confidence
           },
-          usePlanningLoopMessage,
-          actionLoopCheck.detected,
           effectiveMaxAttempts
         )
 

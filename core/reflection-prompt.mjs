@@ -47,28 +47,51 @@ export function interpolateTemplate(template, vars) {
   return result
 }
 
+// Legacy/mixed-case compatibility: this repo's established, tested
+// convention is the capitalized filenames (SystemPrompt.md, Patterns.md,
+// User.md, Goal.md — see test/reflection.test.mjs) and that remains the
+// primary, preferred lookup. Some projects/tooling may instead write
+// all-lowercase filenames (e.g. an auto-derived goal.md — see
+// core/goal.mjs's writeDerivedProjectGoal). This alias map is purely
+// ADDITIVE: the capitalized name is always tried first, at both the project
+// and defaults location, before any alias is considered.
+const FILENAME_ALIASES = {
+  'SystemPrompt.md': 'system.md',
+  'Patterns.md': 'patterns.md',
+  'User.md': 'user.md',
+  'Goal.md': 'goal.md',
+}
+
 /**
  * Try `<directory>/.agents/supervisor/<filename>` first, falling back to
- * `<defaultsDir>/<filename>` (the plugin's shipped defaults). Returns null
- * if neither exists.
+ * `<defaultsDir>/<filename>` (the plugin's shipped defaults). If the primary
+ * (typically capitalized) filename isn't found at either location, also
+ * tries its lower-case/legacy alias (see FILENAME_ALIASES) at both
+ * locations before giving up. Returns null if nothing is found anywhere.
  * @param {string} directory
  * @param {string} defaultsDir
  * @param {string} filename
  * @returns {Promise<string|null>}
  */
 async function readSupervisorFile(directory, defaultsDir, filename) {
-  const projectPath = join(directory, '.agents', 'supervisor', filename)
-  try {
-    return await readFile(projectPath, 'utf-8')
-  } catch (e) {
-    if (e.code !== 'ENOENT') return null
+  const candidates = [filename, FILENAME_ALIASES[filename]].filter(Boolean)
+  for (const name of candidates) {
+    const projectPath = join(directory, '.agents', 'supervisor', name)
+    try {
+      return await readFile(projectPath, 'utf-8')
+    } catch (e) {
+      if (e.code !== 'ENOENT') return null
+    }
   }
   if (!defaultsDir) return null
-  try {
-    return await readFile(join(defaultsDir, filename), 'utf-8')
-  } catch {
-    return null
+  for (const name of candidates) {
+    try {
+      return await readFile(join(defaultsDir, name), 'utf-8')
+    } catch {
+      /* try next candidate */
+    }
   }
+  return null
 }
 
 /**
@@ -149,6 +172,11 @@ export async function buildReflectionPrompt({
     maxAttempts: String(effectiveCap),
     projectInstructions: agents ? agents.slice(0, 800) : undefined,
     goalSection: effectiveGoalSection || undefined,
+    // Non-binding evidence only (see core/evaluation.mjs's describeToolActivity)
+    // — never a verdict. The judge template may cite this as bounded factual
+    // context; it must never be treated as (or substituted for) the judge's
+    // own completion decision.
+    toolActivityNote: safeContext.toolActivityNote || undefined,
   }
 
   // If the system prompt file exists, use the file-based approach

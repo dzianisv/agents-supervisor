@@ -23,6 +23,7 @@ import {
   resolveSupervisorMode,
   writeProjectGoal,
   writeSolofounderGoal,
+  readProjectGoalCondition,
 } from '../core/goal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -142,12 +143,35 @@ switch (cmd.kind) {
   case 'goal-status': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     const st = goalStore.load(cwd, sid);
-    if (!st.goal) console.log(`No ${GOAL_LABEL.toLowerCase()} set for this session.`);
-    else console.log(
-      `${GOAL_LABEL} (${st.goal.status}): ${st.goal.condition}\n` +
-      `attempts: ${st.goal.attempts}` +
-      (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '')
-    );
+    if (st.goal) {
+      console.log(
+        `${GOAL_LABEL} (${st.goal.status}): ${st.goal.condition}\n` +
+        `attempts: ${st.goal.attempts}` +
+        (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '')
+      );
+      break;
+    }
+    // No session goal. Binding contract (align-supervisor-modes): goal mode
+    // with no condition and nothing set MUST attempt an LLM derivation
+    // rather than silently no-op-ing — but this CLI has no LLM call wired
+    // in (see the OpenCode plugin's supervisor_goal tool for the actual
+    // derivation flow). Never fabricate a default here either way: report
+    // a project-level goal if one exists, otherwise say so explicitly and
+    // point at how to set one.
+    const projectCondition = readProjectGoalCondition(cwd);
+    if (projectCondition) {
+      console.log(
+        `No ${GOAL_LABEL.toLowerCase()} set for this session, but a project-level goal exists ` +
+        `(.agents/supervisor/Goal.md or goal.md): "${projectCondition}". ` +
+        `Reflection mode already enforces it; run 'supervisor goal <condition>' to set an explicit session goal instead.`
+      );
+    } else {
+      console.log(
+        `No ${GOAL_LABEL.toLowerCase()} set for this session or the project. ` +
+        `Automatic LLM-based goal derivation is only available via the OpenCode plugin's supervisor_goal tool; ` +
+        `on this CLI, set one explicitly: supervisor goal <condition>`
+      );
+    }
     break;
   }
 

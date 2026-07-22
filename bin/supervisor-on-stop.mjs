@@ -32,7 +32,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, buildCeoDirective } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, extractGoalCondition, readSolofounderGoal } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, readSolofounderGoal } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
@@ -817,37 +817,27 @@ async function main() {
   // deterministically instead of being silently pre-empted by CC.
   effectiveMax = Math.min(effectiveMax, HARD_CAP);
 
-  // Project-level goal: in reflection mode, read .agents/supervisor/Goal.md
+  // Project-level goal: in reflection mode, read the project goal
+  // (.agents/supervisor/Goal.md, or the lower-case goal.md written by the
+  // OpenCode-side LLM auto-derivation feature — see core/goal.mjs's
+  // readProjectGoalCondition for the shared precedence rule).
   let projectGoalSection = '';
   const effectiveMode = resolveSupervisorMode(goalState);
   if (effectiveMode !== 'goal' && effectiveMode !== 'solofounder' && !goal) {
-    try {
-      const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
-      const goalFileContent = fs.readFileSync(goalFilePath, 'utf8');
-      const cond = extractGoalCondition(goalFileContent);
-      if (cond) projectGoalSection = buildGoalRequirementSection(cond);
-    } catch {
-      // Goal.md not present or unreadable — no project goal
-    }
+    const cond = readProjectGoalCondition(cwd);
+    if (cond) projectGoalSection = buildGoalRequirementSection(cond);
   }
 
   // Solofounder: the judge must actually see the $1M ARR condition + evidence
   // rule as a MANDATORY completion requirement (unlike plain 'goal' mode,
   // which only surfaces goal.condition in the continuation feedback text, not
   // the judge prompt itself) — source it from solofounder.md, falling back to
-  // the shared Goal.md pointer if a drive was armed before that file existed.
+  // the shared Goal.md/goal.md pointer if a drive was armed before that file
+  // existed.
   let solofounderGoalSection = '';
   if (mode === 'solofounder') {
-    try {
-      let cond = readSolofounderGoal(cwd);
-      if (!cond) {
-        const goalFilePath = path.join(cwd, '.agents', 'supervisor', 'Goal.md');
-        cond = extractGoalCondition(fs.readFileSync(goalFilePath, 'utf8'));
-      }
-      if (cond) solofounderGoalSection = buildGoalRequirementSection(cond);
-    } catch {
-      // Neither file present/readable — fall back to goal.condition below.
-    }
+    const cond = readSolofounderGoal(cwd) || readProjectGoalCondition(cwd);
+    if (cond) solofounderGoalSection = buildGoalRequirementSection(cond);
   }
 
   const attempts = readAttempts(session_id, cwd, turnKey);
@@ -1010,14 +1000,15 @@ async function main() {
     complete: analysis.complete, severity: analysis.severity, reason: analysis.reason,
   };
 
-  // Helper: build escalating feedback message from analysis.
+  // Helper: build escalating feedback message from analysis. The judge's own
+  // verdict (missing/next_actions/feedback/confidence) is the only authority
+  // here — buildEscalatingFeedback no longer accepts a deterministic
+  // planning/action-loop override.
   function buildAnalysisFeedback() {
     return buildEscalatingFeedback(
       nextAttempt,
       analysis.severity,
       { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason, confidence: assessment?.confidence },
-      false,
-      false,
       effectiveMax,
     );
   }

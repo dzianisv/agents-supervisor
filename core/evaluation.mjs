@@ -40,7 +40,8 @@ export const AGENT_ACTION_PATTERNS = [
  *   toolsSummary: string,
  *   detectedSignals: string[],
  *   recentCommands: string[],
- *   pushedToDefaultBranch: boolean
+ *   pushedToDefaultBranch: boolean,
+ *   toolActivityNote?: string
  * }} TaskContext
  * @typedef {{
  *   task_summary?: string,
@@ -136,6 +137,26 @@ export function detectPlanningLoop(messages) {
 export function shouldApplyPlanningLoop(taskType, loopDetected) {
   if (!loopDetected) return false
   return taskType === 'coding'
+}
+
+/**
+ * Neutral, factual description of recent tool-call activity — NEVER a
+ * judgment or a verdict. This exists solely so autopilot's static nudge (and
+ * the judge prompt, as non-binding evidence) can be enriched with bounded,
+ * factual context such as "recent activity has been read-heavy" without
+ * either surface deciding on its own that a "loop" occurred or forcing a
+ * specific action. Deciding what (if anything) that activity MEANS is left
+ * entirely to the judge LLM in reflection mode, or to the agent itself in
+ * autopilot mode — this function only describes counts.
+ * @param {{ readCount?: number, writeCount?: number, totalTools?: number }} stats
+ * @returns {string} '' when there is nothing to report
+ */
+export function describeToolActivity(stats) {
+  const readCount = stats?.readCount ?? 0
+  const writeCount = stats?.writeCount ?? 0
+  const totalTools = stats?.totalTools ?? 0
+  if (totalTools === 0) return ''
+  return `Recent tool activity (informational only, not a verdict): ${totalTools} tool call${totalTools === 1 ? '' : 's'} — ${writeCount} write-type, ${readCount} read-only.`
 }
 
 /**
