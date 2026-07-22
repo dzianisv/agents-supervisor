@@ -23,9 +23,15 @@
  *     literal "on terse, exit 0, no LLM call" reading of the hook spec.
  *     Opt in via PLAINSPEAK_STRICT_TERSE_EXIT=1.
  *
- * Needs Claude Code OAuth or ANTHROPIC_API_KEY. With no creds it SKIPs
- * (exit 0) so CI without secrets stays green; set SUPERVISOR_EVAL_REQUIRE=1
- * to fail-on-skip instead.
+ * Credentials (Claude Code OAuth or ANTHROPIC_API_KEY) are required ONLY when
+ * at least one loaded row's scoreVerbosity verdict is 'suspect' in either
+ * routing mode (i.e. the corpus actually needs a live LLM judge call for at
+ * least one row) — see selectRowsNeedingLlm/shouldSkipForMissingAuth below.
+ * The shipped default corpus is fully deterministic (every row is 'terse' or
+ * 'verbose', never 'suspect') and always runs to completion with zero
+ * credentials, on any platform. When an LLM IS needed and none is available,
+ * this SKIPs (exit 0) so CI without secrets stays green; set
+ * SUPERVISOR_EVAL_REQUIRE=1 to fail-on-skip instead.
  *
  * Usage: node evals/plainspeak-eval.mjs [--cases <file.jsonl>] [--threshold 0.5] [--concurrency 8]
  */
@@ -47,7 +53,7 @@ const concurrency = parseInt(arg('concurrency', '8'), 10);
 const requireCreds = process.env.SUPERVISOR_EVAL_REQUIRE === '1';
 const MODEL = process.env.PLAINSPEAK_MODEL || 'claude-haiku-4-5-20251001';
 
-function hasAuth() {
+export function hasAuth() {
   if (process.env.ANTHROPIC_API_KEY) return true;
   try {
     const p = path.join(process.env.HOME || '', '.claude', '.credentials.json');
@@ -60,21 +66,44 @@ function hasAuth() {
 // --- for both modes at once (see file header for why both are measured). ---
 const SHORT_REPLY_FLOOR = STYLE_RULES?.thresholds?.shortReplyWords ?? 40;
 
-function needsLlmDefault(scored) {
+export function needsLlmDefault(scored) {
   if (scored.verdict === 'verbose') return false;
   if (scored.verdict === 'suspect') return true;
   return scored.stats.proseWords >= SHORT_REPLY_FLOOR;
 }
 
-function needsLlmStrict(scored) {
+export function needsLlmStrict(scored) {
   if (scored.verdict === 'verbose') return false;
   return scored.verdict === 'suspect';
 }
 
-function isConfirmedVerbose(scored, llmJudge) {
+export function isConfirmedVerbose(scored, llmJudge) {
   if (scored.verdict === 'verbose') return true;
   if (scored.verdict === 'suspect' || llmJudge != null) return llmJudge?.verdict === 'verbose';
   return false;
+}
+
+/**
+ * Which already-scored rows require a live LLM judge call in at least one
+ * routing mode. A fully deterministic corpus (every row 'terse' or 'verbose',
+ * never 'suspect') returns [] — per shouldSkipForMissingAuth below, an empty
+ * result means execution proceeds with zero credentials required, on any
+ * platform, regardless of hasAuth()'s own OS-dependent fallback behavior.
+ */
+export function selectRowsNeedingLlm(rows) {
+  return rows.filter((r) => needsLlmDefault(r.scored) || needsLlmStrict(r.scored));
+}
+
+/**
+ * Credentials are only ever required when at least one loaded row needs an
+ * LLM judge call. hasAuth() must never gate a fully deterministic corpus —
+ * that was the bug: hasAuth() ran unconditionally before rows were even
+ * read, so a credential-less, non-macOS runner (no ANTHROPIC_API_KEY, no
+ * darwin fallback) SKIPped the entire eval even against the all-deterministic
+ * default corpus, which never calls an LLM in the first place.
+ */
+export function shouldSkipForMissingAuth(needsLlmCount, isAuthed) {
+  return needsLlmCount > 0 && !isAuthed;
 }
 
 // --- tiny concurrency-limited async pool ------------------------------------
@@ -134,13 +163,6 @@ function printMetrics(m) {
 }
 
 async function main() {
-  if (!hasAuth()) {
-    const msg = 'plainspeak-eval: no Claude/Anthropic credentials — SKIP.';
-    if (requireCreds) { console.error(msg + ' (SUPERVISOR_EVAL_REQUIRE=1 -> fail)'); process.exit(1); }
-    console.log(msg);
-    process.exit(0);
-  }
-
   let cases;
   try {
     cases = fs.readFileSync(casesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -150,9 +172,15 @@ async function main() {
   }
 
   const rows = cases.map((c) => ({ ...c, scored: scoreVerbosity(c.text) }));
+  const needsAny = selectRowsNeedingLlm(rows);
 
-  // One LLM call per row that either mode needs — cache and reuse for both.
-  const needsAny = rows.filter((r) => needsLlmDefault(r.scored) || needsLlmStrict(r.scored));
+  if (shouldSkipForMissingAuth(needsAny.length, hasAuth())) {
+    const msg = `plainspeak-eval: ${needsAny.length} of ${rows.length} row(s) need a live LLM judge call and no Claude/Anthropic credentials are available — SKIP.`;
+    if (requireCreds) { console.error(msg + ' (SUPERVISOR_EVAL_REQUIRE=1 -> fail)'); process.exit(1); }
+    console.log(msg);
+    process.exit(0);
+  }
+
   console.log(`plainspeak-eval: ${cases.length} rows, ${needsAny.length} need an LLM call in at least one mode (model=${MODEL}, concurrency=${concurrency})...`);
   await runPool(needsAny, concurrency, async (r) => {
     r.llmJudge = await judge(r.text, r.scored);
@@ -187,4 +215,7 @@ async function main() {
   process.exit(goldDefaultMetrics.recall >= threshold ? 0 : 1);
 }
 
-main();
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  main();
+}

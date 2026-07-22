@@ -27,10 +27,17 @@ jobs:
         run: node --experimental-strip-types --check opencode/supervisor.ts
       - name: Privacy guard — no mined data committed
         run: |
-          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v -x 'evals/cases.example.jsonl'; then
+          # Convention: evals/<name>.example.jsonl is a small, committed, synthetic
+          # fixture (e.g. evals/cases.example.jsonl, evals/verbosity-cases.example.jsonl).
+          # Anything else matching .dataset/transcripts/*.jsonl is private mined data
+          # and must never be tracked in git.
+          ALLOW='^evals/[A-Za-z0-9_-]+\.example\.jsonl$'
+          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v -E "$ALLOW"; then
             echo "ERROR: private data tracked in git"; exit 1
           fi
-          if [ "$(wc -c < evals/cases.example.jsonl)" -gt 51200 ]; then
-            echo "ERROR: evals/cases.example.jsonl exceeds 50KB — synthetic cases only, mined data is never committed"; exit 1
-          fi
+          for f in $(git ls-files | grep -E "$ALLOW"); do
+            if [ "$(wc -c < "$f")" -gt 51200 ]; then
+              echo "ERROR: $f exceeds 50KB — synthetic cases only, mined data is never committed"; exit 1
+            fi
+          done
           echo "OK: no private data tracked"
