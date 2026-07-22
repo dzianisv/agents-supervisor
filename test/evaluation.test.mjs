@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateSelfAssessment } from '../core/evaluation.mjs';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as evaluation from '../core/evaluation.mjs';
+
+const { evaluateSelfAssessment, summarizeToolActivity, describeToolActivity } = evaluation;
 
 // ---------------------------------------------------------------------------
 // evaluateSelfAssessment — decision-table coverage.
@@ -217,4 +222,52 @@ test('gates still populate missing[] for visibility even when they cannot flip t
   const result = evaluateSelfAssessment(assessment, context);
   assert.ok(result.missing.some((m) => /test/i.test(m)), `expected a test-related missing item: ${result.missing}`);
   assert.equal(result.complete, true, 'gate must not flip a confident complete');
+});
+
+test('legacy loop-detector symbols are absent from exports and source files', () => {
+  const symbol = (...parts) => parts.join('');
+  const removedSymbols = [
+    symbol('detect', 'Planning', 'Loop'),
+    symbol('shouldApply', 'Planning', 'Loop'),
+    symbol('detect', 'Action', 'Loop'),
+    symbol('PLANNING', '_LOOP', '_MIN_TOOL_CALLS'),
+    symbol('PLANNING', '_LOOP', '_WRITE_RATIO_THRESHOLD'),
+    symbol('ACTION', '_LOOP', '_MIN_COMMANDS'),
+    symbol('ACTION', '_LOOP', '_REPETITION_THRESHOLD'),
+  ];
+
+  for (const symbol of removedSymbols) {
+    assert.equal(symbol in evaluation, false, `evaluation.mjs should not export ${symbol}`);
+  }
+
+  const rootDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const evaluationSource = readFileSync(join(rootDir, 'core', 'evaluation.mjs'), 'utf8');
+  const supervisorSource = readFileSync(join(rootDir, 'opencode', 'supervisor-impl.ts'), 'utf8');
+  for (const symbol of removedSymbols) {
+    assert.equal(evaluationSource.includes(symbol), false, `core/evaluation.mjs still references ${symbol}`);
+    assert.equal(supervisorSource.includes(symbol), false, `opencode/supervisor-impl.ts still references ${symbol}`);
+  }
+});
+
+test('summarizeToolActivity is pure count telemetry; describeToolActivity stays informational', () => {
+  const messages = [
+    {
+      info: { role: 'assistant' },
+      parts: Array.from({ length: 9 }, () => ({
+        type: 'tool',
+        tool: 'bash',
+        state: { input: { command: 'git status' } },
+      })),
+    },
+  ];
+
+  const stats = summarizeToolActivity(messages);
+  assert.deepEqual(stats, { readCount: 9, writeCount: 0, totalTools: 9 });
+  assert.equal('detected' in stats, false);
+  assert.deepEqual(Object.keys(stats).sort(), ['readCount', 'totalTools', 'writeCount']);
+
+  const note = describeToolActivity(stats);
+  assert.match(note, /informational only, not a verdict/i);
+  assert.doesNotMatch(note, /\bSTOP\b/i);
+  assert.doesNotMatch(note, /Planning Loop|Action Loop|detected/i);
 });

@@ -29,8 +29,8 @@ import {
 import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
   detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
-  pushedToDefaultBranch, hasCodeChangeEvidence, detectPlanningLoop, shouldApplyPlanningLoop,
-  detectActionLoop, describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
+  pushedToDefaultBranch, hasCodeChangeEvidence, summarizeToolActivity,
+  describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
 } from "../core/evaluation.mjs"
 import {
@@ -47,7 +47,7 @@ const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents
 export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
 export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 export {
-  detectPlanningLoop, shouldApplyPlanningLoop, detectActionLoop, buildEscalatingFeedback,
+  buildEscalatingFeedback,
   getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
   DEFAULT_RUBRIC, parseRubric,
 }
@@ -923,13 +923,12 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
   const toolsSummary = commands.slice(-6).join("\n") || "(none)"
 
   // Bounded (recent-only, not full-session) telemetry — purely descriptive,
-  // never a judgment. See core/evaluation.mjs's describeToolActivity: this
-  // is the ONLY thing autopilot's static nudge or the reflection judge
-  // prompt may cite as "recent activity has been read-heavy" style context;
-  // neither surface may use it to decide completion/progress or to swap in
-  // a scripted verdict. Bounded to a recent window of messages (not the
-  // full historical session) so the note stays factual and current.
-  const toolActivityNote = describeToolActivity(detectPlanningLoop(messages.slice(-20)))
+  // never a judgment. This is the ONLY thing autopilot's static nudge or the
+  // reflection judge prompt may cite as context about recent tool behavior;
+  // neither surface may use it to decide completion/progress or to author a
+  // scripted verdict. Bounded to a recent window of messages (not the full
+  // historical session) so the note stays factual and current.
+  const toolActivityNote = describeToolActivity(summarizeToolActivity(messages.slice(-20)))
 
   return {
     taskSummary,
@@ -1691,13 +1690,12 @@ Do NOT call this tool:
 
         // ── Autopilot fast-path ──────────────────────────────────────────
         // Binding contract: autopilot is a STATIC nudge loop only. It never
-        // determines whether there is a planning/action loop, never decides
-        // progress/completion, and never emits a deterministic STOP verdict
-        // — only the agent's own autopilot_exit tool call and this budget
-        // check may stop the loop. Neutral, bounded tool-activity telemetry
-        // (context.toolActivityNote) may enrich the nudge as factual
-        // context, but it is never branched on to change what the nudge
-        // says or to author a judgment.
+        // decides progress/completion and never emits a deterministic STOP
+        // verdict — only the agent's own autopilot_exit tool call and this
+        // budget check may stop the loop. Neutral, bounded tool-activity
+        // telemetry (context.toolActivityNote) may enrich the nudge as factual
+        // context, but it is never branched on to change what the nudge says
+        // or to author a judgment.
         if (mode === "autopilot") {
           const autopilotAttempt = (attempts.get(attemptKey) || 0) + 1
           attempts.set(attemptKey, autopilotAttempt)
@@ -2047,14 +2045,13 @@ Continue now.`
         }
 
         // Reflection is the SOLE completion/progress judgement authority.
-        // buildEscalatingFeedback is driven purely by the judge's own
-        // verdict fields (analysis.severity/reason/missing/nextActions) —
-        // no deterministic planning/action-loop detector may compute or
-        // substitute a "STOP: Loop Detected" script here anymore.
-        // Deterministic tool-call telemetry (context.toolActivityNote) is
-        // already threaded upstream as non-binding evidence INTO the judge's
-        // own prompt (see buildReflectionPrompt/buildSelfAssessmentPrompt) —
-        // it never bypasses the judge to construct feedback directly.
+        // buildEscalatingFeedback is driven purely by the judge's own verdict
+        // fields (analysis.severity/reason/missing/nextActions). There is no
+        // deterministic loop-detection mechanism in this repository anymore.
+        // Tool-call telemetry (context.toolActivityNote) is already threaded
+        // upstream as non-binding evidence INTO the judge's own prompt (see
+        // buildReflectionPrompt/buildSelfAssessmentPrompt) — it never bypasses
+        // the judge to construct feedback directly.
         const feedbackText = buildEscalatingFeedback(
           nextAttemptCount,
           analysis.severity || "MEDIUM",

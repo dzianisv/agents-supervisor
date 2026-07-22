@@ -2,10 +2,6 @@
  * Pure evaluation helpers shared by supervisor runtimes.
  */
 
-export const PLANNING_LOOP_MIN_TOOL_CALLS = 8
-export const PLANNING_LOOP_WRITE_RATIO_THRESHOLD = 0.1
-export const ACTION_LOOP_MIN_COMMANDS = 4
-export const ACTION_LOOP_REPETITION_THRESHOLD = 0.6
 export const SELF_ASSESSMENT_MARKER = '## Supervisor Self-Assessment'
 export const FEEDBACK_MARKER = '## Supervisor:'
 
@@ -87,11 +83,11 @@ export const AGENT_ACTION_PATTERNS = [
 
 /**
  * @param {any[]} messages
- * @returns {{ detected: boolean, readCount: number, writeCount: number, totalTools: number }}
+ * @returns {{ readCount: number, writeCount: number, totalTools: number }}
  */
-export function detectPlanningLoop(messages) {
+export function summarizeToolActivity(messages) {
   if (!Array.isArray(messages)) {
-    return { detected: false, readCount: 0, writeCount: 0, totalTools: 0 }
+    return { readCount: 0, writeCount: 0, totalTools: 0 }
   }
   let readCount = 0
   let writeCount = 0
@@ -127,27 +123,17 @@ export function detectPlanningLoop(messages) {
     }
   }
 
-  const detected =
-    totalTools >= PLANNING_LOOP_MIN_TOOL_CALLS &&
-    (writeCount === 0 || writeCount / totalTools < PLANNING_LOOP_WRITE_RATIO_THRESHOLD)
-
-  return { detected, readCount, writeCount, totalTools }
-}
-
-export function shouldApplyPlanningLoop(taskType, loopDetected) {
-  if (!loopDetected) return false
-  return taskType === 'coding'
+  return { readCount, writeCount, totalTools }
 }
 
 /**
  * Neutral, factual description of recent tool-call activity — NEVER a
  * judgment or a verdict. This exists solely so autopilot's static nudge (and
  * the judge prompt, as non-binding evidence) can be enriched with bounded,
- * factual context such as "recent activity has been read-heavy" without
- * either surface deciding on its own that a "loop" occurred or forcing a
- * specific action. Deciding what (if anything) that activity MEANS is left
- * entirely to the judge LLM in reflection mode, or to the agent itself in
- * autopilot mode — this function only describes counts.
+ * factual context such as "recent activity has been read-heavy." Deciding
+ * what (if anything) that activity means is left entirely to the judge LLM in
+ * reflection mode, or to the agent itself in autopilot mode — this function
+ * only describes counts.
  * @param {{ readCount?: number, writeCount?: number, totalTools?: number }} stats
  * @returns {string} '' when there is nothing to report
  */
@@ -157,59 +143,6 @@ export function describeToolActivity(stats) {
   const totalTools = stats?.totalTools ?? 0
   if (totalTools === 0) return ''
   return `Recent tool activity (informational only, not a verdict): ${totalTools} tool call${totalTools === 1 ? '' : 's'} — ${writeCount} write-type, ${readCount} read-only.`
-}
-
-/**
- * @param {any[]} messages
- * @returns {{ detected: boolean, repeatedCommands: string[], totalCommands: number }}
- */
-export function detectActionLoop(messages) {
-  if (!Array.isArray(messages)) {
-    return { detected: false, repeatedCommands: [], totalCommands: 0 }
-  }
-
-  const commands = []
-  for (const msg of messages) {
-    if (msg.info?.role !== 'assistant') continue
-    for (const part of msg.parts || []) {
-      if (part.type !== 'tool') continue
-      const toolName = (part.tool || '').toString().toLowerCase()
-      const input = part.state?.input || {}
-
-      if (toolName === 'bash') {
-        const cmd = (input.command || input.cmd || '').toString().trim()
-        if (cmd) {
-          const normalized = cmd.replace(/\s+/g, ' ').replace(/\d{10,}/g, 'TIMESTAMP').toLowerCase()
-          commands.push(normalized)
-        }
-      } else if (toolName !== 'read' && toolName !== 'glob' && toolName !== 'grep' && toolName !== 'todowrite') {
-        const key = `${toolName}:${JSON.stringify(input).slice(0, 100)}`
-        commands.push(key)
-      }
-    }
-  }
-
-  if (commands.length < ACTION_LOOP_MIN_COMMANDS) {
-    return { detected: false, repeatedCommands: [], totalCommands: commands.length }
-  }
-
-  const counts = new Map()
-  for (const cmd of commands) {
-    counts.set(cmd, (counts.get(cmd) || 0) + 1)
-  }
-
-  const repeatedCommands = []
-  let repeatedCount = 0
-  for (const [cmd, count] of counts) {
-    if (count >= 3) {
-      repeatedCommands.push(cmd)
-      repeatedCount += count
-    }
-  }
-
-  const detected = repeatedCommands.length > 0 && repeatedCount / commands.length >= ACTION_LOOP_REPETITION_THRESHOLD
-
-  return { detected, repeatedCommands, totalCommands: commands.length }
 }
 
 export function inferTaskType(text) {

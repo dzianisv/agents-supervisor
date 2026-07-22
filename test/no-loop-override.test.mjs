@@ -1,7 +1,8 @@
 /**
  * no-loop-override.test.mjs — align-supervisor-modes binding architecture:
- * the deterministic planning/action-loop watchdog (core/evaluation.mjs's
- * detectPlanningLoop/detectActionLoop) must never author or substitute a
+ * there is no deterministic planning/action-loop watchdog in the codebase.
+ * Bounded tool-activity telemetry (core/evaluation.mjs's
+ * summarizeToolActivity/describeToolActivity) must never author or substitute a
  * completion/progress verdict in either the autopilot fast-path or the
  * reflection judge path.
  *
@@ -32,9 +33,8 @@ let ephemeralCounter = 0
 
 /**
  * Synthesizes an assistant message with 9 IDENTICAL `bash: git status`
- * tool calls — a pattern that, before this fix, tripped BOTH
- * detectPlanningLoop (>=8 tool calls, 0 write-type) and detectActionLoop
- * (>=3 repeats of the same normalized command, >=60% of all commands).
+ * tool calls — a read-heavy pattern used to prove telemetry remains
+ * non-binding context, never a deterministic completion/progress verdict.
  */
 function makeLoopyMessages() {
   const toolParts = Array.from({ length: 9 }, (_, i) => ({

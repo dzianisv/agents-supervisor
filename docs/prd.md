@@ -76,12 +76,9 @@ User sets a completion condition: `/supervisor:goal <natural-language condition>
 
 `/supervisor autopilot` skips judge evaluation. The supervisor re-prompts on every idle event until the agent emits a recognized done signal or the budget exhausts. Intended for fully unattended runs.
 
-### Loop Detection
+### Tool-Activity Telemetry
 
-- **Planning loop:** agent reads files heavily but writes no code across N consecutive turns.
-- **Action loop:** same command executed 3+ times in a row without progress.
-
-On detection, the supervisor either injects a loop-break prompt or surfaces the condition to the user, depending on mode.
+A bounded, non-binding counter (`summarizeToolActivity` in `core/evaluation.mjs`) tallies read vs. write tool calls in recent turns and produces a factual, informational-only note (`describeToolActivity`). This note may enrich the autopilot nudge text and the reflection judge's prompt as contextual telemetry, but it never itself decides completion/progress or emits a stop verdict — the reflection judge's own verdict remains the sole authority for that.
 
 ### Trainer
 

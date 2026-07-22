@@ -53,7 +53,7 @@ bin/supervisor-on-stop.mjs
   ├─ reads stdin: { session_id, cwd, transcript_path, last_assistant_message, stop_hook_active? }
   ├─ readTranscriptTail (max 200KB / 50 entries) → normalize to shared message format
   ├─ buildStopContext → { taskType, requiresPR, requiresCI, requiresTests, requiresBuild }
-  ├─ [safety rails] loop detection, attempt budget check
+  ├─ [safety rails] attempt budget check
   ├─ buildSelfAssessmentPrompt (context + patterns + anti-pattern rules + few-shots)
   ├─ callAnthropic (claude-haiku-4-5, 30s timeout) → raw JSON
   ├─ parseSelfAssessmentJson → { category, confidence }
@@ -73,7 +73,7 @@ session.idle event
         ▼
 opencode/supervisor.ts
   ├─ skip if: disabled, judge session, plan mode, recently aborted, transcript too short
-  ├─ [safety rails] planning loop, action loop, attempt budget, signature dedup
+  ├─ [safety rails] attempt budget, signature dedup
   ├─ spawn ephemeral session → self-assessment (+ optional cross-model judge)
   ├─ classify → { category, confidence }
   ├─ if category requires injection:
@@ -96,8 +96,8 @@ reads/writes: .supervisor/goals/<sessionId>.json
 | `patterns.mjs` | Three-tier deep merge: shipped → `~/.config/agents-supervisor/patterns.json` → `.supervisor/patterns.json`. Project-local patterns override user-local, which override shipped. |
 | `judge-core.mjs` | Builds and executes the runtime-agnostic classification prompt. Used by both CC and OpenCode paths. |
 | `assessment.mjs` | Constructs the self-assessment prompt (injects task context, patterns, anti-pattern rules, few-shot examples). Parses raw LLM output to `{ category, confidence }`. |
-| `evaluation.mjs` | Infers task type from transcript signals (`coding/docs/research/ops/other`). Evaluates classification to inject decision. Detects local test commands and default-branch push state. |
-| `feedback.mjs` | Selects feedback tone and content based on attempt count. Escalates from neutral to firm across attempts. |
+| `evaluation.mjs` | Infers task type from transcript signals (`coding/docs/research/ops/other`). Evaluates classification to inject decision. Detects local test commands and default-branch push state. Provides bounded, non-binding tool-activity counting (`summarizeToolActivity`/`describeToolActivity`) that feeds informational telemetry into the autopilot nudge and reflection judge prompt. |
+| `feedback.mjs` | Selects feedback tone and content based on attempt count. Escalates from neutral to firm across attempts. Rewrites destructive-action nudges (force-push, hard reset, history rewrite, branch deletion, `rm -rf`) into a "flag to user for approval" message instead of nudging the action. |
 | `goal.mjs` | Manages goal state: sets goal + `maxAttempts=16`, evaluates per-stop as `achieved | continue | exhausted`. No inject on terminal states. |
 | `llm-client.mjs` | Single Anthropic SDK call with 30s hard timeout. Used for both self-assessment (haiku-4-5) and optional cross-model judge. |
 

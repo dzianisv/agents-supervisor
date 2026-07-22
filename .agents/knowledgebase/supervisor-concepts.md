@@ -39,16 +39,16 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 ## Autopilot
 
 - Autopilot is available on both Claude Code and OpenCode.
-- In autopilot mode the supervisor skips judge evaluation and sends a static, calm nudge on every idle — it never runs loop detection or any other completion/progress judgement.
+- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the attempt-budget check, never by any loop check.
 - Autopilot stops when the agent calls `autopilot_exit` (OpenCode) / outputs `AUTOPILOT_EXIT` (Claude Code) or the retry budget exhausts. Those are the ONLY two ways autopilot stops.
 - Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
 
-## Loop Detection
+## Tool-Activity Telemetry
 
-- `core/evaluation.mjs` exports `detectPlanningLoop` (read-heavy activity without implementation progress) and `detectActionLoop` (repeated commands/actions) as pure, stateless functions.
-- These functions have **no override authority**. They never author or substitute a completion/progress verdict, and they never produce a scripted "STOP: Loop Detected" message.
-- Their only remaining use is `describeToolActivity`, which turns a bounded, recent slice of tool-call counts into one neutral, factual sentence (e.g. "9 tool calls — 0 write-type, 9 read-only"). That sentence may enrich the autopilot nudge or appear in the judge's prompt as clearly non-binding evidence — it is threaded through `TaskContext.toolActivityNote` — but it never changes what the nudge says or what the judge/feedback decides.
-- The reflection judge's own verdict (`analysis.severity`/`reason`/`missing`/`nextActions`) is the sole authority for feedback text (`core/feedback.mjs`'s `buildEscalatingFeedback`); loop-detection output cannot flip or replace it.
+- There is no deterministic repetitive-behavior verdict mechanism in the codebase anymore — the pure functions that used to compute a boolean "read-heavy without progress" / "repeated command" verdict in `core/evaluation.mjs` have been fully removed (two were dead code never called by anything; the remaining one's boolean verdict was never consumed by any caller).
+- What remains is `summarizeToolActivity(messages)` in `core/evaluation.mjs` — a pure, stateless counter that returns only `{ readCount, writeCount, totalTools }` over a bounded, recent slice of tool calls. It makes no judgment and returns no verdict of any kind.
+- `describeToolActivity(stats)` turns those counts into one neutral, factual sentence (e.g. "Recent tool activity (informational only, not a verdict): 9 tool calls — 0 write-type, 9 read-only."). That sentence is threaded through `TaskContext.toolActivityNote` and may enrich the autopilot nudge text and the reflection judge's prompt as non-binding context — it never changes what the nudge says or what the judge/feedback decides.
+- The reflection judge's own verdict (`analysis.severity`/`reason`/`missing`/`nextActions`, or the self-assessment `status`/`confidence`) remains the sole authority for completion/progress feedback text (`core/feedback.mjs`'s `buildEscalatingFeedback`). Tool-activity telemetry cannot flip or replace it.
 
 ## Rubric And Prompt Configuration
 

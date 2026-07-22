@@ -212,7 +212,7 @@ For web app / OpenCode API, call tools directly:
 - Judge is **bypassed entirely** — no latency from scoring/reflection
 - Agent must call `AUTOPILOT_EXIT` to signal work is complete
 - Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
-- Safety rails still apply: attempt budget, loop detection
+- Safety rails still apply: attempt budget, destructive-action flagging
 
 **How it differs from the goal loop:**
 
@@ -225,8 +225,8 @@ For web app / OpenCode API, call tools directly:
 
 **Safety rails still apply** — even in autopilot mode:
 - **Attempt budget**: stops at `maxAttempts` (default 16, configurable via `/supervisor retry N`)
-- **Planning loop detection**: catches agents that read files endlessly without writing code
-- **Action loop detection**: catches agents repeating the same commands 3+ times
+- **Destructive-action flagging**: force-push, hard reset, history rewrite, branch deletion, `rm -rf`, and unapproved spend are flagged to the user for approval instead of being nudged
+- **Tool-activity telemetry**: a bounded, non-binding note (read/write tool-call counts) may be appended to the nudge as factual context — it never itself decides completion or emits a stop verdict
 
 State is per-session at `.supervisor/goals/<sessionId>.json`. When the budget
 exhausts, autopilot disables itself automatically.
