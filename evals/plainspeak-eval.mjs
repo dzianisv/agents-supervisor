@@ -169,12 +169,12 @@ async function main() {
 
   console.log('\n# plainspeak-eval\n');
   console.log('## default mode (shipped): LLM call skipped only below the hard short-reply word floor');
-  printMetrics(confusionMetrics(rows, 'predDefault', 'overall (n=200)'));
-  printMetrics(confusionMetrics(gold, 'predDefault', 'gold human_complaint (n=16)'));
+  printMetrics(confusionMetrics(rows, 'predDefault', 'overall'));
+  printMetrics(confusionMetrics(gold, 'predDefault', 'gold human_complaint'));
 
   console.log('\n## strict mode (PLAINSPEAK_STRICT_TERSE_EXIT=1): LLM call skipped on any terse verdict');
-  printMetrics(confusionMetrics(rows, 'predStrict', 'overall (n=200)'));
-  printMetrics(confusionMetrics(gold, 'predStrict', 'gold human_complaint (n=16)'));
+  printMetrics(confusionMetrics(rows, 'predStrict', 'overall'));
+  printMetrics(confusionMetrics(gold, 'predStrict', 'gold human_complaint'));
 
   const goldDefaultMetrics = confusionMetrics(gold, 'predDefault', 'gold');
   console.log(`\ngold recall (default mode): ${(goldDefaultMetrics.recall * 100).toFixed(1)}%  (threshold ${(threshold * 100).toFixed(0)}%)`);
