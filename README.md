@@ -313,9 +313,17 @@ Detection is two-stage:
 On confirmed verbose, it blocks with one directive: named offenses, one
 corrective, same facts, fewer words. Nothing else.
 
-Real numbers, `evals/verbosity-cases.jsonl` (200 rows, 16 real human style
-complaints): `npm run eval:plainspeak`. Gold-complaint recall: 50%, 100%
-precision, 0 false positives. Cost: an LLM call on 141 of 200 rows. Set
+`npm run eval:plainspeak` works out of the box, no credentials needed: it
+defaults to a small committed synthetic smoke-test corpus,
+`evals/verbosity-cases.example.jsonl` (8 rows, deterministic, no LLM calls).
+
+Real numbers were reproduced against a private, gitignored corpus,
+`evals/verbosity-cases.jsonl` (200 rows, 16 real human style complaints —
+mined from real session logs, kept local, not committed): run
+`npm run eval:plainspeak -- --cases evals/verbosity-cases.jsonl` (or
+`node evals/plainspeak-eval.mjs --cases <path>`) with that file supplied
+locally to reproduce them. Gold-complaint recall: 50%, 100% precision, 0 false
+positives. Cost: an LLM call on 141 of 200 rows. Set
 `PLAINSPEAK_STRICT_TERSE_EXIT=1` for the cheaper, blinder mode (skip the LLM
 on any `terse` verdict, not just below-floor ones) — gold recall drops to
 12.5%. Default trades LLM-call volume for catching real complaints, because on
@@ -340,7 +348,7 @@ Safety rails:
 npm test                 # unit tests (core + hook + train derivation), node:test
 npm run test:cc          # Claude Code end-to-end (real claude -p, no mocks)
 npm run eval             # OpenCode judge eval (promptfoo)
-npm run eval:plainspeak  # plainspeak detector eval (verbosity-cases.jsonl)
+npm run eval:plainspeak  # plainspeak detector eval (default: verbosity-cases.example.jsonl; --cases for the private corpus)
 ```
 
 ## License

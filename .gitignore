@@ -5,6 +5,7 @@
 .plainspeak/
 *.jsonl
 !evals/cases.example.jsonl
+!evals/verbosity-cases.example.jsonl
 /tmp/
 stop-candidates/
 session-digests/

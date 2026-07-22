@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 /**
  * plainspeak-eval.mjs — score the plainspeak detector (core/verbosity.mjs +
- * the plainspeak Stop hook's own LLM-routing decision) against the mined
- * calibration corpus (evals/verbosity-cases.jsonl).
+ * the plainspeak Stop hook's own LLM-routing decision). Default cases are a
+ * small committed synthetic set (evals/verbosity-cases.example.jsonl, 8 rows,
+ * offline/deterministic, no LLM calls needed); point --cases at the private
+ * mined corpus (evals/verbosity-cases.jsonl, gitignored, not shipped) to
+ * reproduce the real 200-row/16-gold-row numbers documented in README.md.
  *
  * Reports precision/recall/F1 for the 'verbose' class two ways:
- *   - overall, across all 200 rows
- *   - on the 16 gold `source:"human_complaint"` rows only (the subset that
- *     matters — a real human style complaint followed that exact reply)
+ *   - overall, across all rows in the cases file (200 in the private corpus)
+ *   - on the gold `source:"human_complaint"` rows only (16 in the private
+ *     corpus — the subset that matters, a real human style complaint
+ *     followed that exact reply)
  *
  * Scores TWO routing modes side by side, because they trade recall for LLM
  * call volume and the brief's own literal hook spec and its own calibration
@@ -37,7 +41,7 @@ const arg = (n, d) => {
   const i = process.argv.indexOf(`--${n}`);
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : d;
 };
-const casesFile = arg('cases', path.join(HERE, 'verbosity-cases.jsonl'));
+const casesFile = arg('cases', path.join(HERE, 'verbosity-cases.example.jsonl'));
 const threshold = parseFloat(arg('threshold', '0.5')); // gold-recall floor, default mode
 const concurrency = parseInt(arg('concurrency', '8'), 10);
 const requireCreds = process.env.SUPERVISOR_EVAL_REQUIRE === '1';
