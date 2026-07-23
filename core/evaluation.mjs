@@ -509,32 +509,75 @@ export function evaluateSelfAssessment(assessment, context) {
   const actionableMissing = missing.filter(item => !isHumanOnlyAction(item))
   const actionableNextActions = nextActions.filter(item => !isHumanOnlyAction(item))
 
+  // Agent-actionable work the JUDGE ITSELF reported (from the assessment's own
+  // remaining_work + next_steps), independent of the deterministic requires*
+  // gates that also feed `missing`/`nextActions`. This is the signal used to
+  // detect Pattern A (permission-for-in-scope-work) and Pattern B (partial
+  // block) — a judge that lists concrete in-scope work it can do itself is not
+  // actually done, and a single gated blocker must not halt that work.
+  const assessmentActionable = splitActionItems([
+    ...(assessment.remaining_work || []),
+    ...(assessment.next_steps || [])
+  ]).agentActionable
+
   // --- The judge's reported status decides; deterministic repo-signal gates
   // (requires* above) only INFORM the outcome by populating missing/nextActions
   // for visibility — they must never override a judge verdict of
   // waiting_for_user, nor flip a confident complete back to "continue". Only
   // in_progress/blocked/stuck (or low-confidence complete) may produce
   // shouldContinue=true, and only when a concrete actionable item remains.
+  //
+  // TWO EXCEPTIONS carve out the reported-status trust to fix real stuck loops:
+  //   * Pattern B (partial block): a waiting_for_user / blocked verdict that
+  //     ALSO lists agent-actionable remaining_work/next_steps must CONTINUE on
+  //     the autonomous items and only SURFACE the gated blocker — one gated
+  //     item may not halt in-scope parallel work. Only a PURE block (every
+  //     remaining item human-only) keeps the unconditional stop.
+  //   * Pattern A (permission for in-scope work): a `complete` verdict that
+  //     still lists NON-human-only remaining_work/next_steps means the agent is
+  //     deferring/asking permission for work it can just do — it is NOT done.
+  //     Such a verdict is not trusted; it falls through to continue on those
+  //     items. Human-only leftovers on a complete verdict are still trusted.
 
-  // 1. waiting_for_user: NEVER continue. No exceptions — a judge that
-  //    explicitly says it is blocked on the user wins unconditionally, even
-  //    if isHumanOnlyAction's keyword heuristic would suggest otherwise.
-  if (status === 'waiting_for_user') {
-    return {
-      complete: false,
-      shouldContinue: false,
-      reason: needsUserAction[0] || humanOnlyNextSteps[0] || 'Waiting for user input before continuing',
-      missing,
-      nextActions,
-      requiresHumanAction: true,
-      severity: 'NONE'
+  // 1. waiting_for_user / blocked: normally stop. EXCEPTION (Pattern B): if
+  //    agent-actionable work the judge itself reported remains, continue on it
+  //    while still flagging requiresHumanAction so the gated blocker surfaces.
+  //    Only a pure human block (no agent-actionable remaining/next items) keeps
+  //    the unconditional stop — that wins even when isHumanOnlyAction's keyword
+  //    heuristic would not flag the needs_user_action text as human-only.
+  if (status === 'waiting_for_user' || status === 'blocked') {
+    if (assessmentActionable.length > 0) {
+      return {
+        complete: false,
+        shouldContinue: true,
+        reason: `${assessmentActionable[0]} (continue autonomously; gated item surfaced separately: ${needsUserAction[0] || humanOnlyNextSteps[0] || 'awaiting user action'})`,
+        missing,
+        nextActions,
+        requiresHumanAction: true,
+        severity: severity === 'NONE' ? 'LOW' : severity
+      }
     }
+    if (status === 'waiting_for_user') {
+      return {
+        complete: false,
+        shouldContinue: false,
+        reason: needsUserAction[0] || humanOnlyNextSteps[0] || 'Waiting for user input before continuing',
+        missing,
+        nextActions,
+        requiresHumanAction: true,
+        severity: 'NONE'
+      }
+    }
+    // status === 'blocked' with only human-only items: fall through to the
+    // general bucket 3 below, which already stops when nothing is actionable.
   }
 
-  // 2. complete at reasonable confidence: trust the judge. Unmet requires*
-  //    gates are surfaced as an informational note only — they cannot flip
-  //    the decision back to "continue".
-  if (status === 'complete' && confidence >= 0.6) {
+  // 2. complete at reasonable confidence: trust the judge — UNLESS the judge
+  //    itself listed non-human-only remaining_work/next_steps (Pattern A: the
+  //    agent is deferring in-scope work). In that case it is not done; fall
+  //    through to continue. Unmet requires* gates alone still only surface as
+  //    an informational note and cannot flip the decision.
+  if (status === 'complete' && confidence >= 0.6 && assessmentActionable.length === 0) {
     const unmetNote = actionableMissing.length
       ? ` (heuristic note: ${actionableMissing.slice(0, 3).join('; ')} — not detected, but judge confirmed completion)`
       : ''
@@ -549,8 +592,11 @@ export function evaluateSelfAssessment(assessment, context) {
     }
   }
 
-  // 3. Everything else (in_progress / blocked / stuck / low-confidence
-  //    "complete" / unrecognized status).
+  // 3. Everything else (in_progress / blocked-with-only-human-items /
+  //    stuck / low-confidence "complete" / unrecognized status / and a
+  //    high-confidence "complete" that fell through Pattern A because it still
+  //    listed non-human-only remaining_work/next_steps). Continue only when a
+  //    concrete actionable item remains, naming it as the reason.
   const finalShouldContinue = actionableMissing.length > 0 || actionableNextActions.length > 0
 
   if (!finalShouldContinue) {
