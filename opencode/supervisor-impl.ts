@@ -26,6 +26,9 @@ import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
   getCrossReviewModelSpec, getLastSessionModelSpec,
 } from "../core/model-selection.mjs"
+// The plugin's `directory` is the SERVER cwd, not the session's — see
+// core/session-context.mjs for the incident that makes this distinction load-bearing.
+import { getLastSessionCwd, resolveSessionDirectory } from "../core/session-context.mjs"
 import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
   detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
@@ -50,6 +53,29 @@ export {
   buildEscalatingFeedback,
   getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
   DEFAULT_RUBRIC, parseRubric, buildTaskContext,
+}
+export { getLastSessionCwd, resolveSessionDirectory }
+
+/**
+ * Read the project-level goal condition for a SESSION, from the session's own
+ * project — not from whatever cwd `opencode serve` happens to have been
+ * started in.
+ *
+ * This is the single entry point the idle/reflection path uses so the
+ * session-scoping rule is expressed in exactly one place (and is directly
+ * testable — see test/goal-scope.test.mjs). Returns '' when the session's
+ * project has no goal; it must NEVER substitute another project's goal.
+ *
+ * INCIDENT 2026-07-27: readProjectGoalCondition(directory) here read the
+ * server cwd (this plugin's own repo), injecting an OpenClawBot checklist as a
+ * MANDATORY GOAL into a session working in KineticAiCoach.
+ */
+export function resolveProjectGoalForSession(messages: any[], pluginDirectory: string): string {
+  try {
+    return readProjectGoalCondition(resolveSessionDirectory(messages, pluginDirectory)) || ""
+  } catch {
+    return ""
+  }
 }
 
 // Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
@@ -1352,6 +1378,31 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     })
   }
 
+  /**
+   * The project directory a given session is actually working in.
+   * Fetches the transcript so `info.path.cwd` can be read; falls back to the
+   * plugin/server `directory` only when that is unavailable. See
+   * core/session-context.mjs for why the plugin `directory` is not usable
+   * as a per-session value.
+   */
+  const resolveSessionDirectoryFor = async (sid: string): Promise<string> => {
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      return resolveSessionDirectory(Array.isArray(data) ? data : [], directory)
+    } catch {
+      return directory
+    }
+  }
+
+  /** Project-level goal for a session, read from that session's own project. */
+  const readProjectGoalForSessionId = async (sid: string): Promise<string> => {
+    try {
+      return readProjectGoalCondition(await resolveSessionDirectoryFor(sid)) || ""
+    } catch {
+      return ""
+    }
+  }
+
   // supervisor_goal / supervisor_retry tools — wire the supervisor-mode goal loop
   // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
   // this per-session state on the next session.idle.
@@ -1374,7 +1425,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       if (st.goal) {
         return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
       }
-      const projectCondition = readProjectGoalCondition(directory)
+      const projectCondition = await readProjectGoalForSessionId(sid)
       if (projectCondition) {
         return `No session goal set, but a project-level goal exists (.agents/supervisor/Goal.md or goal.md): "${projectCondition}". Reflection mode will already enforce it; call supervisor_goal with an explicit condition to set a session-level goal instead.`
       }
@@ -1387,7 +1438,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     await supervisorStore.setGoal(directory, sid, condition, {})
     // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
     // across sessions. Safe under concurrent writers — see writeProjectGoal.
-    writeProjectGoal(directory, condition)
+    // Written into the SESSION's own project: writing to the server cwd is how
+    // one project's goal ended up in another project's Goal.md (INCIDENT
+    // 2026-07-27) — the read-side fix alone would only half-close that loop.
+    writeProjectGoal(await resolveSessionDirectoryFor(sid), condition)
     return `Goal set for session ${sid.slice(0, 8)}…: "${condition}". Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/Goal.md for reflection mode.`
   }
 
@@ -1411,17 +1465,19 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     } catch {
       return "Could not derive a goal: failed to read the session transcript. Set one manually: /supervisor:goal <condition>"
     }
-    const context = await buildTaskContext(messages, directory)
+    const sessionDirectory = resolveSessionDirectory(messages, directory)
+    const context = await buildTaskContext(messages, sessionDirectory)
     if (!context) {
       return "Could not derive a goal: no task context yet (session has no user message). Set one manually: /supervisor:goal <condition>"
     }
-    const agents = await getAgentsFile(directory)
+    const agents = await getAgentsFile(sessionDirectory)
     const derived = await deriveGoalWithLLM(client, directory, context, agents, messages, judgeSessionIds)
     if (!derived) {
       return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:goal <condition>"
     }
     await supervisorStore.setGoal(directory, sid, derived.condition, {})
-    writeDerivedProjectGoal(directory, derived.condition)
+    // Write the derived goal into the SESSION's project, never the server cwd.
+    writeDerivedProjectGoal(sessionDirectory, derived.condition)
     return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/goal.md.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
@@ -1673,13 +1729,24 @@ Do NOT call this tool:
         const lastReflectedId = lastReflectedMsgId.get(sessionId)
         if (lastUserMsgId === lastReflectedId) return
 
-        const context = await buildTaskContext(messages, directory)
+        // The session's OWN project directory. The plugin-scope `directory` is
+        // the SERVER cwd, fixed at plugin init, and is only a last-resort
+        // fallback — see core/session-context.mjs for the cross-project leak
+        // this prevents. Everything that describes THIS PROJECT (repo signals,
+        // AGENTS.md, rubric, supervisor prompt, Goal.md) must be read from here,
+        // not from whatever cwd `opencode serve` happened to start in.
+        const sessionDirectory = resolveSessionDirectory(messages || [], directory)
+        if (sessionDirectory !== directory) {
+          debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
+        }
+
+        const context = await buildTaskContext(messages, sessionDirectory)
         if (!context) return
 
         const lastAssistantText = extractLastAssistantText(messages)
-        const customPrompt = await loadSupervisorPrompt(directory)
-        const agents = await getAgentsFile(directory)
-        const rubric = await loadRubric(directory)
+        const customPrompt = await loadSupervisorPrompt(sessionDirectory)
+        const agents = await getAgentsFile(sessionDirectory)
+        const rubric = await loadRubric(sessionDirectory)
         const currentAttemptCount = attempts.get(attemptKey) || 0
         // Supervisor goal/retry state. A /supervisor:retry override applies even
         // without a goal (sessionOverride). An active goal augments the judge
@@ -1737,16 +1804,14 @@ Continue now.`
         // MUST compose with the existing gates.
         const goalSection = goal ? buildGoalRequirementSection(goal.condition) : ""
 
-        // Reflection mode: also read project-level goal from
+        // Reflection mode: also read project-level goal from the SESSION's
         // .agents/supervisor/Goal.md (or the lower-case goal.md — see
         // core/goal.mjs's readProjectGoalCondition / writeDerivedProjectGoal,
         // which shares this same lookup order with the LLM-derivation path).
         let projectGoalSection = ""
         if (mode === "reflection" && !goal) {
-          try {
-            const cond = readProjectGoalCondition(directory)
-            if (cond) projectGoalSection = buildGoalRequirementSection(cond)
-          } catch {}
+          const cond = resolveProjectGoalForSession(messages || [], directory)
+          if (cond) projectGoalSection = buildGoalRequirementSection(cond)
         }
         const effectiveGoalSection = goalSection || projectGoalSection
 
@@ -1756,7 +1821,9 @@ Continue now.`
 
         // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
         const defaultSupervisorPrompt = await buildReflectionPrompt({
-          directory,
+          // Session-scoped: Goal.md and the .supervisor/rubric.md override are
+          // both per-project and must come from the session's own project.
+          directory: sessionDirectory,
           defaultsDir,
           context,
           agents,
