@@ -62,12 +62,31 @@ const FILENAME_ALIASES = {
   'Goal.md': 'goal.md',
 }
 
+// Files that describe HOW to judge (SystemPrompt/Patterns/User) are generic
+// and may come from the plugin's shipped defaults. Goal.md describes WHAT a
+// specific project must achieve — it is user intent, scoped to one project,
+// and must NEVER be inherited from anywhere but the project itself.
+//
+// INCIDENT 2026-07-27: `defaultsDir` is the plugin's OWN
+// .agents/supervisor (opencode/supervisor-impl.ts sets it relative to the
+// plugin file). `opencode serve` was running from the plugin's repo, whose
+// Goal.md held an OpenClawBot production-readiness checklist. Every session
+// on that server — including one working in KineticAiCoach, which has no
+// Goal.md at all — got that checklist injected as a "MANDATORY GOAL",
+// causing cross-project scope creep and a 14-session fan-out that wedged the
+// server. Do not re-add Goal.md to the defaults fallback. A "scope guard"
+// paragraph inside Goal.md is prose the judge may ignore; this is the fix.
+const PROJECT_ONLY_FILENAMES = new Set(['Goal.md'])
+
 /**
  * Try `<directory>/.agents/supervisor/<filename>` first, falling back to
  * `<defaultsDir>/<filename>` (the plugin's shipped defaults). If the primary
  * (typically capitalized) filename isn't found at either location, also
  * tries its lower-case/legacy alias (see FILENAME_ALIASES) at both
  * locations before giving up. Returns null if nothing is found anywhere.
+ *
+ * Exception: filenames in PROJECT_ONLY_FILENAMES are read from `directory`
+ * only — they never fall back to `defaultsDir`.
  * @param {string} directory
  * @param {string} defaultsDir
  * @param {string} filename
@@ -84,6 +103,7 @@ async function readSupervisorFile(directory, defaultsDir, filename) {
     }
   }
   if (!defaultsDir) return null
+  if (PROJECT_ONLY_FILENAMES.has(filename)) return null
   for (const name of candidates) {
     try {
       return await readFile(join(defaultsDir, name), 'utf-8')
