@@ -56,6 +56,40 @@ export {
 }
 export { getLastSessionCwd, resolveSessionDirectory }
 
+export function detectSupervisorActionInText(text: string): "off" | "on" | null {
+  if (!text || typeof text !== "string") return null
+  // Every form must be the ENTIRE trimmed line. A substring match would let any
+  // pasted log, config snippet, or discussion of the supervisor silently disable it.
+  const OFF_LINES = new Set(['command: "off"', "command: 'off'", "/supervisor off", "/supervisor:off", "supervisor off", "supervisor:off"])
+  const ON_LINES = new Set(['command: "on"', "command: 'on'", "/supervisor on", "/supervisor:on", "supervisor on", "supervisor:on"])
+  for (const raw of text.toLowerCase().split("\n")) {
+    const line = raw.trim()
+    if (OFF_LINES.has(line)) return "off"
+    if (ON_LINES.has(line)) return "on"
+  }
+  return null
+}
+
+export function getLastUserMessageText(messages: any[]): string {
+  if (!Array.isArray(messages)) return ""
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    const role = msg.info?.role || msg.role
+    if (role === "user") {
+      const textParts: string[] = []
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && typeof part.text === "string") {
+          if (!part.text.includes(SELF_ASSESSMENT_MARKER) && !part.text.includes(FEEDBACK_MARKER)) {
+            textParts.push(part.text)
+          }
+        }
+      }
+      if (textParts.length > 0) return textParts.join("\n")
+    }
+  }
+  return ""
+}
+
 /**
  * Read the project-level goal condition for a SESSION, from the session's own
  * project — not from whatever cwd `opencode serve` happens to have been
@@ -1266,28 +1300,58 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   let toolSupervisorPrompt: string | null = null
   let currentSessionId: string | null = null  // tracks most recent active session for the toggle tool
 
-  const disabledFlagPath = join(directory, '.supervisor', 'disabled')
+  // Exact match only. Session IDs are time-ordered, so prefix matching would let one
+  // truncated line disable every session created in the same window. Every writer
+  // (this file and bin/supervisor.mjs) persists full IDs, so prefixes are never needed.
+  function sessionMatchesDisabledLine(sessionId: string, line: string): boolean {
+    return line.trim() === sessionId
+  }
 
-  async function isSessionDisabled(sessionId: string): Promise<boolean> {
+  async function checkDisabledFile(filePath: string, sessionId: string): Promise<boolean> {
     try {
-      const content = await readFile(disabledFlagPath, 'utf8')
-      return content.split('\n').map(l => l.trim()).filter(Boolean).includes(sessionId)
+      const content = await readFile(filePath, "utf8")
+      const lines = content.split("\n").map(l => l.trim()).filter(Boolean)
+      return lines.some(line => sessionMatchesDisabledLine(sessionId, line))
     } catch { return false }
   }
 
-  async function setSessionDisabled(sessionId: string, disabled: boolean): Promise<void> {
-    let lines: string[] = []
-    try {
-      const content = await readFile(disabledFlagPath, 'utf8')
-      lines = content.split('\n').map(l => l.trim()).filter(Boolean)
-    } catch {}
-    if (disabled) {
-      if (!lines.includes(sessionId)) lines.push(sessionId)
-    } else {
-      lines = lines.filter(l => l !== sessionId)
+  async function isSessionDisabled(sessionId: string, sessionDir?: string): Promise<boolean> {
+    if (await checkDisabledFile(join(directory, ".supervisor", "disabled"), sessionId)) {
+      return true
     }
-    await mkdir(join(directory, '.supervisor'), { recursive: true })
-    await writeFile(disabledFlagPath, lines.join('\n') + (lines.length ? '\n' : ''))
+    if (sessionDir && sessionDir !== directory) {
+      if (await checkDisabledFile(join(sessionDir, ".supervisor", "disabled"), sessionId)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  async function setSessionDisabled(sessionId: string, disabled: boolean, sessionDir?: string): Promise<void> {
+    const targetDirs = new Set<string>([directory])
+    if (sessionDir) targetDirs.add(sessionDir)
+
+    for (const dir of targetDirs) {
+      const flagPath = join(dir, ".supervisor", "disabled")
+      let lines: string[] = []
+      try {
+        const content = await readFile(flagPath, "utf8")
+        lines = content.split("\n").map(l => l.trim()).filter(Boolean)
+      } catch {}
+
+      if (disabled) {
+        if (!lines.some(l => sessionMatchesDisabledLine(sessionId, l))) {
+          lines.push(sessionId)
+        }
+      } else {
+        lines = lines.filter(l => !sessionMatchesDisabledLine(sessionId, l))
+      }
+
+      await mkdir(join(dir, ".supervisor"), { recursive: true, mode: 0o700 })
+      await writeFile(flagPath, lines.join("\n") + (lines.length ? "\n" : ""), { mode: 0o600 })
+      // writeFile's mode only applies on create; chmod covers pre-existing files.
+      await chmod(flagPath, 0o600).catch(() => {})
+    }
   }
 
   const setSupervisorDescription = "Use this for difficult or complex tasks to set supervisor guidance with a plan/checklist. Provide concrete steps and verification checks so supervisor can validate completion quality and catch missed work."
@@ -1311,9 +1375,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
 
   // Primary supervisor tool: status, session on/off, and mode selection.
   const supervisorToggleDescription = "Inspect or change supervisor state for the current session. Use mode=autopilot or mode=reflection to switch modes. Use action=off/on for session disable/enable, or omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
-  const executeSupervisorToggle = async (args: { action?: string; mode?: SupervisorMode; condition?: string; clear?: boolean; n?: number } = {}) => {
-    const sid = currentSessionId
+  const executeSupervisorToggle = async (
+    args: { action?: string; mode?: SupervisorMode; condition?: string; clear?: boolean; n?: number } = {},
+    context?: any
+  ) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session tracked yet — wait for the first session.idle event, then try again."
+    currentSessionId = sid
+    const sessionDir = await resolveSessionDirectoryFor(sid)
     const requestedMode = args.mode?.trim().toLowerCase()
     if (requestedMode === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
@@ -1325,11 +1394,11 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     }
     const action = (args.action || "status").trim().toLowerCase()
     if (action === "off") {
-      await setSessionDisabled(sid, true)
+      await setSessionDisabled(sid, true, sessionDir)
       return `Supervisor disabled for session ${sid.slice(0, 8)}… (added to .supervisor/disabled).`
     }
     if (action === "on") {
-      await setSessionDisabled(sid, false)
+      await setSessionDisabled(sid, false, sessionDir)
       return `Supervisor enabled for session ${sid.slice(0, 8)}… (removed from .supervisor/disabled).`
     }
     if (action === "autopilot") {
@@ -1341,20 +1410,20 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
     if (action === "goal") {
-      return executeSupervisorGoal({ condition: args.condition, clear: args.clear })
+      return executeSupervisorGoal({ condition: args.condition, clear: args.clear }, context)
     }
     if (action === "retry") {
-      return executeSupervisorRetry({ n: args.n })
+      return executeSupervisorRetry({ n: args.n }, context)
     }
     if (action === "autoreview" || action === "autoreview-on" || action === "autoreview-off" || action === "autoreview-status") {
-      if (action === "autoreview-off") return executeSupervisorAutoreview({ enabled: false })
+      if (action === "autoreview-off") return executeSupervisorAutoreview({ enabled: false }, context)
       if (action === "autoreview-status") {
         const st = await supervisorStore.load(directory, sid)
         return `Autoreview: ${st.autoreview ? "on" : "off"}`
       }
-      return executeSupervisorAutoreview({ enabled: true })
+      return executeSupervisorAutoreview({ enabled: true }, context)
     }
-    const disabled = await isSessionDisabled(sid)
+    const disabled = await isSessionDisabled(sid, sessionDir)
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
     const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
@@ -1407,9 +1476,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
   // this per-session state on the next session.idle.
   const supervisorGoalDescription = "Set, check, or clear a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear)."
-  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }) => {
-    const sid = currentSessionId
+  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
+    currentSessionId = sid
     if (args.clear) {
       await supervisorStore.clearGoal(directory, sid)
       return `Goal cleared for session ${sid.slice(0, 8)}….`
@@ -1481,9 +1551,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/goal.md.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
-  const executeSupervisorRetry = async (args: { n?: number }) => {
-    const sid = currentSessionId
+  const executeSupervisorRetry = async (args: { n?: number }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then set retry."
+    currentSessionId = sid
     if (typeof args.n === "number" && Number.isFinite(args.n)) {
       await supervisorStore.setRetry(directory, sid, args.n)
       const eff = resolveMaxAttempts({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
@@ -1495,9 +1566,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
 
   // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
   const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call autopilot_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
-  const executeSupervisorAutopilot = async (args: { enabled: boolean }) => {
-    const sid = currentSessionId
+  const executeSupervisorAutopilot = async (args: { enabled: boolean }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then toggle autopilot."
+    currentSessionId = sid
     await supervisorStore.setAutopilot(directory, sid, args.enabled)
     if (args.enabled) {
       return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
@@ -1507,9 +1579,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
 
   // supervisor_autoreview tool — toggle cross-model review on completion
   const supervisorAutoreviewDescription = "Toggle cross-model autoreview. When enabled, a second AI model reviews task completion verdicts for blind-spot coverage. Usage: call with enabled=true to enable, enabled=false to disable."
-  const executeSupervisorAutoreview = async (args: { enabled: boolean }) => {
-    const sid = currentSessionId
+  const executeSupervisorAutoreview = async (args: { enabled: boolean }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then toggle autoreview."
+    currentSessionId = sid
     await supervisorStore.setAutoreview(directory, sid, args.enabled)
     if (args.enabled) {
       return `Autoreview enabled for session ${sid.slice(0, 8)}…. Cross-model review will run when the judge marks a task complete.`
@@ -1525,9 +1598,10 @@ Call this tool:
 Do NOT call this tool:
 - Before implementation work is complete
 - If you still need to run more tools to finish the task`
-  const executeAutopilotExit = async () => {
-    const sid = currentSessionId
+  const executeAutopilotExit = async (_args?: any, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (sid) {
+      currentSessionId = sid
       await supervisorStore.setAutopilot(directory, sid, false)
     }
     return { title: "Exited autopilot", output: "Autopilot completed." }
@@ -1691,10 +1765,6 @@ Do NOT call this tool:
       if (activeSupervisors.has(sessionId)) return
 
       currentSessionId = sessionId
-      if (await isSessionDisabled(sessionId)) {
-        debug("Supervisor disabled for session:", sessionId.slice(0, 8))
-        return
-      }
 
       activeSupervisors.add(sessionId)
 
@@ -1712,6 +1782,26 @@ Do NOT call this tool:
         if (isJudgeSession(sessionId, messages, judgeSessionIds)) return
         if (isPlanMode(messages)) return
 
+        const sessionDirectory = resolveSessionDirectory(messages || [], directory)
+        if (sessionDirectory !== directory) {
+          debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
+        }
+
+        const lastUserText = getLastUserMessageText(messages)
+        const explicitAction = detectSupervisorActionInText(lastUserText)
+        if (explicitAction === "off") {
+          await setSessionDisabled(sessionId, true, sessionDirectory)
+          debug("Supervisor disabled by explicit user command in transcript:", sessionId.slice(0, 8))
+          return
+        } else if (explicitAction === "on") {
+          await setSessionDisabled(sessionId, false, sessionDirectory)
+        }
+
+        if (await isSessionDisabled(sessionId, sessionDirectory)) {
+          debug("Supervisor disabled for session:", sessionId.slice(0, 8))
+          return
+        }
+
         // Issue #82 / Issue #109: ESC-abort detection.
         // Previously we checked time.completed on the last assistant message, but
         // that caused false negatives — sessions where the model stopped producing
@@ -1728,17 +1818,6 @@ Do NOT call this tool:
         const attemptKey = `${sessionId}:${lastUserMsgId}`
         const lastReflectedId = lastReflectedMsgId.get(sessionId)
         if (lastUserMsgId === lastReflectedId) return
-
-        // The session's OWN project directory. The plugin-scope `directory` is
-        // the SERVER cwd, fixed at plugin init, and is only a last-resort
-        // fallback — see core/session-context.mjs for the cross-project leak
-        // this prevents. Everything that describes THIS PROJECT (repo signals,
-        // AGENTS.md, rubric, supervisor prompt, Goal.md) must be read from here,
-        // not from whatever cwd `opencode serve` happened to start in.
-        const sessionDirectory = resolveSessionDirectory(messages || [], directory)
-        if (sessionDirectory !== directory) {
-          debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
-        }
 
         const context = await buildTaskContext(messages, sessionDirectory)
         if (!context) return
