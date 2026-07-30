@@ -1307,20 +1307,35 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     return line.trim() === sessionId
   }
 
-  async function checkDisabledFile(filePath: string, sessionId: string): Promise<boolean> {
+  async function readDisabledLines(filePath: string): Promise<string[] | null> {
     try {
       const content = await readFile(filePath, "utf8")
-      const lines = content.split("\n").map(l => l.trim()).filter(Boolean)
-      return lines.some(line => sessionMatchesDisabledLine(sessionId, line))
-    } catch { return false }
+      return content.split("\n").map(l => l.trim()).filter(Boolean)
+    } catch { return null }
+  }
+
+  async function checkDisabledFile(filePath: string, sessionId: string): Promise<boolean> {
+    const lines = await readDisabledLines(filePath)
+    return !!lines?.some(line => sessionMatchesDisabledLine(sessionId, line))
+  }
+
+  async function writeDisabledLines(dir: string, lines: string[]): Promise<void> {
+    const flagPath = join(dir, ".supervisor", "disabled")
+    await mkdir(join(dir, ".supervisor"), { recursive: true, mode: 0o700 })
+    await writeFile(flagPath, lines.join("\n") + (lines.length ? "\n" : ""), { mode: 0o600 })
+    // writeFile's mode only applies on create; chmod covers pre-existing files.
+    await chmod(flagPath, 0o600).catch(() => {})
   }
 
   async function isSessionDisabled(sessionId: string, sessionDir?: string): Promise<boolean> {
-    if (await checkDisabledFile(join(directory, ".supervisor", "disabled"), sessionId)) {
+    if (sessionDir && await checkDisabledFile(join(sessionDir, ".supervisor", "disabled"), sessionId)) {
       return true
     }
-    if (sessionDir && sessionDir !== directory) {
-      if (await checkDisabledFile(join(sessionDir, ".supervisor", "disabled"), sessionId)) {
+    // The plugin `directory` is the server cwd, not the session's project. It is read
+    // for backward compatibility with entries written before disable became
+    // session-scoped, and by the bin/ CLI when it runs from the server cwd.
+    if (!sessionDir || sessionDir !== directory) {
+      if (await checkDisabledFile(join(directory, ".supervisor", "disabled"), sessionId)) {
         return true
       }
     }
@@ -1328,29 +1343,23 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   async function setSessionDisabled(sessionId: string, disabled: boolean, sessionDir?: string): Promise<void> {
-    const targetDirs = new Set<string>([directory])
-    if (sessionDir) targetDirs.add(sessionDir)
+    if (disabled) {
+      // Write ONLY to the session's own project so disabling a session in project A
+      // does not leave an entry in whatever project `opencode serve` started in.
+      const dir = sessionDir || directory
+      const lines = (await readDisabledLines(join(dir, ".supervisor", "disabled"))) ?? []
+      if (!lines.some(l => sessionMatchesDisabledLine(sessionId, l))) lines.push(sessionId)
+      await writeDisabledLines(dir, lines)
+      return
+    }
 
-    for (const dir of targetDirs) {
-      const flagPath = join(dir, ".supervisor", "disabled")
-      let lines: string[] = []
-      try {
-        const content = await readFile(flagPath, "utf8")
-        lines = content.split("\n").map(l => l.trim()).filter(Boolean)
-      } catch {}
-
-      if (disabled) {
-        if (!lines.some(l => sessionMatchesDisabledLine(sessionId, l))) {
-          lines.push(sessionId)
-        }
-      } else {
-        lines = lines.filter(l => !sessionMatchesDisabledLine(sessionId, l))
-      }
-
-      await mkdir(join(dir, ".supervisor"), { recursive: true, mode: 0o700 })
-      await writeFile(flagPath, lines.join("\n") + (lines.length ? "\n" : ""), { mode: 0o600 })
-      // writeFile's mode only applies on create; chmod covers pre-existing files.
-      await chmod(flagPath, 0o600).catch(() => {})
+    // Re-enable must clear EVERY location that isSessionDisabled reads, otherwise a
+    // legacy entry in the server cwd would keep the session disabled forever.
+    for (const dir of new Set<string>([directory, ...(sessionDir ? [sessionDir] : [])])) {
+      const lines = await readDisabledLines(join(dir, ".supervisor", "disabled"))
+      if (lines === null) continue  // no file here; don't create an empty one
+      const next = lines.filter(l => !sessionMatchesDisabledLine(sessionId, l))
+      if (next.length !== lines.length) await writeDisabledLines(dir, next)
     }
   }
 
@@ -1787,6 +1796,10 @@ Do NOT call this tool:
           debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
         }
 
+        // The disabled check runs AFTER the transcript fetch (it used to short-circuit
+        // before it). That costs one local API call per idle on a disabled session, which
+        // is the price of honouring a transcript-level `/supervisor on` — the model does
+        // not reliably call the tool, so the command must be readable from the messages.
         const lastUserText = getLastUserMessageText(messages)
         const explicitAction = detectSupervisorActionInText(lastUserText)
         if (explicitAction === "off") {
