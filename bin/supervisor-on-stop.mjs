@@ -31,8 +31,8 @@ import {
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { buildEscalatingFeedback, buildCeoDirective } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, readSolofounderGoal } from '../core/goal.mjs';
+import { buildEscalatingFeedback } from '../core/feedback.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
@@ -782,14 +782,16 @@ async function main() {
     if (goalState.goal && goalState.goal.status === 'active') {
       goal = goalState.goal;
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
-      // Solofounder's attempt budget is per-human-turn, not cumulative for
-      // the whole session (unlike plain 'goal' mode): once turnKey moves —
-      // a new real user message arrived — the previous turn's escalation no
-      // longer applies, so goal.attempts resets to 0 instead of marching
-      // toward decideGoalTransition's exhausted cap forever. lastTurnKey is
-      // only null on the very first stop after arming (setSolofounder), so
-      // that first observation just stamps it without a spurious reset.
-      if (mode === 'solofounder' && turnKey != null && goal.lastTurnKey !== turnKey) {
+      // A goal's attempt budget is per-human-turn, not cumulative for the
+      // whole session: once turnKey moves — a new real user message arrived —
+      // the previous turn's escalation no longer applies, so goal.attempts
+      // resets to 0 instead of marching toward decideGoalTransition's
+      // exhausted cap forever. Without this, a goal set early in a session
+      // died permanently ~16 stops later with no verdict and no way to tell
+      // why the supervisor had gone quiet. lastTurnKey is only null on the
+      // very first stop after setGoal, so that first observation just stamps
+      // it without a spurious reset.
+      if (turnKey != null && goal.lastTurnKey !== turnKey) {
         const shouldReset = goal.lastTurnKey != null;
         goal = { ...goal, lastTurnKey: turnKey, ...(shouldReset ? { attempts: 0 } : {}) };
         goalState = { ...goalState, goal };
@@ -822,36 +824,31 @@ async function main() {
   // readProjectGoalCondition for the shared precedence rule).
   let projectGoalSection = '';
   const effectiveMode = resolveSupervisorMode(goalState);
-  if (effectiveMode !== 'goal' && effectiveMode !== 'solofounder' && !goal) {
+  if (effectiveMode !== 'goal' && !goal) {
     const cond = readProjectGoalCondition(cwd);
     if (cond) projectGoalSection = buildGoalRequirementSection(cond);
   }
 
-  // Solofounder: the judge must actually see the $1M ARR condition + evidence
-  // rule as a MANDATORY completion requirement (unlike plain 'goal' mode,
-  // which only surfaces goal.condition in the continuation feedback text, not
-  // the judge prompt itself) — source it from solofounder.md, falling back to
-  // the shared Goal.md/goal.md pointer if a drive was armed before that file
-  // existed.
-  let solofounderGoalSection = '';
-  if (mode === 'solofounder') {
-    const cond = readSolofounderGoal(cwd) || readProjectGoalCondition(cwd);
-    if (cond) solofounderGoalSection = buildGoalRequirementSection(cond);
-  }
+  // The judge must actually SEE the goal condition + evidence rule as a
+  // MANDATORY completion requirement. It previously only reached the
+  // continuation feedback text, never the judge prompt — so the judge decided
+  // "complete" against generic workflow gates while the goal loop then used
+  // that verdict to decide the goal was met. (OpenCode always injected it —
+  // see supervisor-impl.ts's goalSection — so this was a CC-only gap.)
+  const sessionGoalSection = goal ? buildGoalRequirementSection(goal.condition) : '';
 
   const attempts = readAttempts(session_id, cwd, turnKey);
   if (attempts >= effectiveMax) {
-    // Solofounder's per-turn budget hitting its cap is NOT permanent
-    // exhaustion — the file-based `attempts` counter above already resets on
-    // the next turnKey (a new human message), so leave goal.status 'active'
-    // and just stand down for the rest of THIS turn. Marking it 'exhausted'
-    // here would permanently disable the drive: the goal-active branch above
-    // (where lastTurnKey/attempts get reset) never re-fires once status
-    // leaves 'active', so a solofounder goal that hit this per-turn cap once
-    // would never resume on a later turn.
-    if (goal && mode !== 'solofounder') {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: { ...goal, status: 'exhausted' } }); } catch { /* */ }
-    }
+    // Hitting the per-turn budget is NOT permanent exhaustion — the
+    // file-based `attempts` counter above already resets on the next turnKey
+    // (a new human message), so leave goal.status 'active' and just stand
+    // down for the rest of THIS turn. Marking it 'exhausted' here would
+    // permanently disable the goal: the goal-active branch above (where
+    // lastTurnKey/attempts get reset) never re-fires once status leaves
+    // 'active', so a goal that hit the cap once would never resume on a
+    // later turn. Real exhaustion is the deadline, applied in the goal loop
+    // below.
+    //
     // Disable autopilot on budget exhaustion so the next stop is clean.
     if (mode === 'autopilot') {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
@@ -926,9 +923,7 @@ async function main() {
     lastAssistantText: ctx.final_assistant_text,
     attemptCount: attempts,
     maxAttempts: effectiveMax,
-    goalSection: mode === 'solofounder'
-      ? (solofounderGoalSection || (goal ? buildGoalRequirementSection(goal.condition) : undefined))
-      : ((projectGoalSection && !goal) ? projectGoalSection : undefined),
+    goalSection: sessionGoalSection || projectGoalSection || undefined,
   });
 
   // 6.5. Resolve delivered media so the tool-less judge can SEE it. Images are
@@ -946,6 +941,14 @@ async function main() {
     }
   } catch (e) {
     debug({ msg: 'media_collect_failed', err: String(e?.message ?? e) }, cwd);
+  }
+
+  // Test-only escape hatch (same family as SUPERVISOR_FAKE_JUDGE): dump the
+  // fully-built judge prompt to a file so a test can assert what the judge
+  // actually sees — e.g. that an active goal reaches it as a mandatory
+  // requirement. Never set in normal operation; best-effort, never throws.
+  if (process.env.SUPERVISOR_DUMP_PROMPT) {
+    try { fs.writeFileSync(process.env.SUPERVISOR_DUMP_PROMPT, prompt, 'utf8'); } catch { /* best effort */ }
   }
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;
@@ -1025,33 +1028,37 @@ async function main() {
     if (t.action === 'achieved') {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.goal = 'achieved';
-      if (mode === 'solofounder') {
-        verdictRecord.message = `$1M ARR condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
-      }
+      verdictRecord.message = `Goal condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
       writeVerdict(session_id, verdictRecord, cwd);
-      debug({ msg: mode === 'solofounder' ? 'solofounder_achieved' : 'goal_achieved', session_id, message: verdictRecord.message }, cwd);
+      debug({ msg: 'goal_achieved', session_id, message: verdictRecord.message }, cwd);
       process.exit(0);
     }
     if (t.action === 'exhausted') {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
-      verdictRecord.goal = 'exhausted';
+      // Two different things reach this branch, and only one of them is a
+      // real end-of-goal. The deadline is: it means the goal outlived the
+      // window it was set for. The attempts cap is not — attempts reset on
+      // the next human turn (see the per-turn reset above), so persisting
+      // 'exhausted' here would kill a goal the human is still driving. Stand
+      // down for the rest of THIS turn instead and leave it active.
+      const deadlineHit = Date.now() >= goal.deadline;
+      if (deadlineHit) {
+        try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+        verdictRecord.goal = 'exhausted';
+      } else {
+        verdictRecord.goal = 'turn_budget_spent';
+      }
       writeVerdict(session_id, verdictRecord, cwd);
-      debug({ msg: 'goal_exhausted', session_id }, cwd);
+      debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id }, cwd);
       process.exit(0);
     }
     // continue — but never override a genuine human-only block.
     if (!analysis.requiresHumanAction) {
-      // Solofounder gets a CEO directive (pick a lever, spawn doers, evaluate,
-      // integrate) instead of the generic Missing/Next-Actions feedback plain
-      // 'goal' mode uses — same escalation slot, different framing.
-      const msg = mode === 'solofounder'
-        ? buildCeoDirective({ goalCondition: goal.condition, analysis, attempt: nextAttempt, effectiveMax })
-        : `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
+      const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
-      verdictRecord.feedback_reason = mode === 'solofounder' ? 'ceo_directive_continue' : 'goal_continue';
+      verdictRecord.feedback_reason = 'goal_continue';
       writeVerdict(session_id, verdictRecord, cwd);
       process.stdout.write(JSON.stringify({ decision: 'block', reason: msg }));
       debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity, mode }, cwd);

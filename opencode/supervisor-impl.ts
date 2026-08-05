@@ -159,6 +159,14 @@ export interface SupervisorGoal {
   startedAt: number
   deadline: number
   lastReason: string
+  /**
+   * Fingerprint of the human turn `attempts` belongs to (the last relevant
+   * user message id here; a transcript-derived turn key on the Claude Code
+   * side). The attempt budget is per-turn, not cumulative for the session —
+   * see the reset in the session.idle handler. null until the first idle pass
+   * observes one.
+   */
+  lastTurnKey?: string | null
 }
 
 export type SupervisorMode = "autopilot" | "goal" | "reflection"
@@ -222,6 +230,7 @@ export const supervisorStore = {
       startedAt: now,
       deadline: now + maxDurationMs,
       lastReason: "",
+      lastTurnKey: null,
     }
     state.mode = "goal"
     state.autopilot = false
@@ -1845,7 +1854,21 @@ Do NOT call this tool:
         // rubric with a mandatory completion requirement and drives the goal loop.
         const sup = await supervisorStore.load(directory, sessionId)
         const mode = resolveSupervisorMode(sup) as SupervisorMode
-        const goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+        let goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+        // A goal's attempt budget is per-human-turn, not cumulative for the
+        // whole session: once the human speaks again the previous turn's
+        // escalation no longer applies, so goal.attempts resets instead of
+        // marching toward decideGoalTransition's exhausted cap forever (which
+        // killed the goal permanently, mid-session, with no verdict).
+        // lastTurnKey is only null on the very first pass after setGoal, so
+        // that first observation just stamps it without a spurious reset.
+        // Mirrors the identical reset in bin/supervisor-on-stop.mjs.
+        if (goal && goal.lastTurnKey !== lastUserMsgId) {
+          const shouldReset = goal.lastTurnKey != null
+          goal = { ...goal, lastTurnKey: lastUserMsgId, ...(shouldReset ? { attempts: 0 } : {}) }
+          sup.goal = goal
+          try { await supervisorStore.save(directory, sessionId, sup) } catch { /* best effort */ }
+        }
         const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
 
         // ── Autopilot fast-path ──────────────────────────────────────────
@@ -2085,16 +2108,27 @@ Continue now.`
             reason: analysis.reason,
           })
           if (t.action === "exhausted") {
-            await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+            // Two different things reach this branch, and only the deadline is
+            // a real end-of-goal — it means the goal outlived the window it was
+            // set for. The attempts cap is per-human-turn (see the reset above),
+            // so persisting "exhausted" + mode:reflection there would kill a
+            // goal the human is still driving. Stand down for the rest of THIS
+            // turn instead and leave it active. Mirrors bin/supervisor-on-stop.mjs.
+            const deadlineHit = Date.now() >= goal.deadline
+            if (deadlineHit) {
+              await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+            }
             attempts.delete(attemptKey)
             lastReflectedMsgId.set(sessionId, lastUserMsgId)
             await showToast(
               client,
               directory,
-              `Goal budget exhausted (${t.goal.attempts} attempts) — paused`,
+              deadlineHit
+                ? `Goal deadline reached — paused`
+                : `Goal budget spent for this turn (${t.goal.attempts} attempts) — resumes on your next message`,
               "warning"
             )
-            debug("Goal budget exhausted, pausing without continuation")
+            debug(deadlineHit ? "Goal deadline reached, pausing" : "Goal turn budget spent, pausing until next human turn")
             return
           }
           if (t.action === "achieved") {

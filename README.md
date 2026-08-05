@@ -73,8 +73,8 @@ so both runtimes — and the trainer — share one brain.
 Inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
-- `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met or budget exhausts
-- `/supervisor:retry N` — set the retry budget (1–100, default 16)
+- `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (budget resets each human turn)
+- `/supervisor:retry N` — set the per-turn retry budget (1–100, default 16)
 - `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `AUTOPILOT_EXIT` or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
@@ -129,7 +129,7 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 | Mode | Command | Behavior |
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
-| `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
+| `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met. The retry budget bounds one human turn, then resets when you speak again. |
 | `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
 
 The effective default mode is `reflection`.
@@ -137,13 +137,25 @@ The effective default mode is `reflection`.
 ## Goal mode (both runtimes)
 
 Beyond catching premature stops, you can point the supervisor at a **goal** it must
-demonstrably meet before it lets the agent stop — it keeps re-prompting (up to a
-retry budget) until the goal's met or the budget runs out.
+demonstrably meet before it lets the agent stop — it keeps re-prompting until the
+goal's met.
 
 ```
 /supervisor:set-goal all tests in test/auth pass and the PR is open with green CI
-/supervisor:retry 24           # set this session's retry budget (1–100, default 16)
+/supervisor:retry 24           # set this turn's retry budget (1–100, default 16)
 ```
+
+**The retry budget is per human turn, not per session.** It bounds how many times
+the supervisor may re-prompt inside one unbroken turn; the moment you send another
+message, the budget resets and the goal keeps driving. Spending the budget stands
+the supervisor down for the rest of that turn and hands control back to you — it
+does not end the goal. Only two things end a goal: the judge confirming the
+condition is met, or the 30-day deadline backstop (see
+`DEFAULT_MAX_GOAL_DURATION_MS`). Clear one early with `/supervisor:set-goal clear`.
+
+This used to be a separate `solofounder` mode. It isn't any more — those semantics
+are goal mode's default, and `solofounder` survives only as a skill
+(`skills/solofounder/`) that arms a goal with a revenue done-bar.
 
 The command is deliberately named `/supervisor:set-goal` on **both** runtimes,
 never `/supervisor:goal` — Claude Code ships its own native `/goal` command and
@@ -161,8 +173,8 @@ Beyond the per-session goal above, a project-level goal can also persist across
 sessions — see "Project goals (`Goal.md`)" below.
 
 The goal is injected into the judge as a **mandatory completion requirement** — the
-agent is not allowed to stop until the goal is met (or the budget exhausts). While a
-goal is active the retry budget rises to 16 (vs 3 normally). State is per-session at
+agent is not allowed to stop until the goal is met. While a goal is active the retry
+budget rises to 16 (vs 3 normally). State is per-session at
 `.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
 continuation actually fires.
 
@@ -222,7 +234,7 @@ For web app / OpenCode API, call tools directly:
 |---|---|---|
 | Judge evaluation | Yes (self-assessment + optional cross-model) | No (skipped entirely) |
 | Continuation trigger | Judge says "not done" | Every idle (unconditional) |
-| Stop condition | Goal met or budget exhausted | Agent calls `autopilot_exit` or budget exhausted |
+| Stop condition | Goal met (or 30-day deadline) | Agent calls `autopilot_exit` or budget exhausted |
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:

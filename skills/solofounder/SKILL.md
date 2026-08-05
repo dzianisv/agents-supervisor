@@ -61,15 +61,17 @@ The single-agent **Operating loop** below is what each *doer* runs on its narrow
 
 ## Set the $1M ARR done-bar (Step 1 — before the loop)
 
-This skill runs inside the **supervisor** plugin, using its first-class **`solofounder`
-mode** — architecturally identical to `reflection` mode (the judge runs on every
-Stop-hook invocation) but its goal state lives in `.agents/supervisor/solofounder.md`
-and is scored against the $1M ARR condition instead of a generic reflection check. On
-every turn-end the hook reads that file, judges the reply against it, and — if unmet —
-forces a continuation instead of letting the agent stop. That hook IS the persistence
-motor; there is no separate `.autopilot/` engine to arm and no `active`/heartbeat file
-to write. Enabling the mode below is a real tool call you make THIS turn, not a plan you
-describe — a turn that ends without it armed nothing.
+This skill runs inside the **supervisor** plugin, on its **goal mode**. There is no
+separate `solofounder` supervisor mode any more — everything that made one different
+(per-human-turn attempt budget, effectively unbounded deadline, condition injected into
+the judge as a mandatory completion requirement) is now goal mode's default. This skill
+is the prompt-level layer on top: it arms a goal whose condition is the $1M ARR
+done-bar. Goal state lives in `.agents/supervisor/Goal.md` plus the per-session store
+under `.supervisor/goals/`. On every turn-end the hook judges the reply against that
+condition and — if unmet — forces a continuation instead of letting the agent stop.
+That hook IS the persistence motor; there is no separate `.autopilot/` engine to arm and
+no `active`/heartbeat file to write. Arming the goal below is a real tool call you make
+THIS turn, not a plan you describe — a turn that ends without it armed nothing.
 
 1. **Resolve the revenue source (once).** `${ARGUMENTS}` names the product/context. Find
    how ITS revenue is actually read: grep the target project for a billing or store
@@ -81,20 +83,20 @@ describe — a turn that ends without it armed nothing.
    empty is that itself gap #1: ask the human ONCE which revenue source is authoritative
    (or instrument the obvious one — e.g. Stripe MRR — as the first shipped change), then
    resolve the exact command. Never guess or self-report a revenue number.
-2. **Enable solofounder mode.** Turn the mode on via the supervisor CLI, folding the
+2. **Arm the goal.** Set it via the supervisor CLI, folding the
    product context and the resolved revenue-read command into the call — this is the
    file/state write, not narration:
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" solofounder "<product/context from \${ARGUMENTS}>. \$1M ARR condition: revenue (read via: <the resolved read-only command>) × 12 >= \$1,000,000. DONE only if the reply quotes that command's live output and it meets the threshold. Otherwise CONTINUE — the next highest-leverage growth/product/content gap toward \$1M ARR."
+   node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" set-goal "<product/context from \${ARGUMENTS}>. \$1M ARR condition: revenue (read via: <the resolved read-only command>) × 12 >= \$1,000,000. DONE only if the reply quotes that command's live output and it meets the threshold. Otherwise CONTINUE — the next highest-leverage growth/product/content gap toward \$1M ARR."
    ```
    Substitute the real resolved command from step 1 for `<the resolved read-only
    command>` — never leave a placeholder in the text. This call writes/updates
-   `.agents/supervisor/solofounder.md`, enforced by every subsequent Stop-hook check for
+   `.agents/supervisor/Goal.md`, enforced by every subsequent Stop-hook check for
    this project, across turns and context resets, until cleared or met.
-3. **Confirm and cite.** Read back `.agents/supervisor/solofounder.md` (or the command's
-   own confirmation output) and tell the human, in this turn's reply: solofounder mode is
+3. **Confirm and cite.** Read back `.agents/supervisor/Goal.md` (or the command's
+   own confirmation output) and tell the human, in this turn's reply: the goal is
    active, quote the resolved revenue-read command, and cite the exact path
-   `.agents/supervisor/solofounder.md` as where the persistent goal state lives.
+   `.agents/supervisor/Goal.md` as where the persistent goal state lives.
 4. **Seed the doer brain.** Each doer subagent boots clean, so persist this skill's
    decision logic where every doer can be handed it:
    ```bash
@@ -113,7 +115,7 @@ describe — a turn that ends without it armed nothing.
    narrow scope. When a doer scores low, rewrite and re-persist this file (CEO mode
    step 4) so the next generation inherits the fix.
 5. **Go idle and let the hook drive.** No `echo N > active` cadence file is needed —
-   the Stop-hook fires on every stop automatically once solofounder mode is enabled. CEO
+   the Stop-hook fires on every stop automatically once the goal is armed. CEO
    mode (below) is this skill's default operating body for every cycle the hook
    re-launches; there is no separate serial-vs-CEO marker file to toggle.
 
@@ -121,13 +123,13 @@ describe — a turn that ends without it armed nothing.
 Stop hook can force at most **~7 turn-continuations within a single unbroken human
 message** — Claude Code overrides the hook and lets the turn end after 8 consecutive
 `{decision:'block'}` responses (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`, default 8, hook stays
-one under it). solofounder mode does not bypass this cap; it is the same Stop-hook
+one under it). Goal mode does not bypass this cap; it is the same Stop-hook
 mechanism as `reflection`. For a genuinely long autonomous drive toward $1M ARR, either:
 - pair this skill with the `/loop` skill (a fresh message resets CC's per-turn counter,
   so `/loop` re-invoking the prompt on an interval is what actually spans hours/days), or
 - raise `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` in the environment running the session (still
   bounded by whatever cap CC itself enforces).
-Without one of those, solofounder mode will drive hard within a turn and then still stop
+Without one of those, the goal will drive hard within a turn and then still stop
 when the human message's ~7-continuation budget is spent — it is not, by itself, an
 unattended multi-day process.
 

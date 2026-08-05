@@ -22,7 +22,6 @@ import {
   resolveMaxAttempts,
   resolveSupervisorMode,
   writeProjectGoal,
-  writeSolofounderGoal,
   readProjectGoalCondition,
 } from '../core/goal.mjs';
 
@@ -129,7 +128,8 @@ switch (cmd.kind) {
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
-      `The supervisor will keep pushing the agent until this is demonstrably met or the retry budget (${budget}) runs out.\n` +
+      `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met.\n` +
+      `Budget: ${budget} attempts per human turn — it resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
       `Also saved to .agents/supervisor/Goal.md for reflection mode.`
     );
     break;
@@ -223,24 +223,6 @@ switch (cmd.kind) {
     break;
   }
 
-  // ── solofounder-on ────────────────────────────────────────────────────────
-  case 'solofounder-on': {
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    const condition = cmd.condition || '';
-    // Deliberately NOT calling clearGoalIfActive: solofounder-on sets a new
-    // session goal itself (setSolofounder below), it never deletes one.
-    writeSolofounderGoal(cwd, condition);
-    goalStore.setSolofounder(cwd, sid, condition);
-    const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
-    console.log(
-      `mode: solofounder\n` +
-      `Solo-founder drive armed for session ${sid.slice(0, 8)}… — target: $1,000,000 ARR.\n` +
-      `Condition: "${condition}"\n` +
-      `Saved to .agents/supervisor/solofounder.md. The judge runs on every stop and keeps driving the CEO loop until the ARR bar is demonstrably met; the ${budget}-attempt budget resets every human turn instead of exhausting permanently, and the drive has no practical time limit.`
-    );
-    break;
-  }
-
   // ── autopilot-off ─────────────────────────────────────────────────────────
   case 'autopilot-off': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
@@ -314,7 +296,7 @@ switch (cmd.kind) {
     const given = process.argv[2] ?? '(none)';
     console.log(
       `Unknown supervisor command: ${given}.\n` +
-      `Valid commands: status, on, off, goal, retry, autopilot, reflection, solofounder, mode.`
+      `Valid commands: status, on, off, set-goal, retry, autopilot, reflection, mode.`
     );
     process.exit(1);
   }

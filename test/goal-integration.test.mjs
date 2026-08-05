@@ -20,6 +20,13 @@ import { readProjectGoalHistory } from "../core/goal.mjs"
 // ---------------------------------------------------------------------------
 
 const SESSION_ID = "ses_goaltest123"
+// The turn key of makeMessages()'s last real user message — what
+// getLastRelevantUserMessageId() returns for it. The fixture carries no
+// top-level `id`, so getMessageSignature falls back to
+// `${role}:${info.time.start ?? 0}:${first 20 chars of text}`. Goal state
+// written by a test that wants the per-turn attempt reset NOT to fire must
+// stamp this as goal.lastTurnKey.
+const LAST_USER_MSG_ID = "user:0:Fix the bug in auth."
 const EPHEMERAL_PREFIX = "ses_judge_goal_"
 let ephemeralCounter = 0
 
@@ -253,11 +260,17 @@ describe("integration: supervisor goal loop", () => {
     )
   })
 
-  test("goal loop exhausts after maxAttempts", async () => {
+  // The attempts cap is a PER-HUMAN-TURN stand-down, not the end of the goal.
+  // (It used to permanently exhaust the goal and revert to reflection — which
+  // silently killed goals mid-session with no verdict. That behavior now
+  // belongs to the deadline alone; see the next test.)
+  test("goal loop stands down for the turn at maxAttempts but stays active", async () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
-    // Write goal state with attempts already at the default max (16)
+    // Write goal state with attempts already at the default max (16) and a
+    // lastTurnKey that matches the current turn, so the per-turn reset does
+    // not fire and the cap is genuinely reached.
     writeFileSync(
       join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
       JSON.stringify({
@@ -270,7 +283,8 @@ describe("integration: supervisor goal loop", () => {
           tokenBaseline: 0,
           startedAt: Date.now() - 10000,
           deadline: Date.now() + 3600000,
-          lastReason: ""
+          lastReason: "",
+          lastTurnKey: LAST_USER_MSG_ID
         }
       })
     )
@@ -283,14 +297,49 @@ describe("integration: supervisor goal loop", () => {
     // Wait for async processing
     await new Promise(r => setTimeout(r, 5000))
 
-    // Read state file — should be exhausted
     const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
     const state = JSON.parse(readFileSync(statePath, "utf-8"))
 
-    assert.equal(state.goal.status, "exhausted", `Goal should be exhausted, got: ${state.goal.status}`)
-    assert.equal(state.mode, "reflection", `Mode should revert to reflection, got: ${state.mode}`)
+    assert.equal(state.goal.status, "active", `Goal must stay active at the per-turn cap, got: ${state.goal.status}`)
+    assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
 
     // No continuation should have been injected to the active session
+    const activePrompts = getActiveSessionPrompts()
+    assert.equal(activePrompts.length, 0, `No prompt should be sent to active session once the turn budget is spent, got ${activePrompts.length}`)
+  })
+
+  test("goal loop exhausts for real once the deadline passes", async () => {
+    const messages = makeMessages()
+    const { client, getActiveSessionPrompts } = createMockClient(messages)
+
+    writeFileSync(
+      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      JSON.stringify({
+        mode: "goal",
+        autopilot: false,
+        goal: {
+          condition: "all tests pass",
+          status: "active",
+          attempts: 0,
+          tokenBaseline: 0,
+          startedAt: Date.now() - 10000,
+          deadline: Date.now() - 1,
+          lastReason: "",
+          lastTurnKey: LAST_USER_MSG_ID
+        }
+      })
+    )
+
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    await new Promise(r => setTimeout(r, 5000))
+
+    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
+    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+
+    assert.equal(state.goal.status, "exhausted", `Goal should be exhausted past its deadline, got: ${state.goal.status}`)
+    assert.equal(state.mode, "reflection", `Mode should revert to reflection, got: ${state.mode}`)
+
     const activePrompts = getActiveSessionPrompts()
     assert.equal(activePrompts.length, 0, `No prompt should be sent to active session after exhaustion, got ${activePrompts.length}`)
   })
