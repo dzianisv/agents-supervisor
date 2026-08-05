@@ -171,6 +171,77 @@ test(
   }
 );
 
+// ── 4b. Issue #57: one counter, one cap, no unreachable exhaust branch ─────
+//
+// The hook used to keep TWO independent tallies of "how many times have we
+// pushed the agent this turn": the turn-scoped file counter (gated against the
+// clamped effectiveMax) and goal.attempts (checked by decideGoalTransition).
+// The file gate runs first with the SAME cap, so goal.attempts could never
+// reach it — decideGoalTransition's reason:'attempts' branch, and the
+// `turn_budget_spent` verdict it feeds, were dead code on Claude Code.
+//
+// Contract now: goal.attempts IS the file counter, and hitting the per-turn
+// cap with an active goal emits a real `turn_budget_spent` verdict (rather
+// than exiting silently) while leaving the goal active.
+
+function loadVerdict(tmp, sid) {
+  const p = path.join(tmp, '.supervisor', `verdict_${sid}.json`);
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+test(
+  'goal: hitting the per-turn cap emits a turn_budget_spent verdict (reason:"attempts" is reachable)',
+  { timeout: 30_000 },
+  () => {
+    const d = mkcwd();
+    const sid = 'goal-budget-spent-test';
+    goalStore.setGoal(d, sid, 'the migration is applied and verified in staging');
+
+    const turns = [
+      { type: 'user', message: { role: 'user', content: 'apply the migration' } },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it.' }] } },
+    ];
+    const tp = mkTranscript(d, turns, 'budget');
+    const payload = { session_id: sid, cwd: d, transcript_path: tp, last_assistant_message: 'Working on it.' };
+
+    // Burn the whole per-turn budget (HARD_CAP = 7) inside ONE human turn.
+    for (let i = 0; i < 7; i++) {
+      const out = runOnStop(payload);
+      assert.equal(out.code, 0, `call ${i + 1} should exit 0`);
+      assert.equal(JSON.parse(out.stdout).decision, 'block', `call ${i + 1} should inject`);
+    }
+
+    // The single counter: goal.attempts must equal the file counter exactly.
+    const fileAttempts = JSON.parse(
+      fs.readFileSync(path.join(d, '.supervisor', `${sid}_attempts.json`), 'utf8')
+    ).count;
+    assert.equal(fileAttempts, 7, 'file counter should be at the per-turn cap');
+    assert.equal(
+      loadGoalState(d, sid).goal.attempts, fileAttempts,
+      'goal.attempts must BE the per-turn file counter, not a second independent tally'
+    );
+
+    // The capped call: no injection, goal stays active, but it must now leave
+    // a verdict saying WHY the supervisor went quiet. Pre-fix this exited
+    // silently at the cap gate and no such verdict was ever written.
+    const capped = runOnStop(payload);
+    assert.equal(capped.code, 0);
+    assert.equal(capped.stdout, '', 'no injection once the per-turn cap is hit');
+
+    const verdict = loadVerdict(d, sid);
+    assert.equal(
+      verdict.goal, 'turn_budget_spent',
+      'hitting the per-turn cap with an active goal must emit turn_budget_spent — ' +
+      'the discriminator is dead code if the cap gate stands down silently'
+    );
+    assert.equal(verdict.injected, false);
+    assert.equal(
+      loadGoalState(d, sid).goal.status, 'active',
+      'a spent per-turn budget is NOT terminal — the goal must survive to the next human turn'
+    );
+  }
+);
+
 test('goal: judge status "complete" allows the stop (goal achieved, not injected)', { timeout: 15_000 }, () => {
   const d = mkcwd();
   const sid = 'goal-achieved-test';

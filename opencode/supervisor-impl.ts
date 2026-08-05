@@ -2232,9 +2232,13 @@ Continue now.`
           return
         }
 
-        // When a goal is active, goal.attempts (persisted) guards the budget via
-        // decideGoalTransition above; this per-message counter still fires as the
-        // fallback cap for ordinary sessions without a goal. They coexist on purpose.
+        // Ordering invariant (see issue #57): the goal loop above runs BEFORE
+        // this per-message counter, so an active goal's budget check always
+        // gets first refusal and decideGoalTransition's reason:"attempts"
+        // branch stays reachable on this runtime. This counter is only the
+        // fallback cap for ordinary sessions without a goal. Do NOT move this
+        // check above the goal loop — that inversion is exactly what made the
+        // exhaust reason dead code on the Claude Code hook.
         const nextAttemptCount = (attempts.get(attemptKey) || 0) + 1
         attempts.set(attemptKey, nextAttemptCount)
         if (nextAttemptCount >= effectiveMaxAttempts) {

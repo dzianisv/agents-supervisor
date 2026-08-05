@@ -157,6 +157,15 @@ Evidence rule: a claim that this goal condition is met must be backed by evidenc
  * recoverable per-turn case, which produces a loop with no terminal state.
  * Deadline is checked first so a goal that is past its deadline AND out of
  * attempts is reported as the terminal case.
+ *
+ * `goal.attempts` and `maxAttempts` MUST be the caller's ONE per-turn counter
+ * and its ONE effective cap — not a second, independently-incremented tally.
+ * On Claude Code that means goal.attempts is mirrored from the turn-scoped
+ * file counter and maxAttempts is the same clamped `effectiveMax` the hook's
+ * cap gate uses (bin/supervisor-on-stop.mjs); on OpenCode it is the persisted
+ * goal count checked before the per-message fallback map. A caller that
+ * gates on a different counter or a different cap before calling this makes
+ * the 'attempts' branch unreachable dead code — see issue #57.
  */
 export function decideGoalTransition({ goal, complete, now, maxAttempts, reason }) {
   const lastReason = reason ?? goal.lastReason;
