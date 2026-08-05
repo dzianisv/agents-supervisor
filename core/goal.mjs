@@ -128,11 +128,27 @@ Evidence rule: a claim that this goal condition is met must be backed by evidenc
 /**
  * Decide the next goal state. Strict order: exhausted (attempts cap OR deadline)
  * → achieved (complete) → continue (attempts+1). Returns a NEW goal; never mutates.
+ *
+ * On `action:'exhausted'` the result also carries `reason`, saying WHICH of the
+ * two exhaust conditions fired:
+ *   - 'deadline' — the goal outlived its window. Terminal: callers persist
+ *     `status:'exhausted'` and stand the goal down for good.
+ *   - 'attempts' — the per-human-turn attempt budget is spent. NOT terminal:
+ *     callers stand down for the rest of this turn only and leave the goal
+ *     active; attempts reset when the human speaks again.
+ * Callers MUST branch on this field rather than re-deriving it from the clock —
+ * re-deriving silently misclassifies any future third exhaust reason as the
+ * recoverable per-turn case, which produces a loop with no terminal state.
+ * Deadline is checked first so a goal that is past its deadline AND out of
+ * attempts is reported as the terminal case.
  */
 export function decideGoalTransition({ goal, complete, now, maxAttempts, reason }) {
   const lastReason = reason ?? goal.lastReason;
-  if (goal.attempts >= maxAttempts || now >= goal.deadline) {
-    return { action: 'exhausted', goal: { ...goal, status: 'exhausted', lastReason } };
+  if (now >= goal.deadline) {
+    return { action: 'exhausted', reason: 'deadline', goal: { ...goal, status: 'exhausted', lastReason } };
+  }
+  if (goal.attempts >= maxAttempts) {
+    return { action: 'exhausted', reason: 'attempts', goal: { ...goal, status: 'exhausted', lastReason } };
   }
   if (complete) {
     return { action: 'achieved', goal: { ...goal, status: 'achieved', lastReason } };

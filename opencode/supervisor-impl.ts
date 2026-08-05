@@ -2114,7 +2114,10 @@ Continue now.`
             // so persisting "exhausted" + mode:reflection there would kill a
             // goal the human is still driving. Stand down for the rest of THIS
             // turn instead and leave it active. Mirrors bin/supervisor-on-stop.mjs.
-            const deadlineHit = Date.now() >= goal.deadline
+            // decideGoalTransition reports WHICH condition fired; never
+            // re-derive it from the clock (a third exhaust reason would then
+            // be silently misclassified as the recoverable per-turn case).
+            const deadlineHit = t.reason === "deadline"
             if (deadlineHit) {
               await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
             }

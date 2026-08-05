@@ -1040,7 +1040,10 @@ async function main() {
       // the next human turn (see the per-turn reset above), so persisting
       // 'exhausted' here would kill a goal the human is still driving. Stand
       // down for the rest of THIS turn instead and leave it active.
-      const deadlineHit = Date.now() >= goal.deadline;
+      // decideGoalTransition tells us WHICH fired; never re-derive it from
+      // the clock, or a future third exhaust reason silently becomes the
+      // recoverable per-turn case and the loop gains no terminal state.
+      const deadlineHit = t.reason === 'deadline';
       if (deadlineHit) {
         try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
         verdictRecord.goal = 'exhausted';
