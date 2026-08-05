@@ -946,8 +946,22 @@ async function main() {
   // fully-built judge prompt to a file so a test can assert what the judge
   // actually sees — e.g. that an active goal reaches it as a mandatory
   // requirement. Never set in normal operation; best-effort, never throws.
+  //
+  // The prompt embeds transcript text, so the destination is confined to the
+  // project's own .supervisor/ directory: an env var alone must not be able to
+  // exfiltrate a transcript to an arbitrary path from shipped production code.
+  // Anything resolving outside that directory is ignored.
   if (process.env.SUPERVISOR_DUMP_PROMPT) {
-    try { fs.writeFileSync(process.env.SUPERVISOR_DUMP_PROMPT, prompt, 'utf8'); } catch { /* best effort */ }
+    try {
+      const dumpRoot = path.resolve(cwd, '.supervisor');
+      const dest = path.resolve(cwd, process.env.SUPERVISOR_DUMP_PROMPT);
+      if (dest === dumpRoot || dest.startsWith(dumpRoot + path.sep)) {
+        fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(dest, prompt, { encoding: 'utf8', mode: 0o600 });
+      } else {
+        debug({ msg: 'dump_prompt_rejected', reason: 'outside .supervisor/' }, cwd);
+      }
+    } catch { /* best effort */ }
   }
 
   const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? process.env.REFLECTION_CC_FAKE_JUDGE;

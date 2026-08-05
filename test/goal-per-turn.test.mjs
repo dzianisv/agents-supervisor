@@ -212,10 +212,41 @@ test('goal: the session goal condition reaches the judge prompt as a mandatory r
 
   // SUPERVISOR_DEBUG writes the built prompt into the debug log; assert on the
   // injected continuation plus the persisted verdict instead of the raw call.
-  const out = runOnStop(payload, { SUPERVISOR_DUMP_PROMPT: path.join(d, 'prompt.txt') });
+  // SUPERVISOR_DUMP_PROMPT is confined to the project's .supervisor/ dir —
+  // the dump contains transcript text, so an arbitrary path is not honored.
+  const dumpPath = path.join(d, '.supervisor', 'prompt.txt');
+  const out = runOnStop(payload, { SUPERVISOR_DUMP_PROMPT: dumpPath });
   assert.equal(out.code, 0);
 
-  const dumped = fs.readFileSync(path.join(d, 'prompt.txt'), 'utf8');
+  const dumped = fs.readFileSync(dumpPath, 'utf8');
   assert.match(dumped, /GOAL \(mandatory completion requirement\)/);
   assert.match(dumped, new RegExp(condition.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+// ── 6. SUPERVISOR_DUMP_PROMPT is confined to the project's .supervisor/ dir ─
+//
+// The dumped judge prompt embeds transcript text. This escape hatch ships in
+// production code, so an env var alone must not be able to redirect that
+// content to an arbitrary path on disk.
+
+test('goal: SUPERVISOR_DUMP_PROMPT refuses a destination outside .supervisor/', { timeout: 15_000 }, () => {
+  const d = mkcwd();
+  const sid = 'goal-dump-escape-test';
+  goalStore.setGoal(d, sid, 'the refresh-token rotation test passes');
+
+  const turns = [
+    { type: 'user', message: { role: 'user', content: 'fix auth' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Edited the handler.' }] } },
+  ];
+  const tp = mkTranscript(d, turns, 'escape');
+  const payload = { session_id: sid, cwd: d, transcript_path: tp, last_assistant_message: 'Edited the handler.' };
+
+  const outside = path.join(d, 'leaked-prompt.txt');
+  const out = runOnStop(payload, { SUPERVISOR_DUMP_PROMPT: outside });
+  assert.equal(out.code, 0, 'a rejected dump path must never break the hook');
+  assert.equal(fs.existsSync(outside), false, 'prompt must not be written outside .supervisor/');
+
+  const traversal = path.join(d, '.supervisor', '..', 'traversed.txt');
+  runOnStop(payload, { SUPERVISOR_DUMP_PROMPT: traversal });
+  assert.equal(fs.existsSync(path.join(d, 'traversed.txt')), false, '.. traversal out of .supervisor/ must be rejected');
 });
