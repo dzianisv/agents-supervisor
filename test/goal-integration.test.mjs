@@ -308,6 +308,63 @@ describe("integration: supervisor goal loop", () => {
     assert.equal(activePrompts.length, 0, `No prompt should be sent to active session once the turn budget is spent, got ${activePrompts.length}`)
   })
 
+  // -------------------------------------------------------------------------
+  // Coverage for the per-turn attempts reset in opencode/supervisor-impl.ts.
+  // The two tests above deliberately stamp lastTurnKey to the CURRENT turn so
+  // the reset does NOT fire — which left the reset block itself untested. Here
+  // the stored lastTurnKey belongs to an OLDER turn, so the reset must fire:
+  // an over-cap goal is rescued instead of standing down, and a continuation
+  // is injected. Reverting the reset block makes this test fail.
+  // -------------------------------------------------------------------------
+  test("stale lastTurnKey resets the spent attempt budget and the goal continues", async () => {
+    const messages = makeMessages()
+    const { client, getActiveSessionPrompts } = createMockClient(messages)
+
+    writeFileSync(
+      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      JSON.stringify({
+        mode: "goal",
+        autopilot: false,
+        goal: {
+          condition: "all tests pass",
+          status: "active",
+          attempts: 16,
+          tokenBaseline: 0,
+          startedAt: Date.now() - 10000,
+          deadline: Date.now() + 3600000,
+          lastReason: "",
+          lastTurnKey: "stale-turn-key-from-a-previous-turn"
+        }
+      })
+    )
+
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    await new Promise(r => setTimeout(r, 5000))
+
+    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
+    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+
+    assert.equal(state.goal.status, "active", `Goal must stay active after the per-turn reset, got: ${state.goal.status}`)
+    assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
+    assert.equal(
+      state.goal.lastTurnKey,
+      LAST_USER_MSG_ID,
+      `lastTurnKey must be restamped to the current turn, got: ${state.goal.lastTurnKey}`
+    )
+    assert.equal(
+      state.goal.attempts,
+      1,
+      `attempts must reset to 0 then increment for this attempt, got: ${state.goal.attempts}`
+    )
+
+    const activePrompts = getActiveSessionPrompts()
+    assert.ok(
+      activePrompts.length > 0,
+      `A continuation must be injected once the budget resets, got ${activePrompts.length} prompts`
+    )
+  })
+
   test("goal loop exhausts for real once the deadline passes", async () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
