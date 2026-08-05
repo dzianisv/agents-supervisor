@@ -101,10 +101,20 @@ test('resolveMaxAttempts: sessionOverride > config > default 16, clamped [1,100]
 
 test('decideGoalTransition: exhausted > achieved > continue', () => {
   const base = { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 10_000, lastReason: '' };
-  // exhausted by attempts
-  assert.equal(decideGoalTransition({ goal: { ...base, attempts: 16 }, complete: true, now: 1, maxAttempts: 16 }).action, 'exhausted');
+  // exhausted by attempts — reason must say so, since callers treat 'attempts'
+  // as a recoverable per-turn stand-down and 'deadline' as terminal.
+  const byAttempts = decideGoalTransition({ goal: { ...base, attempts: 16 }, complete: true, now: 1, maxAttempts: 16 });
+  assert.equal(byAttempts.action, 'exhausted');
+  assert.equal(byAttempts.reason, 'attempts');
   // exhausted by deadline
-  assert.equal(decideGoalTransition({ goal: base, complete: true, now: 20_000, maxAttempts: 16 }).action, 'exhausted');
+  const byDeadline = decideGoalTransition({ goal: base, complete: true, now: 20_000, maxAttempts: 16 });
+  assert.equal(byDeadline.action, 'exhausted');
+  assert.equal(byDeadline.reason, 'deadline');
+  // both conditions at once → deadline wins (the terminal one)
+  assert.equal(
+    decideGoalTransition({ goal: { ...base, attempts: 16 }, complete: true, now: 20_000, maxAttempts: 16 }).reason,
+    'deadline'
+  );
   // achieved
   assert.equal(decideGoalTransition({ goal: base, complete: true, now: 1, maxAttempts: 16 }).action, 'achieved');
   // continue increments attempts, doesn't mutate input

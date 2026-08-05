@@ -46,7 +46,12 @@ test('decideGoalTransition order matches OpenCode impl', () => {
   const g = { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 9e9, lastReason: '' };
   assert.equal(decideGoalTransition({ goal: g, complete: true, now: 1, maxAttempts: 16 }).action, 'achieved');
   assert.equal(decideGoalTransition({ goal: g, complete: false, now: 1, maxAttempts: 16 }).action, 'continue');
-  assert.equal(decideGoalTransition({ goal: { ...g, attempts: 16 }, complete: true, now: 1, maxAttempts: 16 }).action, 'exhausted');
+  const exhausted = decideGoalTransition({ goal: { ...g, attempts: 16 }, complete: true, now: 1, maxAttempts: 16 });
+  assert.equal(exhausted.action, 'exhausted');
+  assert.equal(exhausted.reason, 'attempts');
+  const past = decideGoalTransition({ goal: { ...g, deadline: 5 }, complete: true, now: 10, maxAttempts: 16 });
+  assert.equal(past.action, 'exhausted');
+  assert.equal(past.reason, 'deadline');
 });
 
 test('parseSupervisorCommand + buildGoalRequirementSection (shared logic)', () => {

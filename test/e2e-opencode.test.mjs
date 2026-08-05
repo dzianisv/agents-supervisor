@@ -59,6 +59,16 @@ const AMBIENT_PROVIDER_ENV_VARS = [
   "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
 ]
 
+// Ambient env that reconfigures the *server itself* rather than a provider.
+// OPENCODE_SERVER_PASSWORD makes `opencode serve` demand HTTP basic auth, so
+// every unauthenticated request in this suite (including the health poll)
+// gets a 401. The opencode desktop app exports it into the user's shell, so
+// this suite must strip it to stay hermetic.
+const AMBIENT_SERVER_ENV_VARS = [
+  "OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER_USERNAME",
+  "OPENCODE_URL", "OPENCODE_CLIENT",
+]
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -186,6 +196,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     baseUrl = `http://127.0.0.1:${port}`
     const childEnv = { ...process.env, HOME: isolatedHome }
     for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
+    for (const key of AMBIENT_SERVER_ENV_VARS) delete childEnv[key]
 
     serverProc = spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
       cwd: tmpDir,
