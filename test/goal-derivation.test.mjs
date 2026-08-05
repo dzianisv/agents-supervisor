@@ -2,7 +2,7 @@
  * goal-derivation.test.mjs — coverage for the align-supervisor-modes binding
  * architecture:
  *
- *   - `supervisor:goal` invoked with no condition AND no existing
+ *   - `supervisor:set-goal` invoked with no condition AND no existing
  *     session/project goal MUST attempt an LLM derivation of a concise,
  *     falsifiable goal (core/goal.mjs: buildGoalDerivationPrompt,
  *     parseDerivedGoalResponse) rather than silently no-op-ing.
@@ -360,7 +360,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
 
     const result = await goalTool.execute({})
     assert.ok(result.includes("Could not derive"), `Expected failure message, got: ${result}`)
-    assert.ok(result.includes("/supervisor:goal"), `Expected explicit manual-set instruction, got: ${result}`)
+    assert.ok(result.includes("/supervisor:set-goal"), `Expected explicit manual-set instruction, got: ${result}`)
 
     const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
     const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf-8")) : {}

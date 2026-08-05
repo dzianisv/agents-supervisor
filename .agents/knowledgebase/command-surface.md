@@ -27,7 +27,8 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Package name is `opencode-supervisor` in `opencode/package.json`.
 - Plugin entrypoint is `opencode/supervisor.ts`.
 - Slash command files are under `opencode/commands/`.
-- Current command files: `supervisor.md` (bare `/supervisor <mode>` dispatcher) plus colon subcommands — `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:goal.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, `supervisor:reflection.md`. OpenCode has no native `/goal` command to shadow, so this side keeps the `goal` naming (unlike Claude Code's `set-goal`).
+- Current command files: `supervisor.md` (bare `/supervisor <mode>` dispatcher) plus colon subcommands — `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:set-goal.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, `supervisor:reflection.md`. Naming is identical to Claude Code's skill set.
+- **Regression history — `/supervisor:goal` must never come back.** It was renamed to `/supervisor:objective` on both runtimes (PR #41, `b2a28a4`), then independently renamed `goal → set-goal` on the Claude Code side only (#43, `0d8ead8`). Merge `27d873e` resolved the two by keeping `set-goal` and deleting the `objective` files — but only touched the Claude Code skills, so OpenCode silently kept `supervisor:goal.md`. Unified to `set-goal` on both runtimes; `test/manifest.test.mjs` now pins the OpenCode command filenames and asserts no user-facing surface emits the literal `/supervisor:goal`.
 - README documents the full unified colon-command set and notes OpenCode additionally has the bare `/supervisor <subcommand>` dispatcher.
 - README documents OpenCode tools: `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, and `autopilot_exit`.
 
@@ -50,7 +51,7 @@ Both Claude Code and OpenCode expose the same 8 colon subcommands (naming differ
 1. `/supervisor:status` — display current patterns and verdicts
 2. `/supervisor:on` — enable supervisor
 3. `/supervisor:off` — disable supervisor
-4. `/supervisor:set-goal <condition>` (Claude Code) / `/supervisor:goal <condition>` (OpenCode) — set a mandatory completion condition
+4. `/supervisor:set-goal <condition>` (both runtimes) — set a mandatory completion condition
 5. `/supervisor:retry N` — set the retry budget
 6. `/supervisor:train` — mine and learn from your sessions
 7. `/supervisor:autopilot` — skip judge, auto-continue until AUTOPILOT_EXIT or budget

@@ -66,7 +66,10 @@ export function parseSupervisorCommand(name, args) {
     if (lower === 'on') return { kind: 'supervisor-on' };
     if (lower === 'autopilot' || AUTOPILOT_COMPAT_ALIASES.has(lower)) return { kind: 'mode-set', mode: 'autopilot' };
     if (lower === 'reflection') return { kind: 'mode-set', mode: lower };
-    if (lower === 'goal') return parseSupervisorCommand('goal', tail);
+    // `set-goal` is the canonical name on both runtimes; bare `goal` is kept as
+    // a legacy alias only (it was the user-facing name until it collided with
+    // Claude Code's native /goal — see .agents/knowledgebase/command-surface.md).
+    if (lower === 'set-goal' || lower === 'goal') return parseSupervisorCommand('set-goal', tail);
     if (lower === 'retry') return parseSupervisorCommand('retry', tail);
     if (lower === 'autoreview') return parseSupervisorCommand('autoreview', tail);
     if (lower === 'solofounder') return parseSupervisorCommand('solofounder', tail);
@@ -75,7 +78,7 @@ export function parseSupervisorCommand(name, args) {
   if (name === 'solofounder') {
     return { kind: 'solofounder-on', condition: trimmed.slice(0, GOAL_CONDITION_MAX_LEN) };
   }
-  if (name === 'goal') {
+  if (name === 'set-goal' || name === 'goal') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
     return { kind: 'goal-set', condition: trimmed.slice(0, GOAL_CONDITION_MAX_LEN) };
@@ -315,7 +318,7 @@ export function writeProjectGoal(cwd, condition) {
 // the NEW auto-derivation feature (see deriveProjectGoal below) — kept as a
 // separate file from Goal.md so an automatically-derived goal never
 // silently overwrites (or races) a condition the user set by hand via
-// `/supervisor:goal <condition>`.
+// `/supervisor:set-goal <condition>`.
 const PROJECT_GOAL_FILENAMES = ['Goal.md', 'goal.md'];
 
 function resolveExistingProjectGoalPath(cwd) {

@@ -70,7 +70,7 @@ Both runtimes share classification logic from the core module.
 
 ### Goal Mode
 
-User sets a completion condition: `/supervisor:goal <natural-language condition>`. The supervisor evaluates each stop against the condition (via LLM judge). Re-prompting continues until the condition is evidenced in the session or the retry budget exhausts. Goal state persists across stops within the session.
+User sets a completion condition: `/supervisor:set-goal <natural-language condition>`. The supervisor evaluates each stop against the condition (via LLM judge). Re-prompting continues until the condition is evidenced in the session or the retry budget exhausts. Goal state persists across stops within the session.
 
 ### Autopilot Mode (OpenCode only)
 

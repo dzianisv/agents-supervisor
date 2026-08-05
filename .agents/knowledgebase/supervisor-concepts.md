@@ -25,12 +25,12 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 
 ## Goal Loop
 
-> User-facing name is `/supervisor:set-goal` on Claude Code and `/supervisor:goal` on OpenCode — Claude Code has a native `/goal` command a bare-named skill would shadow, OpenCode doesn't. Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `goal` mode value.
+> User-facing name is `/supervisor:set-goal` on **both** runtimes. Claude Code has a native `/goal` command a bare-named skill would shadow; OpenCode doesn't, but one name across runtimes beats a per-runtime split (the split silently reappeared once already — see `command-surface.md`). Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `goal` mode value.
 
 - A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop.
 - Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
 - Goal state is stored under `.supervisor/goals/<sessionId>.json` (per-session). A separate project-level goal persists across sessions in `.agents/supervisor/Goal.md` (manually set, takes precedence) or lower-case `.agents/supervisor/goal.md` (see `writeProjectGoal`/`readProjectGoalCondition` in `core/goal.mjs`), with every write also appended to `goal-history.jsonl` so concurrent writers never silently lose a condition.
-- On OpenCode, `/supervisor:goal` invoked with no condition and no existing session/project goal makes a bounded LLM call (`deriveGoalWithLLM`/`buildGoalDerivationPrompt` in `core/goal.mjs` + `opencode/supervisor-impl.ts`) to derive a concise, falsifiable goal from the task context, persisting it to `goal.md` only on success (`parseDerivedGoalResponse` requires `falsifiable: true` and rejects prompt-injection artifacts). If derivation fails or is invalid, no default is fabricated — the goal is left unset with an explicit request to set it manually.
+- On OpenCode, `/supervisor:set-goal` invoked with no condition and no existing session/project goal makes a bounded LLM call (`deriveGoalWithLLM`/`buildGoalDerivationPrompt` in `core/goal.mjs` + `opencode/supervisor-impl.ts`) to derive a concise, falsifiable goal from the task context, persisting it to `goal.md` only on success (`parseDerivedGoalResponse` requires `falsifiable: true` and rejects prompt-injection artifacts). If derivation fails or is invalid, no default is fabricated — the goal is left unset with an explicit request to set it manually.
 - The default goal retry budget is 16 attempts, clamped to 1-100.
 - Goal state can become active, achieved, or exhausted.
 - A goal exhausts when the attempt budget or deadline is reached.

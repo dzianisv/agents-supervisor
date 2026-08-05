@@ -16,7 +16,7 @@
 - `core/patterns.mjs` loads effective patterns by deep-merging shipped defaults, user-local overrides, then project overrides.
 - `core/judge-core.mjs` builds and runs runtime-agnostic stop-classification prompts.
 - `core/feedback-core.mjs` decides when classifications should produce continuation feedback.
-- `core/goal.mjs` contains shared goal-loop parsing, retry-budget resolution, goal prompt generation, per-session state helpers, and concurrency-safe project-level goal persistence (`writeProjectGoal`/`readProjectGoalHistory`/`extractGoalCondition` for `.agents/supervisor/Goal.md`). User-facing command is `/supervisor:set-goal` on Claude Code, `/supervisor:goal` on OpenCode; internal module/identifiers keep the `goal` name on both.
+- `core/goal.mjs` contains shared goal-loop parsing, retry-budget resolution, goal prompt generation, per-session state helpers, and concurrency-safe project-level goal persistence (`writeProjectGoal`/`readProjectGoalHistory`/`extractGoalCondition` for `.agents/supervisor/Goal.md`). User-facing command is `/supervisor:set-goal` on BOTH runtimes; internal module/identifiers keep the `goal` name on both.
 
 ## OpenCode Flow
 

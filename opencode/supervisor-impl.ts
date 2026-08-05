@@ -1542,17 +1542,17 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       const { data } = await client.session.messages({ path: { id: sid } })
       messages = Array.isArray(data) ? data : []
     } catch {
-      return "Could not derive a goal: failed to read the session transcript. Set one manually: /supervisor:goal <condition>"
+      return "Could not derive a goal: failed to read the session transcript. Set one manually: /supervisor:set-goal <condition>"
     }
     const sessionDirectory = resolveSessionDirectory(messages, directory)
     const context = await buildTaskContext(messages, sessionDirectory)
     if (!context) {
-      return "Could not derive a goal: no task context yet (session has no user message). Set one manually: /supervisor:goal <condition>"
+      return "Could not derive a goal: no task context yet (session has no user message). Set one manually: /supervisor:set-goal <condition>"
     }
     const agents = await getAgentsFile(sessionDirectory)
     const derived = await deriveGoalWithLLM(client, directory, context, agents, messages, judgeSessionIds)
     if (!derived) {
-      return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:goal <condition>"
+      return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:set-goal <condition>"
     }
     await supervisorStore.setGoal(directory, sid, derived.condition, {})
     // Write the derived goal into the SESSION's project, never the server cwd.
@@ -2276,7 +2276,7 @@ Continue now.`
       cfg.command = {
         ...(cfg.command || {}),
         supervisor: {
-          description: "Control the supervisor: status | on | off | reflection | autopilot | goal <condition> | goal clear | retry <N> | autoreview on|off",
+          description: "Control the supervisor: status | on | off | reflection | autopilot | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
           template: `Execute this supervisor command by calling the supervisor tool with the appropriate arguments.
 
 Command: "{{input}}"
@@ -2287,8 +2287,8 @@ Routing rules:
 - "off" → supervisor({ action: "off" })
 - "reflection" → supervisor({ mode: "reflection" })
 - "autopilot" → supervisor({ mode: "autopilot" })
-- "goal <condition text>" → supervisor({ action: "goal", condition: "<condition text>" })
-- "goal clear" → supervisor({ action: "goal", clear: true })
+- "set-goal <condition text>" (or legacy "goal <condition text>") → supervisor({ action: "goal", condition: "<condition text>" })
+- "set-goal clear" (or legacy "goal clear") → supervisor({ action: "goal", clear: true })
 - "retry <N>" → supervisor({ action: "retry", n: N })
 - "autoreview on" → supervisor_autoreview({ enabled: true })
 - "autoreview off" → supervisor_autoreview({ enabled: false })
