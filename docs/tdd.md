@@ -146,7 +146,7 @@ Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in 
 
 5. **Pattern merge order.** Shipped patterns are always the base. User-local overrides are applied next. Project-local overrides have highest precedence. Deep merge — individual rules can be overridden without replacing the full taxonomy.
 
-6. **Attempt budget.** Goal mode caps at 16 attempts. Non-goal mode caps are resolved via `resolveMaxAttempts`. Both paths check the budget before injecting; exhausted budget → no inject, no block.
+6. **Attempt budget.** There is ONE per-human-turn attempt counter per runtime, checked against ONE effective cap. On Claude Code that counter is the turn-scoped file counter (`.supervisor/<sid>_attempts.json`), and the cap is `resolveMaxAttempts(...)` clamped to `resolveClaudeCodeHardCap()` (7, one under CC's own Stop-hook block ceiling); `goal.attempts` is mirrored from it for status reporting, not tracked separately. On OpenCode the persisted `goal.attempts` is checked first, with the per-message map as the fallback cap for goal-less sessions. Exhausted budget → no inject, no block; with an active goal it also writes a `turn_budget_spent` verdict and leaves the goal active (only the deadline is terminal).
 
 ---
 

@@ -768,6 +768,14 @@ async function main() {
   const earlyTail = transcript_path ? readTranscriptTail(transcript_path) : [];
   const turnKey = computeTurnKey(normalizeTranscriptToMessages(earlyTail));
 
+  // THE per-turn attempt counter. There is exactly one on this runtime: this
+  // turn-scoped file counter. It covers every path that pushes the agent
+  // (plain reflection injections, autopilot nudges, goal continuations) and
+  // resets by itself when turnKey moves. `goal.attempts` is NOT a second
+  // counter — it is mirrored from this value below purely so the persisted
+  // goal record and `/supervisor:set-goal` status stay truthful.
+  const attempts = readAttempts(session_id, cwd, turnKey);
+
   // 3. Attempt cap.
   // Goal loop: if a goal is active, raise the retry budget.
   // All goal logic is best-effort — any failure falls back to default.
@@ -782,17 +790,18 @@ async function main() {
       goal = goalState.goal;
       effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
       // A goal's attempt budget is per-human-turn, not cumulative for the
-      // whole session: once turnKey moves — a new real user message arrived —
-      // the previous turn's escalation no longer applies, so goal.attempts
-      // resets to 0 instead of marching toward decideGoalTransition's
-      // exhausted cap forever. Without this, a goal set early in a session
-      // died permanently ~16 stops later with no verdict and no way to tell
-      // why the supervisor had gone quiet. lastTurnKey is only null on the
-      // very first stop after setGoal, so that first observation just stamps
-      // it without a spurious reset.
-      if (turnKey != null && goal.lastTurnKey !== turnKey) {
-        const shouldReset = goal.lastTurnKey != null;
-        goal = { ...goal, lastTurnKey: turnKey, ...(shouldReset ? { attempts: 0 } : {}) };
+      // whole session, and it is not tracked separately: goal.attempts is
+      // mirrored from the single turn-scoped file counter read above, which
+      // already resets itself when turnKey moves (a new real user message
+      // arrived). Keeping a second, independently-incremented count here was
+      // the bug in #57 — the file counter also advances on plain reflection
+      // injections, so arming a goal mid-turn silently shrank the goal's real
+      // budget, and the file gate below (same cap) always tripped first, so
+      // decideGoalTransition's `reason:'attempts'` branch could never fire.
+      // lastTurnKey is still stamped so the persisted record says which human
+      // turn the count belongs to.
+      if (turnKey != null && (goal.lastTurnKey !== turnKey || goal.attempts !== attempts)) {
+        goal = { ...goal, lastTurnKey: turnKey, attempts };
         goalState = { ...goalState, goal };
         try { goalStore.save(cwd, session_id, goalState); } catch { /* best effort */ }
       }
@@ -836,21 +845,44 @@ async function main() {
   // see supervisor-impl.ts's goalSection — so this was a CC-only gap.)
   const sessionGoalSection = goal ? buildGoalRequirementSection(goal.condition) : '';
 
-  const attempts = readAttempts(session_id, cwd, turnKey);
+  // Shared handler for BOTH goal-exhaust sites (the per-turn cap gate below
+  // and the post-judge goal loop). decideGoalTransition reports WHICH
+  // condition fired; never re-derive it from the clock, or a future third
+  // exhaust reason silently becomes the recoverable per-turn case and the
+  // loop gains no terminal state.
+  //   - 'deadline' — terminal. The goal outlived the window it was set for:
+  //     persist status 'exhausted' and stand it down for good.
+  //   - 'attempts' — NOT terminal. The single per-turn counter is spent;
+  //     it resets on the next human turn, so leave status 'active' and stand
+  //     down for the rest of THIS turn only. Persisting 'exhausted' here
+  //     would kill a goal the human is still driving, because the goal-active
+  //     branch above (which re-syncs attempts/lastTurnKey) never re-fires
+  //     once status leaves 'active'.
+  function finishExhaustedGoal(t, baseRecord) {
+    const deadlineHit = t.reason === 'deadline';
+    if (deadlineHit) {
+      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+    }
+    writeVerdict(session_id, { ...baseRecord, goal: deadlineHit ? 'exhausted' : 'turn_budget_spent' }, cwd);
+    debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
+  }
+
   if (attempts >= effectiveMax) {
-    // Hitting the per-turn budget is NOT permanent exhaustion — the
-    // file-based `attempts` counter above already resets on the next turnKey
-    // (a new human message), so leave goal.status 'active' and just stand
-    // down for the rest of THIS turn. Marking it 'exhausted' here would
-    // permanently disable the goal: the goal-active branch above (where
-    // lastTurnKey/attempts get reset) never re-fires once status leaves
-    // 'active', so a goal that hit the cap once would never resume on a
-    // later turn. Real exhaustion is the deadline, applied in the goal loop
-    // below.
-    //
     // Disable autopilot on budget exhaustion so the next stop is clean.
     if (mode === 'autopilot') {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
+    }
+    // An active goal must not die silently here. Because goal.attempts is the
+    // same number as `attempts`, decideGoalTransition is guaranteed to report
+    // 'exhausted' — with reason 'deadline' if the goal also outlived its
+    // window, else 'attempts'. `complete` is irrelevant: exhaustion is checked
+    // strictly before achievement, so the judge never has to run to get here.
+    if (goal) {
+      const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMax });
+      finishExhaustedGoal(t, {
+        session_id, attempt: attempts, timestamp: new Date().toISOString(),
+        plugin_version: PLUGIN_VERSION, injected: false,
+      });
     }
     debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal, mode }, cwd);
     process.exit(0);
@@ -1047,24 +1079,11 @@ async function main() {
       process.exit(0);
     }
     if (t.action === 'exhausted') {
-      // Two different things reach this branch, and only one of them is a
-      // real end-of-goal. The deadline is: it means the goal outlived the
-      // window it was set for. The attempts cap is not — attempts reset on
-      // the next human turn (see the per-turn reset above), so persisting
-      // 'exhausted' here would kill a goal the human is still driving. Stand
-      // down for the rest of THIS turn instead and leave it active.
-      // decideGoalTransition tells us WHICH fired; never re-derive it from
-      // the clock, or a future third exhaust reason silently becomes the
-      // recoverable per-turn case and the loop gains no terminal state.
-      const deadlineHit = t.reason === 'deadline';
-      if (deadlineHit) {
-        try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
-        verdictRecord.goal = 'exhausted';
-      } else {
-        verdictRecord.goal = 'turn_budget_spent';
-      }
-      writeVerdict(session_id, verdictRecord, cwd);
-      debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id }, cwd);
+      // Reachable here only via the deadline: the per-turn cap gate above
+      // already stood down for any turn where `attempts >= effectiveMax`.
+      // Both reasons still flow through one handler so the two sites can
+      // never drift on what a spent budget means.
+      finishExhaustedGoal(t, verdictRecord);
       process.exit(0);
     }
     // continue — but never override a genuine human-only block.
