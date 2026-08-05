@@ -109,6 +109,19 @@ function writeDisabled(list) {
 
 const cmd = parseSupervisorCommand(name, args);
 
+// Migration notice: solofounder mode used to keep its own condition in
+// .agents/supervisor/solofounder.md. That mode is gone and nothing reads the
+// file any more, so a leftover copy would silently do nothing. Tell the user
+// once, on any supervisor invocation. Best-effort: must never throw.
+try {
+  if (fs.existsSync(path.join(cwd, '.agents', 'supervisor', 'solofounder.md'))) {
+    console.log(
+      '⚠  .agents/supervisor/solofounder.md is no longer read — solofounder is not a mode any more. ' +
+      'Move its condition into .agents/supervisor/Goal.md via `set-goal "<condition>"`, then delete the file.'
+    );
+  }
+} catch { /* best effort */ }
+
 /** Warn and clear an active goal before a mode switch that would delete it. */
 function clearGoalIfActive(cwd, sid) {
   const st = goalStore.load(cwd, sid);
