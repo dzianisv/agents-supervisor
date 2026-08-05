@@ -21,6 +21,7 @@ import {
   parseSupervisorCommand,
   resolveMaxAttempts,
   resolveSupervisorMode,
+  resolveClaudeCodeHardCap,
   writeProjectGoal,
   readProjectGoalCondition,
 } from '../core/goal.mjs';
@@ -126,10 +127,14 @@ switch (cmd.kind) {
     // across sessions. Safe under concurrent writers — see writeProjectGoal.
     writeProjectGoal(cwd, cmd.condition);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
+    // The Stop hook clamps the per-turn budget to one under Claude Code's own
+    // block-override threshold, so the requested number is not what actually
+    // runs here. Quote both rather than the misleading raw budget.
+    const ccCap = Math.min(budget, resolveClaudeCodeHardCap());
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
       `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met.\n` +
-      `Budget: ${budget} attempts per human turn — it resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
+      `Budget: ${budget} attempts per human turn (clamped to ${ccCap} here on Claude Code by CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) — it resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
       `Also saved to .agents/supervisor/Goal.md for reflection mode.`
     );
     break;
@@ -296,7 +301,7 @@ switch (cmd.kind) {
     const given = process.argv[2] ?? '(none)';
     console.log(
       `Unknown supervisor command: ${given}.\n` +
-      `Valid commands: status, on, off, set-goal, retry, autopilot, reflection, mode.`
+      `Valid commands: status, on, off, set-goal, retry, autopilot, reflection, mode, solofounder (alias for set-goal).`
     );
     process.exit(1);
   }

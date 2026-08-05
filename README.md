@@ -174,7 +174,9 @@ sessions — see "Project goals (`Goal.md`)" below.
 
 The goal is injected into the judge as a **mandatory completion requirement** — the
 agent is not allowed to stop until the goal is met. While a goal is active the retry
-budget rises to 16 (vs 3 normally). State is per-session at
+budget rises to 16 per human turn (vs 3 normally) — on Claude Code the Stop hook
+clamps that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), so 16 requested
+means 7 effective there. State is per-session at
 `.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
 continuation actually fires.
 

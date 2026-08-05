@@ -32,7 +32,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
@@ -56,8 +56,7 @@ const ASSESSMENT_TIMEOUT_MS = 20_000;
 // CLAUDE_CODE_STOP_HOOK_BLOCK_CAP mirrors CC's own override threshold
 // (default 8); the hook always stays ONE UNDER it so a raised harness cap
 // keeps the same safety margin instead of colliding with it.
-const CC_BLOCK_CAP_RAW = parseInt(process.env.CLAUDE_CODE_STOP_HOOK_BLOCK_CAP ?? '8', 10);
-const HARD_CAP = Number.isFinite(CC_BLOCK_CAP_RAW) && CC_BLOCK_CAP_RAW > 1 ? CC_BLOCK_CAP_RAW - 1 : 7;
+const HARD_CAP = resolveClaudeCodeHardCap();
 // Stamped into every verdict record so session mining can attribute observed
 // behavior to the plugin version that produced it.
 const PLUGIN_VERSION = (() => {

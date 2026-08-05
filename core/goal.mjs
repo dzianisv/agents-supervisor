@@ -36,6 +36,22 @@ export const DEFAULT_SUPERVISOR_MODE = 'reflection';
 // small enough that a single fs.appendFileSync write lands atomically.
 export const GOAL_CONDITION_MAX_LEN = 4000;
 
+/**
+ * Claude Code allows only a limited number of consecutive Stop-hook
+ * {decision:'block'} responses within one unbroken turn (default 8) before it
+ * overrides the hook and lets the turn end regardless. The Stop hook therefore
+ * clamps its own per-turn budget to ONE UNDER that threshold so its exhaustion
+ * bookkeeping fires deterministically instead of being silently pre-empted.
+ *
+ * Single source of truth: bin/supervisor-on-stop.mjs applies it, and
+ * bin/supervisor.mjs quotes it to the user so the number printed by `set-goal`
+ * matches what the hook will actually do. OpenCode has no such ceiling.
+ */
+export function resolveClaudeCodeHardCap(env = process.env) {
+  const raw = parseInt(env.CLAUDE_CODE_STOP_HOOK_BLOCK_CAP ?? '8', 10);
+  return Number.isFinite(raw) && raw > 1 ? raw - 1 : 7;
+}
+
 const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'cancel']);
 const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
 const AUTOPILOT_COMPAT_ALIASES = new Set(['static', 'reminder', 'auto-reminder']);
