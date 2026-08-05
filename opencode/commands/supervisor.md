@@ -16,8 +16,8 @@ Interpret `$ARGUMENTS`:
   supervisor for THIS session only. These are not modes.
 - `autopilot` -> call `supervisor` with `mode: "autopilot"`.
 - `reflection` -> call `supervisor` with `mode: "reflection"`.
-- `goal <condition>` -> call `supervisor_goal` with the remaining text.
-- exactly `goal` -> call `supervisor_goal` with no args.
-- `goal clear` -> call `supervisor_goal` with `clear: true`.
+- `set-goal <condition>` (legacy alias: `goal <condition>`) -> call `supervisor_goal` with the remaining text.
+- exactly `set-goal` / `goal` -> call `supervisor_goal` with no args.
+- `set-goal clear` / `goal clear` -> call `supervisor_goal` with `clear: true`.
 - `retry N` -> call `supervisor_retry` with `n: N`.
 - otherwise -> call `set_supervisor` with `$ARGUMENTS` as guidance.

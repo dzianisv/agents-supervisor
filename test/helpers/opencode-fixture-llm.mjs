@@ -38,7 +38,7 @@ import { createServer } from "node:http"
  * template (opencode/supervisor-impl.ts, the `config` plugin hook) so this
  * fixture reproduces exactly what a capable real model is instructed to do,
  * without hand-waving a different contract.
- * @param {string} rawText - the raw slash-command text, e.g. "/supervisor goal all tests pass"
+ * @param {string} rawText - the raw slash-command text, e.g. "/supervisor set-goal all tests pass"
  * @returns {{ tool: string, args: Record<string, unknown> }}
  */
 export function parseSupervisorRouting(rawText) {
@@ -53,8 +53,8 @@ export function parseSupervisorRouting(rawText) {
   if (lower === "autopilot") return { tool: "supervisor", args: { mode: "autopilot" } }
   if (lower === "autoreview on") return { tool: "supervisor_autoreview", args: { enabled: true } }
   if (lower === "autoreview off") return { tool: "supervisor_autoreview", args: { enabled: false } }
-  if (lower.startsWith("goal")) {
-    const rest = withoutSlash.slice(4).trim()
+  if (lower.startsWith("set-goal") || lower.startsWith("goal")) {
+    const rest = withoutSlash.slice(lower.startsWith("set-goal") ? 8 : 4).trim()
     if (rest.toLowerCase() === "clear") return { tool: "supervisor", args: { action: "goal", clear: true } }
     if (rest === "") return { tool: "supervisor", args: { action: "goal" } }
     return { tool: "supervisor", args: { action: "goal", condition: rest } }

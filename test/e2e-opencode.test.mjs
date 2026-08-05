@@ -298,7 +298,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   // .agents/supervisor/Goal.md or goal.md yet — required for the "no
   // existing goal" branch of deriveAndSetGoal (opencode/supervisor-impl.ts)
   // to actually trigger instead of short-circuiting on a pre-existing goal.
-  test("supervisor goal command with no condition derives and persists .agents/supervisor/goal.md", { timeout: 300_000 }, async () => {
+  test("supervisor set-goal command with no condition derives and persists .agents/supervisor/goal.md", { timeout: 300_000 }, async () => {
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
@@ -310,7 +310,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     // No condition, no existing session/project goal — must attempt LLM
     // derivation (align-supervisor-modes binding contract) rather than
     // silently no-op or fabricate a default.
-    const goalRes = await sendMessage(baseUrl, session.id, "/supervisor goal", 120_000, { model })
+    const goalRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal", 120_000, { model })
     assert.ok(goalRes, "Goal derivation response should not be null")
     const goalContent = JSON.stringify(goalRes)
 
@@ -324,14 +324,14 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
   })
 
-  test("supervisor goal set/status/clear works", { timeout: 900_000 }, async () => {
+  test("supervisor set-goal set/status/clear works", { timeout: 900_000 }, async () => {
     // Create a fresh session
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
 
     // 1. Set a goal
-    const setRes = await sendMessage(baseUrl, session.id, "/supervisor goal all tests pass", 300_000, { model })
+    const setRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal all tests pass", 300_000, { model })
     assert.ok(setRes, "Goal set response should not be null")
     const setContent = JSON.stringify(setRes).toLowerCase()
     assert.ok(
@@ -340,7 +340,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
 
     // 2. Check status — should reflect the active goal
-    const statusRes = await sendMessage(baseUrl, session.id, "/supervisor goal", 300_000, { model })
+    const statusRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal", 300_000, { model })
     assert.ok(statusRes, "Goal status response should not be null")
     const statusContent = JSON.stringify(statusRes).toLowerCase()
     assert.ok(
@@ -349,7 +349,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     )
 
     // 3. Clear the goal
-    const clearRes = await sendMessage(baseUrl, session.id, "/supervisor goal clear", 300_000, { model })
+    const clearRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal clear", 300_000, { model })
     assert.ok(clearRes, "Goal clear response should not be null")
     const clearContent = JSON.stringify(clearRes).toLowerCase()
     assert.ok(
@@ -470,7 +470,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       )
 
       // 4. Switch to goal mode (from reflection, proving full mode cycle works)
-      const goalRes = await sendMessage(baseUrl, session.id, "/supervisor goal tests pass", 300_000, { model })
+      const goalRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal tests pass", 300_000, { model })
       assert.ok(goalRes, "Goal switch response should not be null")
       const goalContent = JSON.stringify(goalRes).toLowerCase()
       assert.ok(

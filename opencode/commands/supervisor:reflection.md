@@ -14,7 +14,7 @@ After it returns, relay the response. Add context for the user:
 - **reflection** (default): judge runs after each stop; evaluates against
   patterns/antipatterns. If `.agents/supervisor/Goal.md` is present, its condition
   is also injected as a mandatory requirement.
-- **goal**: set with `/supervisor:goal <condition>`; keeps pushing until that
+- **goal**: set with `/supervisor:set-goal <condition>`; keeps pushing until that
   specific condition is met.
 - **autopilot**: set with `/supervisor:autopilot on`; skips the judge and always
   continues until the agent calls `autopilot_exit`.

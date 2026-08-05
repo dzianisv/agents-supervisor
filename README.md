@@ -52,7 +52,7 @@ Then inside an OpenCode session:
 ```
 /supervisor          # status
 /supervisor autopilot   # keep going on every idle
-/supervisor goal <condition>   # stop only when condition is met
+/supervisor set-goal <condition>   # stop only when condition is met
 ```
 
 Works on two runtimes from one shared core:
@@ -60,7 +60,7 @@ Works on two runtimes from one shared core:
 | Runtime | Mechanism | Colon commands | Additional |
 |---|---|---|---|
 | **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
-| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
+| **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
 
 The classification taxonomy (6 categories + mined anti-patterns) and its feedback
 templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
@@ -98,7 +98,7 @@ Inside an active Claude Code session:
 Use the same colon-command set as Claude Code:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions
-- `/supervisor:goal <condition>` — set a mandatory completion condition
+- `/supervisor:set-goal <condition>` — set a mandatory completion condition
 - `/supervisor:retry N` — set the retry budget (1–100)
 - `/supervisor:autopilot` — skip the judge, auto-continue until exit or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
@@ -109,7 +109,7 @@ Use the same colon-command set as Claude Code:
 OpenCode also supports a bare `/supervisor <subcommand>` dispatcher as an alternative:
 - `/supervisor status`
 - `/supervisor autopilot`
-- `/supervisor goal <condition>`
+- `/supervisor set-goal <condition>`
 - `/supervisor reflection`
 - `/supervisor on`
 - `/supervisor off`
@@ -129,7 +129,7 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 | Mode | Command | Behavior |
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
-| `goal` | `/supervisor:set-goal <condition>` (CC) / `/supervisor:goal <condition>` (OpenCode) | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
+| `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met or the retry budget runs out. |
 | `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
 
 The effective default mode is `reflection`.
@@ -141,19 +141,21 @@ demonstrably meet before it lets the agent stop — it keeps re-prompting (up to
 retry budget) until the goal's met or the budget runs out.
 
 ```
-/supervisor:set-goal all tests in test/auth pass and the PR is open with green CI   # Claude Code
-/supervisor:goal all tests in test/auth pass and the PR is open with green CI       # OpenCode
+/supervisor:set-goal all tests in test/auth pass and the PR is open with green CI
 /supervisor:retry 24           # set this session's retry budget (1–100, default 16)
 ```
 
-On Claude Code the skill is deliberately named `/supervisor:set-goal`, not
-`/supervisor:goal` — Claude Code ships its own native `/goal` command, and this
-plugin must not shadow it. The two are different features: the native `/goal` is
+The command is deliberately named `/supervisor:set-goal` on **both** runtimes,
+never `/supervisor:goal` — Claude Code ships its own native `/goal` command and
+this plugin must not shadow or be confused with it, and one name across runtimes
+beats a per-runtime split. The two are different features: the native `/goal` is
 evaluated by your configured small fast model with no retry-budget or
-pattern/rubric injection; `/supervisor:set-goal` is this plugin's
-judge-driven equivalent, sharing state and retry budget with the rest of the
-supervisor. OpenCode has no native `/goal` command, so `/supervisor:goal` there
-is unambiguous.
+pattern/rubric injection; `/supervisor:set-goal` is this plugin's judge-driven
+equivalent, sharing state and retry budget with the rest of the supervisor.
+
+Internal identifiers keep the `goal` name (`core/goal.mjs`, the `supervisor_goal`
+tool, the `goal` mode value, the on-disk state schema) — those are never typed by
+a human, so renaming them would only add migration risk.
 
 Beyond the per-session goal above, a project-level goal can also persist across
 sessions — see "Project goals (`Goal.md`)" below.

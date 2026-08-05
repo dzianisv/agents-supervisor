@@ -35,9 +35,9 @@ let args = process.argv.slice(3).join(' ');
 
 // Special-case: `mode <word>` → translate to `supervisor <word>` so the
 // parser's `name==='supervisor'` branch handles mode-set correctly.
-// `mode goal` needs its own path: `supervisor goal` means "goal status" to the
-// parser, so set the mode directly instead (parity with the OpenCode surface,
-// where `/supervisor goal` with no condition also reports status).
+// `mode goal` needs its own path: `supervisor set-goal` means "goal status" to
+// the parser, so set the mode directly instead (parity with the OpenCode surface,
+// where `/supervisor set-goal` with no condition also reports status).
 if (name === 'mode' && process.argv[3]?.toLowerCase() === 'goal') {
   const sidForMode = (() => {
     try { return fs.readFileSync(path.join(process.cwd(), '.supervisor', 'current_session'), 'utf8').trim(); }
@@ -163,13 +163,13 @@ switch (cmd.kind) {
       console.log(
         `No ${GOAL_LABEL.toLowerCase()} set for this session, but a project-level goal exists ` +
         `(.agents/supervisor/Goal.md or goal.md): "${projectCondition}". ` +
-        `Reflection mode already enforces it; run 'supervisor goal <condition>' to set an explicit session goal instead.`
+        `Reflection mode already enforces it; run 'supervisor set-goal <condition>' to set an explicit session goal instead.`
       );
     } else {
       console.log(
         `No ${GOAL_LABEL.toLowerCase()} set for this session or the project. ` +
         `Automatic LLM-based goal derivation is only available via the OpenCode plugin's supervisor_goal tool; ` +
-        `on this CLI, set one explicitly: supervisor goal <condition>`
+        `on this CLI, set one explicitly: supervisor set-goal <condition>`
       );
     }
     break;
