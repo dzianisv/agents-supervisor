@@ -1862,8 +1862,11 @@ Do NOT call this tool:
         // killed the goal permanently, mid-session, with no verdict).
         // lastTurnKey is only null on the very first pass after setGoal, so
         // that first observation just stamps it without a spurious reset.
-        // Mirrors the identical reset in bin/supervisor-on-stop.mjs.
-        if (goal && goal.lastTurnKey !== lastUserMsgId) {
+        // Mirrors the identical reset in bin/supervisor-on-stop.mjs — including
+        // its turnKey != null guard: without it a null/undefined id makes the
+        // reset condition true on every idle, so attempts never accumulate and
+        // the loop never escalates or stands down.
+        if (goal && lastUserMsgId != null && goal.lastTurnKey !== lastUserMsgId) {
           const shouldReset = goal.lastTurnKey != null
           goal = { ...goal, lastTurnKey: lastUserMsgId, ...(shouldReset ? { attempts: 0 } : {}) }
           sup.goal = goal
