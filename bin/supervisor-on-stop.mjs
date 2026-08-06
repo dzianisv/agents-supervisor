@@ -31,8 +31,8 @@ import {
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
+import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 import {
   extractLastAssistantText, splitUserTurns, buildTurnEvidence, userMessageText,
@@ -832,10 +832,17 @@ async function main() {
   // OpenCode-side LLM auto-derivation feature — see core/goal.mjs's
   // readProjectGoalCondition for the shared precedence rule).
   let projectGoalSection = '';
+  // The exact project condition injected into THIS judgement. Load-bearing
+  // for goal retirement: only a file that still holds the condition we
+  // actually judged may be deleted (see retireProjectGoal in core/goal.mjs).
+  let injectedProjectGoalCondition = '';
   const effectiveMode = resolveSupervisorMode(goalState);
   if (effectiveMode !== 'goal' && !goal) {
     const cond = readProjectGoalCondition(cwd);
-    if (cond) projectGoalSection = buildGoalRequirementSection(cond);
+    if (cond) {
+      injectedProjectGoalCondition = cond;
+      projectGoalSection = buildGoalRequirementSection(cond);
+    }
   }
 
   // The judge must actually SEE the goal condition + evidence rule as a
@@ -1070,9 +1077,45 @@ async function main() {
     return buildEscalatingFeedback(
       nextAttempt,
       analysis.severity,
-      { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason, confidence: assessment?.confidence },
+      {
+        missing: analysis.missing,
+        next_actions: analysis.nextActions,
+        feedback: analysis.reason,
+        confidence: assessment?.confidence,
+        // Standing goal renders in its own labelled section, never merged
+        // into `### Missing` alongside real per-turn gaps.
+        goal_condition: goal?.condition || injectedProjectGoalCondition || '',
+      },
       effectiveMax,
     );
+  }
+
+  // A verdict with nothing actionable (empty missing, empty next_actions,
+  // blank feedback) must never be injected: the agent has nothing to act on,
+  // stops again immediately, and receives the identical empty message until
+  // the retry cap burns out.
+  const actionlessVerdict = isActionlessVerdict({
+    missing: analysis.missing,
+    next_actions: analysis.nextActions,
+    feedback: analysis.reason,
+  });
+
+  // Project-level goal judged met (reflection mode: no session goal object,
+  // so the goal loop below never runs for it). The condition WAS injected as
+  // a MANDATORY completion requirement, so `complete` means it was met —
+  // retire it, or it re-fires on every future turn and every future session.
+  if (analysis.complete && injectedProjectGoalCondition) {
+    try {
+      const retired = retireProjectGoal(cwd, {
+        condition: injectedProjectGoalCondition,
+        sessionId: session_id,
+        source: 'claude-code:project-goal-achieved',
+        reason: analysis.reason || '',
+      });
+      debug({ msg: 'project_goal_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+    } catch (e) {
+      debug({ msg: 'project_goal_retire_failed', err: String(e?.message ?? e) }, cwd);
+    }
   }
 
   // 6a. Goal loop: when a goal is active, keep pushing until the goal is met
@@ -1087,6 +1130,21 @@ async function main() {
     });
     if (t.action === 'achieved') {
       try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      // An achieved goal must DIE: persisting status:'achieved' alone left
+      // .agents/supervisor/Goal.md (or goal.md) on disk, so the next session
+      // re-read it and the goal resurrected forever.
+      try {
+        const retired = retireProjectGoal(cwd, {
+          condition: goal.condition,
+          sessionId: session_id,
+          source: 'claude-code:session-goal-achieved',
+          reason: analysis.reason || '',
+        });
+        debug({ msg: 'goal_project_file_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+      } catch (e) {
+        debug({ msg: 'goal_project_file_retire_failed', err: String(e?.message ?? e) }, cwd);
+      }
+      try { goalStore.clearGoal(cwd, session_id); } catch { /* */ }
       verdictRecord.goal = 'achieved';
       verdictRecord.message = `Goal condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
       writeVerdict(session_id, verdictRecord, cwd);
@@ -1101,7 +1159,15 @@ async function main() {
       finishExhaustedGoal(t, verdictRecord);
       process.exit(0);
     }
-    // continue — but never override a genuine human-only block.
+    // continue — but never override a genuine human-only block, and never
+    // push on a content-free verdict (that is the loop, not progress).
+    if (actionlessVerdict) {
+      verdictRecord.goal = 'paused';
+      verdictRecord.feedback_reason = 'actionless_verdict';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'no_inject_actionless_verdict', session_id, goal: true }, cwd);
+      process.exit(0);
+    }
     if (!analysis.requiresHumanAction) {
       const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
@@ -1122,8 +1188,15 @@ async function main() {
   }
 
   // 6b. Normal (no goal) inject decision.
-  if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction) {
+  if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction && !actionlessVerdict) {
     const feedbackMsg = buildAnalysisFeedback();
+    // Last-resort guard: never inject an empty-bodied message.
+    if (!hasFeedbackBody(feedbackMsg)) {
+      verdictRecord.feedback_reason = 'empty_feedback_body';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'no_inject_empty_body', session_id }, cwd);
+      process.exit(0);
+    }
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     verdictRecord.injected = true;
     verdictRecord.feedback_reason = 'assessment_continue';
@@ -1134,7 +1207,7 @@ async function main() {
   }
 
   writeVerdict(session_id, verdictRecord, cwd);
-  debug({ msg: 'no_inject', complete: analysis.complete, attempt: nextAttempt }, cwd);
+  debug({ msg: 'no_inject', complete: analysis.complete, attempt: nextAttempt, actionless: actionlessVerdict, reason: actionlessVerdict ? 'verdict had no actionable content' : analysis.reason }, cwd);
   process.exit(0);
 }
 

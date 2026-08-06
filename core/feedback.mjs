@@ -23,6 +23,52 @@ function rewriteIfDestructive(item) {
   return isDestructiveAction(item) ? `Flag to the user for approval: ${item}` : item
 }
 
+const GOAL_SECTION_HEADING = '### Standing goal (not a gap in this turn)'
+
+function nonBlankStrings(value) {
+  return (Array.isArray(value) ? value : []).filter((v) => typeof v === 'string' && v.trim() !== '')
+}
+
+/**
+ * True when the judge's verdict carries NOTHING actionable: no missing items,
+ * no next actions, and no feedback text once whitespace is stripped.
+ *
+ * Rendering such a verdict produces a "Task Incomplete" headline with an empty
+ * body — zero information for the agent, which then does nothing new, goes
+ * idle, and gets the identical empty message again. Observed in production:
+ * the same content-free injection repeated 15x at ~20s intervals until the
+ * retry cap (38 cases in 30 days). Callers MUST stand down instead of
+ * injecting when this returns true. Goal items are deliberately NOT counted
+ * as actionable content here: a standing goal is not a gap produced by this
+ * turn, so it can never on its own justify pushing the agent again.
+ */
+export function isActionlessVerdict(verdict) {
+  const v = verdict ?? {}
+  if (nonBlankStrings(v.missing).length > 0) return false
+  if (nonBlankStrings(v.next_actions).length > 0) return false
+  return typeof v.feedback !== 'string' || v.feedback.trim() === ''
+}
+
+/**
+ * True when the rendered feedback message has no body at all below its
+ * headline — a last-resort guard so no runtime can ever inject an empty
+ * "Task Incomplete" message even if a future verdict shape slips past
+ * isActionlessVerdict.
+ */
+export function hasFeedbackBody(text) {
+  if (typeof text !== 'string') return false
+  // The standing-goal section is context, never a per-turn gap, so it must
+  // not by itself make a message look like it has something to say.
+  const goalIdx = text.indexOf(GOAL_SECTION_HEADING)
+  const perTurn = goalIdx === -1 ? text : text.slice(0, goalIdx)
+  const body = perTurn
+    .split('\n')
+    .slice(1) // line 0 is the headline
+    .filter((l) => l.trim() !== '')
+    .filter((l) => !/^(Please address these issues and continue\.|This assessment was not fully confident)/.test(l.trim()))
+  return body.length > 0
+}
+
 /**
  * Build the single continuation message the reflection judge's verdict is
  * rendered into. IMPORTANT: this function has exactly ONE authority over
@@ -43,8 +89,20 @@ export function buildEscalatingFeedback(
   maxAttempts
 ) {
   const safeVerdict = verdict ?? {}
-  const missingItems = (Array.isArray(safeVerdict.missing) ? safeVerdict.missing : []).map(rewriteIfDestructive)
-  const nextActionItems = (Array.isArray(safeVerdict.next_actions) ? safeVerdict.next_actions : []).map(rewriteIfDestructive)
+  // A standing goal is a long-lived project/session condition, NOT something
+  // this turn failed to do. Merging goal-derived items into `### Missing`
+  // (what this used to do) is why a user reading the message saw
+  // "Missing: reach $1,000 MRR" sitting next to "Missing: fix build errors"
+  // as if both were gaps the agent just created. They render separately now.
+  const goalCondition = typeof safeVerdict.goal_condition === 'string' ? safeVerdict.goal_condition.trim() : ''
+  const goalItems = nonBlankStrings(safeVerdict.goal_items).map(rewriteIfDestructive)
+  const goalItemSet = new Set(nonBlankStrings(safeVerdict.goal_items))
+  const missingItems = nonBlankStrings(safeVerdict.missing)
+    .filter((m) => !goalItemSet.has(m))
+    .map(rewriteIfDestructive)
+  const nextActionItems = nonBlankStrings(safeVerdict.next_actions)
+    .filter((a) => !goalItemSet.has(a))
+    .map(rewriteIfDestructive)
   const feedbackStr = safeVerdict.feedback || ''
   const confidence = typeof safeVerdict.confidence === 'number' ? safeVerdict.confidence : undefined
   const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
@@ -59,6 +117,14 @@ export function buildEscalatingFeedback(
   const nextActions = nextActionItems.length
     ? `\n### Next Actions\n${nextActionItems.map((a) => `- ${a}`).join('\n')}`
     : ''
+  const goalLines = goalItems.length
+    ? goalItems.map((g) => `- ${g}`).join('\n')
+    : goalCondition
+      ? `- ${rewriteIfDestructive(goalCondition)}`
+      : ''
+  const goalSection = goalLines
+    ? `\n${GOAL_SECTION_HEADING}\n${goalLines}\nThis is a standing condition carried across turns — it is context, not a gap introduced by this turn. Do not treat it as the reason this turn is incomplete.`
+    : ''
   const headline = lowConfidence
     ? `${FEEDBACK_MARKER} Task may be incomplete (${severity})`
     : `${FEEDBACK_MARKER} Task Incomplete (${severity})`
@@ -70,6 +136,7 @@ export function buildEscalatingFeedback(
 ${feedbackStr}
 ${missing}
 ${nextActions}
+${goalSection}
 
 ${closing}`
 }

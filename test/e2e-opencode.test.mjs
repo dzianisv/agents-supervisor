@@ -309,7 +309,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   // .agents/supervisor/Goal.md or goal.md yet — required for the "no
   // existing goal" branch of deriveAndSetGoal (opencode/supervisor-impl.ts)
   // to actually trigger instead of short-circuiting on a pre-existing goal.
-  test("supervisor set-goal command with no condition derives and persists .agents/supervisor/goal.md", { timeout: 300_000 }, async () => {
+  test("supervisor set-goal command with no condition derives a SESSION-scoped goal and writes no project file", { timeout: 300_000 }, async () => {
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
     const session = await createRes.json()
@@ -325,13 +325,20 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(goalRes, "Goal derivation response should not be null")
     const goalContent = JSON.stringify(goalRes)
 
+    // An auto-derived goal is SESSION-SCOPED. This test used to assert the
+    // opposite — that the derived condition was persisted to
+    // .agents/supervisor/goal.md — which encoded the stale-goal bug: a goal
+    // inferred from turn 1 kept firing on turn 50 and in every future session
+    // in the project, with no expiry and no relevance check. Only an explicit
+    // /supervisor:set-goal <condition> may create the durable project file.
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
-    assert.ok(existsSync(goalMdPath), `Expected derived goal to be persisted at ${goalMdPath}`)
-    const persisted = readFileSync(goalMdPath, "utf8").trim()
-    assert.ok(persisted.length > 0, "Derived goal.md should not be empty")
     assert.ok(
-      goalContent.toLowerCase().includes("derived") || goalContent.includes(persisted),
-      `Expected goal response to acknowledge derivation or echo the persisted condition. Got: ${goalContent.slice(0, 500)}`
+      !existsSync(goalMdPath),
+      `An auto-derived goal must NOT be persisted to ${goalMdPath} — it is session-scoped`
+    )
+    assert.ok(
+      goalContent.toLowerCase().includes("derived") || goalContent.toLowerCase().includes("goal"),
+      `Expected goal response to acknowledge derivation. Got: ${goalContent.slice(0, 500)}`
     )
   })
 

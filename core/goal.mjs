@@ -598,6 +598,134 @@ export function parseDerivedGoalResponse(text) {
   return { condition, rationale };
 }
 
+// --- goal retirement (a goal that has been achieved must DIE) --------------
+//
+// Bug: a project goal (.agents/supervisor/Goal.md or goal.md) was injected as
+// a MANDATORY completion requirement into EVERY reflection, forever. Nothing
+// ever removed it, so once a condition was written it was re-read by every
+// future session in that project and every turn was judged incomplete against
+// it for good (real case: a "$1,000 MRR" business outcome no single turn can
+// satisfy, 95 injections). Achieving a goal must retire the file.
+//
+// DELETION SAFETY RULE (deliberate, do not loosen):
+//   A project goal file is unlinked ONLY when BOTH hold:
+//     1. The caller passes the exact condition that was actually injected
+//        into the judge prompt for the evaluation that just returned
+//        "achieved"/"complete". We never delete on a guess.
+//     2. The condition currently ON DISK still parses to that same string.
+//        If a human (or another session) edited the goal while the judge was
+//        running, the file now holds a DIFFERENT, unjudged goal — we leave it
+//        alone and record a `skipped` entry instead.
+//   And it is never silent: an append-only JSONL record is written to
+//   <cwd>/.supervisor/goal-achieved.log BEFORE anything is unlinked, and
+//   .agents/supervisor/goal-history.jsonl already retains every condition
+//   ever written. A hand-written Goal.md is therefore always recoverable
+//   from disk, and the removal always leaves a trace.
+
+function goalAchievedLogPath(cwd) {
+  return path.join(cwd, '.supervisor', 'goal-achieved.log');
+}
+
+/**
+ * Append a durable, recoverable record of a goal retirement (or a skipped
+ * retirement) before any file is removed. Best-effort: never throws.
+ * @returns {boolean} true if the record was written
+ */
+export function recordGoalAchieved(cwd, record) {
+  try {
+    const dir = path.dirname(goalAchievedLogPath(cwd));
+    fs.mkdirSync(dir, { recursive: true });
+    const p = goalAchievedLogPath(cwd);
+    fs.appendFileSync(p, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...record }) + '\n', 'utf8');
+    try { fs.chmodSync(p, 0o600); } catch { /* best effort */ }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read back the durable achievement log, oldest first. Best-effort: [] when
+ * missing/unreadable; individually corrupt lines are skipped.
+ */
+export function readGoalAchievedLog(cwd) {
+  let raw;
+  try {
+    raw = fs.readFileSync(goalAchievedLogPath(cwd), 'utf8');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try { out.push(JSON.parse(t)); } catch { /* skip corrupt line */ }
+  }
+  return out;
+}
+
+/**
+ * Retire an achieved project-level goal: log it durably, then unlink the
+ * goal file(s) that still hold exactly the condition that was judged.
+ * See DELETION SAFETY RULE above. Best-effort: never throws.
+ *
+ * @param {string} cwd project directory (the SESSION's project, never the server cwd)
+ * @param {{ condition: string, sessionId?: string, source?: string, reason?: string }} opts
+ * @returns {{ removed: string[], skipped: string[], logged: boolean }}
+ */
+export function retireProjectGoal(cwd, opts = {}) {
+  const condition = (opts.condition ?? '').trim();
+  const result = { removed: [], skipped: [], logged: false };
+  if (!cwd || !condition) return result; // rule 1: never delete on a guess
+
+  const dir = projectGoalDir(cwd);
+  const candidates = [];
+  // On a case-insensitive filesystem (macOS default) `Goal.md` and `goal.md`
+  // are the SAME inode, so resolve before deciding — otherwise one file would
+  // be counted (and unlinked) twice.
+  const seen = new Set();
+  for (const name of PROJECT_GOAL_FILENAMES) {
+    const p = path.join(dir, name);
+    let key;
+    try {
+      const st = fs.statSync(p);
+      key = `${st.dev}:${st.ino}`;
+    } catch {
+      continue; // missing — nothing to retire
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let onDisk;
+    try {
+      onDisk = extractGoalCondition(fs.readFileSync(p, 'utf8'));
+    } catch {
+      continue; // unreadable — leave it alone
+    }
+    // rule 2: only a file that still holds the judged condition
+    if (onDisk === condition) candidates.push(p);
+    else result.skipped.push(p);
+  }
+
+  result.logged = recordGoalAchieved(cwd, {
+    condition,
+    sessionId: opts.sessionId ?? null,
+    source: opts.source ?? 'unknown',
+    reason: (opts.reason ?? '').slice(0, 500),
+    removed: candidates,
+    skipped: result.skipped,
+  });
+
+  for (const p of candidates) {
+    try {
+      fs.unlinkSync(p);
+      result.removed.push(p);
+    } catch {
+      /* best effort */
+    }
+  }
+  return result;
+}
+
 /**
  * Read back every recorded condition from goal-history.jsonl, oldest first.
  * Best-effort: returns [] if the file is missing/unreadable; skips any
