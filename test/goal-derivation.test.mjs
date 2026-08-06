@@ -341,10 +341,15 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.equal(state.goal.condition, "All tests in test/ pass and the flaky login test is fixed")
     assert.equal(state.goal.status, "active")
 
-    // Persisted to the lower-case goal.md (NOT the manual Goal.md).
+    // SESSION-SCOPED ONLY. This test previously asserted the opposite (that
+    // the derived condition was persisted to .agents/supervisor/goal.md) —
+    // that assertion encoded the stale-goal bug: a goal inferred from turn 1
+    // became a MANDATORY completion requirement for turn 50 and for every
+    // future session in the project, with no expiry. Only an explicit
+    // /supervisor:set-goal <condition> may create the durable project file.
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
-    assert.ok(existsSync(goalMdPath), "goal.md should be written by the derivation path")
-    assert.equal(readFileSync(goalMdPath, "utf8"), "All tests in test/ pass and the flaky login test is fixed")
+    assert.ok(!existsSync(goalMdPath), "an auto-derived goal must NOT be persisted to the project file")
+    assert.equal(readProjectGoalCondition(tmpDir), "", "no durable project goal may be created by derivation")
 
     // The derivation prompt actually reached the model.
     const derivationCalls = getPromptCalls().filter((c) => c.body?.parts?.[0]?.text?.includes("DERIVE SUPERVISOR GOAL"))

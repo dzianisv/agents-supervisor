@@ -19,7 +19,7 @@ import {
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
-  readProjectGoalCondition, writeDerivedProjectGoal,
+  readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
 } from "../core/goal.mjs"
 import {
@@ -40,7 +40,7 @@ import {
   DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt, buildJudgePrompt,
   parseSelfAssessmentJson,
 } from "../core/assessment.mjs"
-import { buildEscalatingFeedback } from "../core/feedback.mjs"
+import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from "../core/feedback.mjs"
 import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
@@ -50,7 +50,7 @@ const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents
 export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
 export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 export {
-  buildEscalatingFeedback,
+  buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody, retireProjectGoal,
   getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
   DEFAULT_RUBRIC, parseRubric, buildTaskContext,
 }
@@ -1538,12 +1538,19 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
    * with no condition and nothing is set yet (see deriveGoalWithLLM above
    * for the model cascade / ephemeral-session plumbing, and
    * core/goal.mjs's buildGoalDerivationPrompt / parseDerivedGoalResponse for
-   * the prompt-injection-resistant prompt + strict validation). On success,
-   * persists to BOTH session state (so the goal loop starts enforcing it
-   * immediately) and the project-level goal.md (so it survives across
-   * sessions the same way a manually-set goal does). On failure/invalid
-   * derivation, sets nothing and says so explicitly — never a fabricated
-   * default.
+   * the prompt-injection-resistant prompt + strict validation).
+   *
+   * SESSION-SCOPED ONLY (deliberate). An auto-derived goal is inferred from
+   * whatever the session happened to be doing at derivation time. It used to
+   * ALSO be persisted to .agents/supervisor/goal.md, which turned a guess made
+   * on turn 1 into a MANDATORY completion requirement for turn 50 — and for
+   * every future session in that project, forever, with no expiry. That was
+   * the single largest source of stale-goal injections. Only an explicit
+   * `/supervisor:set-goal <condition>` (executeSupervisorGoal above, via
+   * writeProjectGoal) may create the durable project file now.
+   *
+   * On failure/invalid derivation, sets nothing and says so explicitly —
+   * never a fabricated default.
    */
   const deriveAndSetGoal = async (sid: string): Promise<string> => {
     let messages: any[] = []
@@ -1564,9 +1571,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:set-goal <condition>"
     }
     await supervisorStore.setGoal(directory, sid, derived.condition, {})
-    // Write the derived goal into the SESSION's project, never the server cwd.
-    writeDerivedProjectGoal(sessionDirectory, derived.condition)
-    return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Also saved to .agents/supervisor/goal.md.`
+    return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Scoped to THIS session only — it is deliberately NOT written to .agents/supervisor/goal.md; use /supervisor:set-goal <condition> if you want a goal that persists across sessions.`
   }
   const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
   const executeSupervisorRetry = async (args: { n?: number }, context?: any) => {
@@ -1927,9 +1932,17 @@ Continue now.`
         // core/goal.mjs's readProjectGoalCondition / writeDerivedProjectGoal,
         // which shares this same lookup order with the LLM-derivation path).
         let projectGoalSection = ""
+        // The exact condition injected into THIS judgement. Load-bearing for
+        // goal retirement: we only ever delete a goal file that still holds
+        // the condition we actually judged (see retireProjectGoal's safety
+        // rule in core/goal.mjs).
+        let injectedProjectGoalCondition = ""
         if (mode === "reflection" && !goal) {
           const cond = resolveProjectGoalForSession(messages || [], directory)
-          if (cond) projectGoalSection = buildGoalRequirementSection(cond)
+          if (cond) {
+            injectedProjectGoalCondition = cond
+            projectGoalSection = buildGoalRequirementSection(cond)
+          }
         }
         const effectiveGoalSection = goalSection || projectGoalSection
 
@@ -2138,9 +2151,34 @@ Continue now.`
             return
           }
           if (t.action === "achieved") {
-            // Persist the achieved status now; the existing analysis.complete
-            // branch below handles the bookkeeping + return. No attempts increment.
-            await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+            // An achieved goal must DIE. Persisting status:'achieved' alone
+            // left .agents/supervisor/Goal.md (or goal.md) on disk, so the
+            // NEXT session re-read it and the goal resurrected forever.
+            // Retire the project file (both casings) AND drop the session
+            // goal, after recording the achievement durably in
+            // .supervisor/goal-achieved.log. See retireProjectGoal for the
+            // deletion safety rule (only a file still holding the exact
+            // judged condition is removed).
+            try {
+              const retired = retireProjectGoal(sessionDirectory, {
+                condition: goal.condition,
+                sessionId,
+                source: "opencode:session-goal-achieved",
+                reason: analysis.reason || "",
+              })
+              debug("Goal achieved, retired project goal:", JSON.stringify(retired))
+            } catch (e: any) {
+              debug("retireProjectGoal failed (non-fatal):", e?.message || e)
+            }
+            // Clear the session goal too: leaving it in state keeps mode/goal
+            // bookkeeping alive for a condition that is already satisfied.
+            const achievedState: any = { ...sup, mode: "reflection", autopilot: false, goal: t.goal }
+            await supervisorStore.save(directory, sessionId, achievedState)
+            try {
+              await supervisorStore.clearGoal(directory, sessionId)
+            } catch (e: any) {
+              debug("clearGoal after achievement failed (non-fatal):", e?.message || e)
+            }
           } else {
             // "continue": DO NOT persist the attempts++ here. Stash it and only
             // write it after a continuation is actually injected (post-promptAsync
@@ -2190,6 +2228,26 @@ Continue now.`
         await writeVerdictSignal(directory, sessionId, analysis.complete, analysis.severity)
 
         if (analysis.complete) {
+          // Reflection-mode project goal (no session goal object, so the goal
+          // loop above never ran): the condition WAS injected as a MANDATORY
+          // completion requirement for this judgement, so complete === the
+          // goal was judged met. Retire it, or it fires forever on every
+          // future turn and every future session in this project — which is
+          // exactly how a "$1,000 MRR" condition ended up being injected into
+          // 95 unrelated turns.
+          if (injectedProjectGoalCondition) {
+            try {
+              const retired = retireProjectGoal(sessionDirectory, {
+                condition: injectedProjectGoalCondition,
+                sessionId,
+                source: "opencode:project-goal-achieved",
+                reason: analysis.reason || "",
+              })
+              debug("Project goal judged met, retired:", JSON.stringify(retired))
+            } catch (e: any) {
+              debug("retireProjectGoal failed (non-fatal):", e?.message || e)
+            }
+          }
           attempts.delete(attemptKey)
           lastReflectedMsgId.set(sessionId, lastUserMsgId)
           await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
@@ -2203,6 +2261,31 @@ Continue now.`
           const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
           await showToast(client, directory, `Action needed: ${hint}`, "warning")
           debug("Supervisor requires human action (no agent-actionable work remaining)")
+          return
+        }
+
+        // A verdict with NOTHING actionable must not continue. This runtime
+        // previously injected on any `!analysis.complete`, ignoring
+        // shouldContinue entirely — so a judge verdict with an empty
+        // missing/next_actions and blank feedback rendered a "Task Incomplete"
+        // headline with an empty body, the agent had nothing to act on, went
+        // idle, and got the byte-identical message again ~20s later until the
+        // retry cap (observed: 15 consecutive identical injections). Stand
+        // down instead, and record why. Mirrors the `no_inject` handling in
+        // bin/supervisor-on-stop.mjs.
+        const actionlessVerdict = isActionlessVerdict({
+          missing: analysis.missing,
+          next_actions: analysis.nextActions,
+          feedback: analysis.reason,
+        })
+        if (!analysis.shouldContinue || actionlessVerdict) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          const standDownReason = actionlessVerdict
+            ? "verdict had no actionable content (empty missing, empty next_actions, blank feedback)"
+            : "judge did not ask to continue (shouldContinue=false)"
+          debug("Supervisor standing down, no injection:", standDownReason)
+          await showToast(client, directory, `Supervisor stood down — ${standDownReason}`, "info")
           return
         }
 
@@ -2263,10 +2346,25 @@ Continue now.`
             feedback: analysis.reason || "Task incomplete",
             missing: analysis.missing,
             next_actions: analysis.nextActions,
-            confidence: parsedAssessment?.confidence
+            confidence: parsedAssessment?.confidence,
+            // A standing goal is context carried across turns, NOT a gap this
+            // turn produced. Rendered in its own labelled section so the user
+            // never sees "Missing: reach $1,000 MRR" next to
+            // "Missing: fix build errors" as if both were this turn's fault.
+            goal_condition: goal?.condition || injectedProjectGoalCondition || "",
           },
           effectiveMaxAttempts
         )
+
+        // Last-resort guard: never inject a message whose body is empty after
+        // rendering. isActionlessVerdict above should already have stood us
+        // down; this catches any future verdict shape that slips past it.
+        if (!hasFeedbackBody(feedbackText)) {
+          attempts.delete(attemptKey)
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          debug("Supervisor standing down, no injection: rendered feedback had an empty body")
+          return
+        }
 
         // NEVER apply routing model to the active session feedback. The active
         // session must keep its original model. Routing was removed because it

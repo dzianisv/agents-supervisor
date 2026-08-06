@@ -257,8 +257,14 @@ test('goal: judge status "complete" allows the stop (goal achieved, not injected
   const out = runOnStop(payload, { SUPERVISOR_FAKE_JUDGE: 'complete' });
   assert.equal(out.code, 0);
   assert.equal(out.stdout, '', 'a complete judge verdict must not inject — the stop is allowed');
+  // An achieved goal is RETIRED, not left sitting in state: previously the
+  // hook persisted status:'achieved' and left the condition (and any project
+  // Goal.md) behind, so the next session re-read it and the goal resurrected
+  // forever. The achievement is still recoverable from
+  // .supervisor/goal-achieved.log.
   const state = loadGoalState(d, sid);
-  assert.equal(state.goal.status, 'achieved');
+  assert.equal(state.goal, undefined, 'session goal must be cleared once achieved');
+  assert.equal(state.mode, 'reflection');
 });
 
 // ── 5. The judge prompt must actually carry the session goal condition ─────
