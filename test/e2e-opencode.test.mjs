@@ -194,7 +194,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     //    provider credentials.
     const port = await findFreePort()
     baseUrl = `http://127.0.0.1:${port}`
-    const childEnv = { ...process.env, HOME: isolatedHome }
+    const childEnv = { ...process.env, HOME: isolatedHome, SUPERVISOR_DEBUG: "1" }
     for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
     for (const key of AMBIENT_SERVER_ENV_VARS) delete childEnv[key]
 
@@ -395,6 +395,101 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.equal(getRes.status, 200)
     const retrieved = await getRes.json()
     assert.equal(retrieved.id, session.id)
+  })
+
+  // -------------------------------------------------------------------------
+  // Subagent gate (BUG A). 633 of 962 supervisor injections in a 30-day sample
+  // (66%) landed in delegated subagent sessions — sessions whose "user" is a
+  // scoped delegation prompt, not a human. This proves, against a real server,
+  // (a) the field name the gate depends on, and (b) that the gate actually
+  // fires for a child session and does NOT fire for a root session.
+  // The spawned server runs with SUPERVISOR_DEBUG=1 so the plugin's own
+  // decision is observable in <serverCwd>/.supervisor/debug.log.
+  // -------------------------------------------------------------------------
+  describe("subagent gate", () => {
+    /** Poll the plugin's debug log until `needle` appears (or timeout). */
+    async function waitForDebugLine(needle, timeoutMs = 60_000) {
+      const logPath = join(tmpDir, ".supervisor", "debug.log")
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        if (existsSync(logPath) && readFileSync(logPath, "utf-8").includes(needle)) return true
+        await new Promise((r) => setTimeout(r, 500))
+      }
+      return false
+    }
+
+    function debugLog() {
+      const logPath = join(tmpDir, ".supervisor", "debug.log")
+      return existsSync(logPath) ? readFileSync(logPath, "utf-8") : ""
+    }
+
+    // The gate reads `parentID` off the session object. This is the empirical
+    // half of that claim: the live server, not just the SDK .d.ts, returns
+    // `parentID` on a child and omits it entirely on a root.
+    test("live server exposes `parentID` on child sessions and omits it on roots", { timeout: 60_000 }, async () => {
+      const parent = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      const childRes = await fetch(`${baseUrl}/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parentID: parent.id, title: "e2e subagent gate child" }),
+      })
+      assert.equal(childRes.status, 200)
+      const child = await childRes.json()
+
+      assert.equal(
+        child.parentID,
+        parent.id,
+        `Child session must carry parentID. If this fails the SDK field was renamed and isSubagentSession must be updated. Got: ${JSON.stringify(child).slice(0, 300)}`
+      )
+      const fetchedRoot = await (await fetch(`${baseUrl}/session/${parent.id}`)).json()
+      assert.equal(
+        fetchedRoot.parentID,
+        undefined,
+        `Root sessions must omit parentID. Got: ${JSON.stringify(fetchedRoot).slice(0, 300)}`
+      )
+      const fetchedChild = await (await fetch(`${baseUrl}/session/${child.id}`)).json()
+      assert.equal(fetchedChild.parentID, parent.id, "GET /session/{id} must also carry parentID")
+    })
+
+    test("supervisor skips a real child session but runs for a real root session", { timeout: 300_000 }, async () => {
+      const parent = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      const child = await (
+        await fetch(`${baseUrl}/session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ parentID: parent.id, title: "e2e subagent gate run" }),
+        })
+      ).json()
+
+      // Drive the CHILD to idle. The plugin's session.idle handler must bail
+      // out at the subagent gate before doing any supervisor work.
+      // Full session ids throughout: ids minted seconds apart share an 8-char
+      // prefix, so a truncated id cannot distinguish these sessions.
+      await sendMessage(baseUrl, child.id, "Say hello.", 120_000, { model })
+      const skipped = await waitForDebugLine(`subagent-gate: skipping delegated subagent session ${child.id}`)
+      assert.ok(
+        skipped,
+        `Expected the supervisor to skip child session ${child.id}. debug.log tail:\n${debugLog().slice(-3000)}`
+      )
+
+      // Drive a ROOT session to idle. It must NOT be skipped — the gate must
+      // not be a blanket kill switch.
+      const root = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      await sendMessage(baseUrl, root.id, "Say hello.", 120_000, { model })
+      const rootRan = await waitForDebugLine(`subagent-gate: supervising root session ${root.id}`)
+      assert.ok(
+        rootRan,
+        `Expected the root session ${root.id} to pass the subagent gate. debug.log tail:\n${debugLog().slice(-3000)}`
+      )
+      assert.ok(
+        !debugLog().includes(`subagent-gate: skipping delegated subagent session ${root.id}`),
+        `Root session ${root.id} must never be treated as a subagent. debug.log tail:\n${debugLog().slice(-3000)}`
+      )
+      assert.ok(
+        !debugLog().includes(`subagent-gate: supervising root session ${child.id}`),
+        `Child session ${child.id} must never pass the subagent gate. debug.log tail:\n${debugLog().slice(-3000)}`
+      )
+    })
   })
 
   describe("autopilot mode", () => {

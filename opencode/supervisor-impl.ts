@@ -70,6 +70,64 @@ export function detectSupervisorActionInText(text: string): "off" | "on" | null 
   return null
 }
 
+/**
+ * True when a session was spawned by another session — i.e. a delegated
+ * subagent created through the `task` tool, not a session a human is watching.
+ *
+ * FIELD NAME IS VERIFIED, NOT GUESSED (2026-08-06):
+ *   - SDK type:  `Session.parentID?: string`
+ *     (node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts:397)
+ *   - Live REST: `GET /session/{id}` on a real subagent session returns
+ *     `"parentID": "ses_…"`; the same call on a root session omits the key
+ *     entirely (it is absent, not null).
+ *   - SQLite:    the `session` table stores it as `parent_id`
+ *     (~/.local/share/opencode/opencode.db) — snake_case is the storage form
+ *     only; the API/SDK surface is camelCase `parentID`.
+ *
+ * TRAP: `message.info.parentID` also exists but holds a *message* id
+ * (`msg_…`), not a session id. Never derive subagent-ness from the transcript.
+ * The snake_case / lowercase-d variants below are accepted purely as
+ * defence-in-depth against a future SDK rename; `parentID` is the real one.
+ */
+export function isSubagentSession(session: any): boolean {
+  if (!session || typeof session !== "object") return false
+  const parent = session.parentID ?? session.parent_id ?? session.parentId
+  return typeof parent === "string" && parent.trim().length > 0
+}
+
+/**
+ * Values the model emits for a parameter it does not actually want to set.
+ *
+ * Why this exists: the supervisor tools declare every parameter `.optional()`,
+ * but the schema that reaches the model serialises with
+ * `"required": ["mode","action","condition","clear","n"]` — verified live in
+ * the running tool manifest. The plugin registers its tools through a raw-zod
+ * `args` record, and this runtime passes those zod objects through verbatim
+ * (the manifest shows `{"_def":{...,"typeName":"ZodOptional"}}` instead of a
+ * JSON Schema), so optionality is lost before the model ever sees it. The
+ * model is therefore *forced* to emit a value and invents filler.
+ *
+ * Consequence (30-day forensics): 3 of 5 real `/supervisor off` calls arrived
+ * as `{action:"off", mode:"reflection"}` and one as
+ * `{action:"off", mode:"autopilot"}` — the user asked OFF and got a mode
+ * change. Until the runtime can emit real optional params, the executor must
+ * treat filler as absent.
+ */
+const ABSENT_ARG_SENTINELS = new Set(["", "null", "undefined"])
+
+/**
+ * Normalise a tool argument that is semantically optional but may arrive as a
+ * runtime-forced filler value. Returns undefined for absent/filler input.
+ */
+export function normalizeOptionalArg(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  if (ABSENT_ARG_SENTINELS.has(trimmed.toLowerCase())) return undefined
+  return trimmed
+}
+
 export function getLastUserMessageText(messages: any[]): string {
   if (!Array.isArray(messages)) return ""
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -142,6 +200,32 @@ async function loadConfiguredMaxAttempts(): Promise<number | undefined> {
     }
   } catch {}
   return undefined
+}
+
+/**
+ * Read the top-level `superviseSubagents:` boolean from
+ * ~/.config/opencode/supervisor.yaml. Mirrors loadConfiguredMaxAttempts.
+ *
+ * Default FALSE: the supervisor does not run inside delegated subagent
+ * sessions. 633 of 962 injections in a 30-day sample (66%) landed in sessions
+ * whose "user" is a scoped delegation prompt rather than a human — the
+ * supervisor pushed read-only audit subagents to open PRs and pull
+ * credentials, and every observed injection loop lived in one. Set
+ * `superviseSubagents: true` to restore the old behaviour.
+ */
+export async function loadConfiguredSuperviseSubagents(
+  configPath: string = SUPERVISOR_CONFIG_PATH
+): Promise<boolean> {
+  try {
+    const content = await readFile(configPath, "utf-8")
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith("#")) continue
+      const match = line.match(/^superviseSubagents\s*:\s*(\S+)/)
+      if (match) return /^(true|yes|1|on)$/i.test(match[1].trim())
+    }
+  } catch {}
+  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,16 +1476,63 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   // Primary supervisor tool: status, session on/off, and mode selection.
-  const supervisorToggleDescription = "Inspect or change supervisor state for the current session. Use mode=autopilot or mode=reflection to switch modes. Use action=off/on for session disable/enable, or omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
+  const supervisorToggleDescription = "Inspect or change supervisor state for the current session. action=off/on disables/enables the supervisor and is INDEPENDENT of mode — when the user asks to turn the supervisor off, send action=\"off\" and leave mode empty. Use mode=autopilot or mode=reflection only to switch modes. Omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
   const executeSupervisorToggle = async (
-    args: { action?: string; mode?: SupervisorMode; condition?: string; clear?: boolean; n?: number } = {},
+    args: { action?: string; mode?: string; condition?: string; clear?: boolean; n?: number } = {},
     context?: any
   ) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session tracked yet — wait for the first session.idle event, then try again."
     currentSessionId = sid
     const sessionDir = await resolveSessionDirectoryFor(sid)
-    const requestedMode = args.mode?.trim().toLowerCase()
+
+    // Filler-tolerant argument reading. The runtime forces the model to emit a
+    // value for every "optional" param (see ABSENT_ARG_SENTINELS), so `mode`
+    // and `action` may both be populated when the user asked for only one.
+    const requestedMode = normalizeOptionalArg(args.mode)?.toLowerCase()
+    const requestedAction = normalizeOptionalArg(args.action)?.toLowerCase()
+
+    // ENABLE AXIS FIRST. off/on are orthogonal to mode, so they must be handled
+    // BEFORE any mode branch. The old order checked `mode` first and
+    // early-returned, which silently converted `/supervisor off` into a mode
+    // change: 3 of 5 real off-attempts in a 30-day sample never persisted, and
+    // one of them ("mode":"autopilot") turned the supervisor UP instead of off.
+    // The tool then returned a success-shaped string, so the agent told the
+    // user "Supervisor is off" while it kept injecting.
+    if (requestedAction === "off" || requestedAction === "on") {
+      const shouldDisable = requestedAction === "off"
+      // A real mode arriving alongside off/on is still honoured — both axes
+      // apply — but it can never suppress the enable-axis change.
+      let modeNote = ""
+      if (requestedMode === "autopilot" || requestedMode === "reflection") {
+        try {
+          await supervisorStore.setMode(directory, sid, requestedMode)
+          modeNote = ` Mode also set to ${requestedMode}.`
+        } catch (e: any) {
+          modeNote = ` (Warning: mode change to ${requestedMode} failed: ${e?.message || e}.)`
+        }
+      }
+      try {
+        await setSessionDisabled(sid, shouldDisable, sessionDir)
+      } catch (e: any) {
+        return `FAILED to ${shouldDisable ? "disable" : "enable"} supervisor for session ${sid.slice(0, 8)}… — could not write .supervisor/disabled: ${e?.message || e}. The supervisor is still ${shouldDisable ? "ON" : "OFF"}.${modeNote}`
+      }
+      // Never report success for an operation that did not persist. Read the
+      // state back through the same path runSupervisor uses.
+      let persisted: boolean
+      try {
+        persisted = await isSessionDisabled(sid, sessionDir)
+      } catch (e: any) {
+        return `FAILED to verify supervisor state for session ${sid.slice(0, 8)}… after ${requestedAction}: ${e?.message || e}. Do not assume the supervisor is ${shouldDisable ? "off" : "on"}.${modeNote}`
+      }
+      if (persisted !== shouldDisable) {
+        return `FAILED to ${shouldDisable ? "disable" : "enable"} supervisor for session ${sid.slice(0, 8)}… — the change did not persist (still ${persisted ? "disabled" : "enabled"}). Checked ${join(sessionDir, ".supervisor", "disabled")}.${modeNote}`
+      }
+      return shouldDisable
+        ? `Supervisor disabled for session ${sid.slice(0, 8)}… (added to .supervisor/disabled, verified).${modeNote}`
+        : `Supervisor enabled for session ${sid.slice(0, 8)}… (removed from .supervisor/disabled, verified).${modeNote}`
+    }
+
     if (requestedMode === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
       return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
@@ -1410,15 +1541,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.setMode(directory, sid, "reflection")
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
-    const action = (args.action || "status").trim().toLowerCase()
-    if (action === "off") {
-      await setSessionDisabled(sid, true, sessionDir)
-      return `Supervisor disabled for session ${sid.slice(0, 8)}… (added to .supervisor/disabled).`
-    }
-    if (action === "on") {
-      await setSessionDisabled(sid, false, sessionDir)
-      return `Supervisor enabled for session ${sid.slice(0, 8)}… (removed from .supervisor/disabled).`
-    }
+    const action = requestedAction || "status"
     if (action === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
       return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
@@ -1428,7 +1551,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
     if (action === "goal") {
-      return executeSupervisorGoal({ condition: args.condition, clear: args.clear }, context)
+      return executeSupervisorGoal({ condition: normalizeOptionalArg(args.condition), clear: args.clear }, context)
     }
     if (action === "retry") {
       return executeSupervisorRetry({ n: args.n }, context)
@@ -1478,6 +1601,39 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return resolveSessionDirectory(Array.isArray(data) ? data : [], directory)
     } catch {
       return directory
+    }
+  }
+
+  /**
+   * True when this session is a delegated subagent (spawned via the `task`
+   * tool) and the user has not opted into supervising those.
+   *
+   * The parent id is NOT available on the transcript — `message.info.parentID`
+   * is a message id — so this needs the session object itself
+   * (`GET /session/{id}` → `parentID`). Result is cached: a session's parent
+   * never changes, so this costs at most one local API call per session.
+   *
+   * Fails OPEN (returns false) when the SDK has no `session.get` or the call
+   * throws. A hard fail-closed here would silently disable the supervisor
+   * everywhere on an SDK mismatch, which is worse than the bug it fixes.
+   */
+  const subagentCache = new Map<string, boolean>()
+  const isDelegatedSubagentSession = async (sid: string): Promise<boolean> => {
+    if (await loadConfiguredSuperviseSubagents()) return false
+    const cached = subagentCache.get(sid)
+    if (cached !== undefined) return cached
+    if (typeof (client as any)?.session?.get !== "function") {
+      debug("client.session.get unavailable — cannot detect subagent sessions")
+      return false
+    }
+    try {
+      const { data } = await (client as any).session.get({ path: { id: sid } })
+      const result = isSubagentSession(data)
+      subagentCache.set(sid, result)
+      return result
+    } catch (e: any) {
+      debug("session.get failed while checking subagent status:", e?.message || e)
+      return false
     }
   }
 
@@ -1670,7 +1826,7 @@ Do NOT call this tool:
     supervisorToggleTool = tool({
       description: supervisorToggleDescription,
       args: {
-        mode: tool.schema.string().optional().describe("Supervisor mode to set: autopilot or reflection. Prefer this over action for mode changes."),
+        mode: tool.schema.string().optional().describe("Supervisor mode to set: autopilot or reflection. LEAVE EMPTY unless the user asked to change mode — it is independent of action=off/on."),
         action: tool.schema.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
         condition: tool.schema.string().optional().describe("Goal text when action is 'goal'."),
         clear: tool.schema.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
@@ -1711,7 +1867,15 @@ Do NOT call this tool:
       supervisorToggleTool = {
         description: supervisorToggleDescription,
         args: {
-          mode: z.enum(["autopilot", "reflection"]).optional().describe("Supervisor mode to set. Prefer this over action for mode changes."),
+          // `z.string()`, NOT `z.enum(["autopilot","reflection"])`. This runtime
+          // forwards raw zod objects to the model and marks every param
+          // required (verified in the live tool manifest), so the model is
+          // forced to emit a `mode` value even when it only wants off/on. With
+          // an enum, the filler ("" / "null") would fail zod validation and the
+          // whole call — including action:"off" — would be rejected. A plain
+          // string lets the filler reach executeSupervisorToggle, where
+          // normalizeOptionalArg treats it as absent.
+          mode: z.string().optional().describe("Supervisor mode to set: autopilot or reflection. LEAVE EMPTY unless the user asked to change mode — it is independent of action=off/on."),
           action: z.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
           condition: z.string().optional().describe("Goal text when action is 'goal'."),
           clear: z.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
@@ -1799,6 +1963,13 @@ Do NOT call this tool:
 
         if (isJudgeSession(sessionId, messages, judgeSessionIds)) return
         if (isPlanMode(messages)) return
+        if (await isDelegatedSubagentSession(sessionId)) {
+          // Full session id (not sliced): ids created seconds apart share an
+          // 8-char prefix, so a truncated id cannot identify a session here.
+          debug("subagent-gate: skipping delegated subagent session", sessionId, "(set superviseSubagents: true in ~/.config/opencode/supervisor.yaml to override)")
+          return
+        }
+        debug("subagent-gate: supervising root session", sessionId)
 
         const sessionDirectory = resolveSessionDirectory(messages || [], directory)
         if (sessionDirectory !== directory) {
@@ -2336,6 +2507,10 @@ Routing rules:
 - "retry <N>" → supervisor({ action: "retry", n: N })
 - "autoreview on" → supervisor_autoreview({ enabled: true })
 - "autoreview off" → supervisor_autoreview({ enabled: false })
+
+NEVER send a mode value for "on" or "off" — mode and action are independent,
+and a filler mode has historically caused "off" to be silently ignored. If the
+schema forces you to supply mode, send an empty string.
 
 Call the tool now. Do not explain, just execute the tool call.`
         }

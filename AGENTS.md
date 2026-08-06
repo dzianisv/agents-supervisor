@@ -34,6 +34,22 @@ node evals/judge-eval.mjs
 
 ## Test Coverage
 
+### `test/supervisor-gates.test.mjs` — the two "should the supervisor run at all" gates
+
+Covers the two highest-volume misfires found in a 30-day forensic sample of real sessions.
+
+**Subagent gate.** The supervisor must not run inside delegated subagent sessions (633 of 962 injections, 66%). The gate reads `parentID` off the session object — **verified**, not guessed:
+- SDK: `Session.parentID?: string` (`@opencode-ai/sdk/dist/gen/types.gen.d.ts`)
+- Live REST: `GET /session/{id}` returns `parentID` on a child and omits the key entirely on a root
+- SQLite storage form is `session.parent_id`; the API/SDK form is `parentID`
+- **Trap:** `message.info.parentID` is a *message* id (`msg_…`). Never derive subagent-ness from the transcript.
+
+Override with `superviseSubagents: true` in `~/.config/opencode/supervisor.yaml` (default false). The gate fails **open** when `client.session.get` is missing or throws — a fail-closed gate would silently kill the whole feature on an SDK mismatch.
+
+**`/supervisor off`.** `action: off/on` is handled BEFORE any `mode` branch, because `mode` used to early-return and swallow it (3 of 5 real off-attempts never persisted; one was converted to `mode: autopilot`). The executor also treats runtime filler (`""`, `"null"`, `"undefined"`, actual `null`) as absent — the tool schema reaching the model marks every param required even though zod says `.optional()`, so the model is forced to invent a `mode`. After writing, the disabled state is read back and an explicit `FAILED …` string is returned if it did not persist.
+
+E2E coverage lives in `test/e2e-opencode.test.mjs` under `describe("subagent gate")`: it creates a real child session via `POST /session {parentID}` against a live server, asserts the `parentID` field contract, and asserts the plugin's own debug log shows the child skipped and a root session supervised. That E2E requires the spawned server to run with `SUPERVISOR_DEBUG=1`.
+
 ### `test/model-fallback.test.mjs` — Judge session model fallback
 
 Tests `getLastSessionModelSpec()` — the helper that extracts `providerID/modelID` from the active session's messages so judge sessions reuse the session model when no model is configured in `opencode.json` or `supervisor.yaml`.

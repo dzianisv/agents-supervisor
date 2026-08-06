@@ -134,6 +134,35 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 
 The effective default mode is `reflection`.
 
+## Where the supervisor does NOT run (OpenCode)
+
+The supervisor skips a session entirely when any of these hold:
+
+| Gate | Why |
+|---|---|
+| Judge/self-assessment session | It would supervise its own judge. |
+| Plan mode | Planning is not work-in-progress. |
+| **Delegated subagent session** (`parentID` set) | The "user" is a scoped delegation prompt, not a human. Supervising these pushed read-only audit subagents to open PRs and pull credentials, and produced 66% of all injections in a 30-day sample. |
+| Session listed in `.supervisor/disabled` | `/supervisor off`. |
+
+To restore the old behaviour and supervise delegated subagents too, add this to
+`~/.config/opencode/supervisor.yaml`:
+
+```yaml
+superviseSubagents: true
+```
+
+Turning the supervisor off for the current session is independent of mode:
+
+```
+/supervisor off      # disables; verified by reading the flag back
+/supervisor on       # re-enables
+```
+
+The `off`/`on` action always wins over any `mode` argument sent in the same
+call, and the tool reports an explicit `FAILED …` string rather than a success
+message if the change did not persist.
+
 ## Goal mode (both runtimes)
 
 Beyond catching premature stops, you can point the supervisor at a **goal** it must
