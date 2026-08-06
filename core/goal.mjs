@@ -8,12 +8,18 @@
  * (default 16) and the goal is injected into the judge prompt as a mandatory
  * completion requirement.
  *
- * State: <cwd>/.supervisor/goals/<sessionId>.json (mode 0600).
+ * State: <cwd>/.supervisor/sessions/<sessionId>/state.json (mode 0600) — see
+ * core/session-store.mjs, which owns the layout, migration, atomicity and GC.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { sessionStore } from './session-store.mjs';
+
+// Re-exported so every consumer reaches the ONE store through a single import
+// surface — a second import path is how the previous duplicates started.
+export { sessionStore } from './session-store.mjs';
 
 export const DEFAULT_MAX_ATTEMPTS = 16;
 // The deadline is a safety backstop against a goal outliving the session that
@@ -182,78 +188,69 @@ export function decideGoalTransition({ goal, complete, now, maxAttempts, reason 
 }
 
 // --- per-session store (sync) ---------------------------------------------
-
-function assertSafeSessionId(sessionId) {
-  if (!sessionId || sessionId.includes('/') || sessionId.includes('\\') || sessionId.includes('..')) {
-    throw new Error(`Invalid sessionId: ${JSON.stringify(sessionId)}`);
-  }
-}
-function goalsDir(cwd) {
-  return path.join(cwd, '.supervisor', 'goals');
-}
-function goalPath(cwd, sessionId) {
-  return path.join(goalsDir(cwd), `${sessionId}.json`);
-}
+//
+// The on-disk layer moved to core/session-store.mjs — ONE accessor shared by
+// BOTH runtimes (`goalStore` here, `supervisorStore` in
+// opencode/supervisor-impl.ts). `goalStore` is now a thin behavioural facade
+// over it: this file owns the GOAL semantics (what setGoal/setMode mean),
+// session-store.mjs owns the layout, migration, atomicity and GC. There is no
+// second implementation of either half.
+//
+// Layout (see session-store.mjs): <cwd>/.supervisor/sessions/<sessionId>/state.json,
+// mode 0600. Legacy <cwd>/.supervisor/goals/<sessionId>.json is read and
+// migrated forward transparently on first load.
 
 export const goalStore = {
   load(cwd, sessionId) {
-    try {
-      return JSON.parse(fs.readFileSync(goalPath(cwd, sessionId), 'utf8'));
-    } catch {
-      return {};
-    }
+    return sessionStore.load(cwd, sessionId);
   },
   save(cwd, sessionId, state) {
-    assertSafeSessionId(sessionId);
-    fs.mkdirSync(goalsDir(cwd), { recursive: true });
-    const p = goalPath(cwd, sessionId);
-    fs.writeFileSync(p, JSON.stringify(state, null, 2), { mode: 0o600 });
-    try { fs.chmodSync(p, 0o600); } catch { /* best effort */ }
+    sessionStore.save(cwd, sessionId, state);
   },
   setGoal(cwd, sessionId, condition, opts = {}) {
-    const state = goalStore.load(cwd, sessionId);
     const now = opts.now ?? Date.now();
     const maxDurationMs = opts.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS;
-    state.goal = {
-      condition, status: 'active', attempts: 0,
-      tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
-      // lastTurnKey: fingerprint of the human turn the attempts count belongs
-      // to. null until the first stop observes one — see the per-turn reset in
-      // bin/supervisor-on-stop.mjs.
-      deadline: now + maxDurationMs, lastReason: '', lastTurnKey: null,
-    };
-    state.mode = 'goal';
-    state.autopilot = false;
-    goalStore.save(cwd, sessionId, state);
-    return state;
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.goal = {
+        condition, status: 'active', attempts: 0,
+        tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
+        // lastTurnKey: fingerprint of the human turn the attempts count belongs
+        // to. null until the first stop observes one — see the per-turn reset in
+        // bin/supervisor-on-stop.mjs.
+        deadline: now + maxDurationMs, lastReason: '', lastTurnKey: null,
+      };
+      state.mode = 'goal';
+      state.autopilot = false;
+      return state;
+    });
   },
   clearGoal(cwd, sessionId) {
-    const state = goalStore.load(cwd, sessionId);
-    delete state.goal;
-    state.mode = DEFAULT_SUPERVISOR_MODE;
-    state.autopilot = false;
-    goalStore.save(cwd, sessionId, state);
-    return state;
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      delete state.goal;
+      state.mode = DEFAULT_SUPERVISOR_MODE;
+      state.autopilot = false;
+      return state;
+    });
   },
   setMode(cwd, sessionId, mode) {
     if (!SUPERVISOR_MODE_SET.has(mode)) throw new Error(`Invalid supervisor mode: ${JSON.stringify(mode)}`);
-    const state = goalStore.load(cwd, sessionId);
-    state.mode = mode;
-    state.autopilot = mode === 'autopilot';
-    // Only 'goal' runs a condition through the goal-loop primitives
-    // (state.goal); switching to any other mode drops it.
-    if (mode !== 'goal') delete state.goal;
-    goalStore.save(cwd, sessionId, state);
-    return state;
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.mode = mode;
+      state.autopilot = mode === 'autopilot';
+      // Only 'goal' runs a condition through the goal-loop primitives
+      // (state.goal); switching to any other mode drops it.
+      if (mode !== 'goal') delete state.goal;
+      return state;
+    });
   },
   setAutopilot(cwd, sessionId, enabled) {
     return goalStore.setMode(cwd, sessionId, enabled ? 'autopilot' : DEFAULT_SUPERVISOR_MODE);
   },
   setRetry(cwd, sessionId, n) {
-    const state = goalStore.load(cwd, sessionId);
-    state.maxAttempts = n;
-    goalStore.save(cwd, sessionId, state);
-    return state;
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.maxAttempts = n;
+      return state;
+    });
   },
   /**
    * Mirror of the OpenCode-side supervisorStore.setStatusDiagram so both
@@ -263,10 +260,16 @@ export const goalStore = {
    * isStatusDiagramEnabled(), never as a bare truthiness test.
    */
   setStatusDiagram(cwd, sessionId, enabled) {
-    const state = goalStore.load(cwd, sessionId);
-    state.statusDiagram = enabled;
-    goalStore.save(cwd, sessionId, state);
-    return state;
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.statusDiagram = enabled;
+      return state;
+    });
+  },
+  setAutoreview(cwd, sessionId, enabled) {
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.autoreview = enabled;
+      return state;
+    });
   },
 };
 

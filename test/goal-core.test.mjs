@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { statePath } from '../core/session-store.mjs';
 import {
   goalStore, resolveMaxAttempts, decideGoalTransition,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
@@ -24,7 +25,7 @@ test('goalStore: setGoal/load/clear round-trip, 0600 perms', () => {
   assert.equal(st.goal.condition, 'all tests pass');
   assert.equal(st.goal.status, 'active');
   assert.equal(st.goal.attempts, 0);
-  const mode = fs.statSync(path.join(d, '.supervisor', 'goals', 's1.json')).mode & 0o777;
+  const mode = fs.statSync(statePath(d, 's1')).mode & 0o777;
   assert.equal(mode, 0o600);
   goalStore.clearGoal(d, 's1');
   assert.equal(goalStore.load(d, 's1').goal, undefined);

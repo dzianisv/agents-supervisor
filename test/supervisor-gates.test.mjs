@@ -26,6 +26,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 import {
   SupervisorPlugin,
   isSubagentSession,
@@ -125,9 +126,9 @@ function createStubClient({ parentID, withSessionGet = true, messages = makeMess
 }
 
 function writeActiveGoal(dir, sessionId) {
-  mkdirSync(join(dir, ".supervisor", "goals"), { recursive: true })
+  ensureSessionDir(dir, sessionId)
   writeFileSync(
-    join(dir, ".supervisor", "goals", `${sessionId}.json`),
+    statePath(dir, sessionId),
     JSON.stringify({
       mode: "goal",
       autopilot: false,
@@ -151,7 +152,7 @@ function readDisabled(dir) {
 }
 
 function readMode(dir, sessionId) {
-  const p = join(dir, ".supervisor", "goals", `${sessionId}.json`)
+  const p = statePath(dir, sessionId)
   if (!existsSync(p)) return null
   return JSON.parse(readFileSync(p, "utf-8")).mode ?? null
 }
@@ -180,7 +181,6 @@ describe("BUG A: supervisor must not run inside delegated subagent sessions", ()
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-gate-sub-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
   })
   afterEach(() => {
     try { rmSync(tmpDir, { recursive: true, force: true }) } catch {}
@@ -292,7 +292,6 @@ describe("BUG B: /supervisor off must never be swallowed by a filler `mode`", ()
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-gate-off-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     const { client } = createStubClient({ parentID: undefined })
     plugin = await SupervisorPlugin({ client, directory: tmpDir })
     toggle = (args) => plugin.tool.supervisor.execute(args, { sessionID: SESSION_ID })

@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { verdictsPath } from '../core/session-store.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
@@ -51,7 +52,7 @@ function runHook(payload, env = {}) {
   });
   let verdict = null;
   try {
-    const vf = path.join(payload.cwd, '.supervisor', `verdict_${payload.session_id}.json`);
+    const vf = verdictsPath(payload.cwd, payload.session_id);
     if (fs.existsSync(vf)) verdict = JSON.parse(fs.readFileSync(vf, 'utf8'));
   } catch { /* none */ }
   return { code: r.status, stdout: (r.stdout || '').trim(), verdict };

@@ -23,6 +23,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
 import {
   readProjectGoalCondition, writeDerivedProjectGoal, writeProjectGoal,
@@ -312,7 +313,6 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-derive-test-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -336,8 +336,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("All tests in test/ pass and the flaky login test is fixed"), `Expected derived condition in reply, got: ${result}`)
 
     // Session state now has the derived goal active.
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal.condition, "All tests in test/ pass and the flaky login test is fixed")
     assert.equal(state.goal.status, "active")
 
@@ -367,8 +366,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("Could not derive"), `Expected failure message, got: ${result}`)
     assert.ok(result.includes("/supervisor:set-goal"), `Expected explicit manual-set instruction, got: ${result}`)
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf-8")) : {}
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal, undefined, "no goal should have been persisted to session state")
 
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
@@ -398,8 +396,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("Could not derive"), `Malicious/hijacked derivation must be rejected, got: ${result}`)
     assert.ok(!result.includes("API key"), "the rejected/hijacked text must never leak into the reply as an accepted goal")
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf-8")) : {}
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal, undefined, "hijacked derivation must never be persisted as an active goal")
 
     // The untrusted task text was still sent to the model — but fenced as

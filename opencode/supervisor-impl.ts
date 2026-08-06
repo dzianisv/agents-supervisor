@@ -7,7 +7,7 @@
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { readFile, writeFile, mkdir, stat, appendFile, readdir, chmod } from "fs/promises"
+import { readFile, writeFile, mkdir, stat, appendFile, chmod } from "fs/promises"
 import { join, dirname } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "url"
@@ -21,8 +21,11 @@ import {
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
   readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
-  isStatusDiagramEnabled,
+  isStatusDiagramEnabled, goalStore,
 } from "../core/goal.mjs"
+import {
+  sessionStore, listSessions, maybeGcSessions,
+} from "../core/session-store.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
   getCrossReviewModelSpec, getLastSessionModelSpec,
@@ -245,7 +248,11 @@ export async function loadConfiguredSuperviseSubagents(
 // ---------------------------------------------------------------------------
 // Supervisor per-session persistence (supervisorStore)
 //
-// Stores goal + retry state at <directory>/.supervisor/goals/<sessionId>.json
+// Stores goal + retry state at
+// <directory>/.supervisor/sessions/<sessionId>/state.json — see
+// core/session-store.mjs, the SINGLE accessor shared with the Claude Code
+// runtime. Legacy <directory>/.supervisor/goals/<sessionId>.json is read and
+// migrated forward transparently on first load.
 // so supervisor decisions survive across tool invocations within a session.
 // ---------------------------------------------------------------------------
 
@@ -304,38 +311,29 @@ export interface SupervisorState {
  */
 export { isStatusDiagramEnabled }
 
-function supervisorDir(directory: string): string {
-  return join(directory, ".supervisor", "goals")
-}
-
-/** Guard against path-traversal attacks via a malformed sessionId. */
-function assertSafeSessionId(sessionId: string): void {
-  if (!sessionId || sessionId.includes("/") || sessionId.includes("\\") || sessionId.includes("..")) {
-    throw new Error(`Invalid sessionId: ${JSON.stringify(sessionId)}`)
-  }
-}
-
-function supervisorPath(directory: string, sessionId: string): string {
-  return join(supervisorDir(directory), `${sessionId}.json`)
-}
-
+/**
+ * `supervisorStore` is an ASYNC ADAPTER, not a second implementation.
+ *
+ * It used to be a full parallel copy of core/goal.mjs's `goalStore`: same
+ * on-disk contract, two code paths, no shared tests. This repo has repeatedly
+ * shipped bugs from exactly that shape (two extractors, two truncation
+ * constants, two isStatusDiagramEnabled). Every method below now delegates to
+ * `sessionStore` in core/session-store.mjs — the ONE accessor both runtimes
+ * use — and only keeps the `Promise`-returning signatures the plugin's call
+ * sites expect.
+ *
+ * The core is deliberately synchronous (see its header): the Claude Code hook
+ * and both CLIs are sync, and this file already calls sync core helpers
+ * (writeProjectGoal, retireProjectGoal, readProjectGoalCondition). The
+ * payload is one small JSON object per session.
+ */
 export const supervisorStore = {
   async load(directory: string, sessionId: string): Promise<SupervisorState> {
-    try {
-      const content = await readFile(supervisorPath(directory, sessionId), "utf-8")
-      return JSON.parse(content) as SupervisorState
-    } catch {
-      return {}
-    }
+    return sessionStore.load(directory, sessionId) as SupervisorState
   },
 
   async save(directory: string, sessionId: string, state: SupervisorState): Promise<void> {
-    assertSafeSessionId(sessionId)
-    const dir = supervisorDir(directory)
-    await mkdir(dir, { recursive: true })
-    const filePath = supervisorPath(directory, sessionId)
-    await writeFile(filePath, JSON.stringify(state, null, 2), { mode: 0o600 })
-    await chmod(filePath, 0o600)
+    sessionStore.save(directory, sessionId, state)
   },
 
   async setGoal(
@@ -344,78 +342,49 @@ export const supervisorStore = {
     condition: string,
     opts?: { tokenBaseline?: number; now?: number; maxDurationMs?: number }
   ): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    const now = opts?.now ?? Date.now()
-    const maxDurationMs = opts?.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS
-    state.goal = {
-      condition,
-      status: "active",
-      attempts: 0,
-      tokenBaseline: opts?.tokenBaseline ?? 0,
-      startedAt: now,
-      deadline: now + maxDurationMs,
-      lastReason: "",
-      lastTurnKey: null,
-    }
-    state.mode = "goal"
-    state.autopilot = false
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.setGoal(directory, sessionId, condition, opts ?? {}) as SupervisorState
   },
 
   async clearGoal(directory: string, sessionId: string): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    delete state.goal
-    state.mode = DEFAULT_SUPERVISOR_MODE
-    state.autopilot = false
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.clearGoal(directory, sessionId) as SupervisorState
   },
 
   async setMode(directory: string, sessionId: string, mode: SupervisorMode): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    state.mode = mode
-    state.autopilot = mode === "autopilot"
-    if (mode !== "goal") delete state.goal
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.setMode(directory, sessionId, mode) as SupervisorState
   },
 
   async setRetry(directory: string, sessionId: string, n: number): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    state.maxAttempts = n
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.setRetry(directory, sessionId, n) as SupervisorState
   },
 
   async setAutopilot(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
-    return supervisorStore.setMode(directory, sessionId, enabled ? "autopilot" : DEFAULT_SUPERVISOR_MODE)
+    return goalStore.setAutopilot(directory, sessionId, enabled) as SupervisorState
   },
 
   async setAutoreview(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    state.autoreview = enabled
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.setAutoreview(directory, sessionId, enabled) as SupervisorState
   },
 
   async setStatusDiagram(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
-    const state = await supervisorStore.load(directory, sessionId)
-    state.statusDiagram = enabled
-    await supervisorStore.save(directory, sessionId, state)
-    return state
+    return goalStore.setStatusDiagram(directory, sessionId, enabled) as SupervisorState
   },
 
+  /**
+   * Persist an arbitrary field without clobbering a concurrent writer's field.
+   * Read-modify-write is serialised behind the session lock in the core.
+   */
+  async mutate(
+    directory: string,
+    sessionId: string,
+    fn: (state: SupervisorState) => SupervisorState | void
+  ): Promise<SupervisorState> {
+    return sessionStore.mutate(directory, sessionId, fn as any) as SupervisorState
+  },
+
+  /** Every session id known in this project (new layout + un-migrated legacy). */
   async list(directory: string): Promise<string[]> {
     try {
-      const dir = supervisorDir(directory)
-      const entries = await readdir(dir, { withFileTypes: true })
-      // Build result in a local array to ensure consistent realm in ESM environments
-      const ids: string[] = []
-      for (const e of entries) {
-        if (e.isFile() && e.name.endsWith(".json")) ids.push(e.name.slice(0, -".json".length))
-      }
-      return ids
+      return listSessions(directory).map((s) => s.id)
     } catch {
       return []
     }
@@ -1039,39 +1008,28 @@ async function loadSupervisorModelList(): Promise<string[]> {
   }
 }
 
-async function ensureSupervisorDir(directory: string): Promise<string> {
-  const supervisorDir = join(directory, ".supervisor")
-  try {
-    await mkdir(supervisorDir, { recursive: true })
-  } catch {}
-  return supervisorDir
-}
-
 async function writeVerdictSignal(directory: string, sessionId: string, complete: boolean, severity: string): Promise<void> {
-  const supervisorDir = await ensureSupervisorDir(directory)
-  const signalPath = join(supervisorDir, `verdict_${sessionId.slice(0, 8)}.json`)
-  const signal = {
-    sessionId: sessionId.slice(0, 8),
+  // Appends to .supervisor/sessions/<full session id>/verdicts.jsonl.
+  //
+  // Replaces `.supervisor/verdict_<sid8>.json`. That file keyed on the session
+  // id TRUNCATED to 8 chars, so two sessions sharing a prefix overwrote each
+  // other's verdict; and it kept only the newest, so the history a reviewer
+  // needs was gone. The log is append-only and keyed on the FULL id.
+  const ok = sessionStore.appendVerdict(directory, sessionId, {
+    sessionId,
     complete,
     severity,
-    timestamp: Date.now()
-  }
-  try {
-    await writeFile(signalPath, JSON.stringify(signal))
-    debug("Wrote verdict signal:", signalPath)
-  } catch (e) {
-    debug("Failed to write verdict signal:", String(e))
-    reportError(e, { plugin: "supervisor-3", op: "write-verdict-signal" })
-  }
+    timestamp: Date.now(),
+    kind: "verdict-signal",
+  })
+  if (ok) debug("Wrote verdict signal for session:", sessionId)
+  else debug("Failed to write verdict signal for session:", sessionId)
 }
 
 async function saveSupervisorData(directory: string, sessionId: string, data: any): Promise<void> {
-  const supervisorDir = await ensureSupervisorDir(directory)
-  const filename = `${sessionId.slice(0, 8)}_${Date.now()}.json`
-  const filepath = join(supervisorDir, filename)
-  try {
-    await writeFile(filepath, JSON.stringify(data, null, 2))
-  } catch {}
+  // Replaces the one-file-per-assessment `.supervisor/<sid8>_<ts>.json` spray
+  // (truncated id, unbounded file count, no GC). Same append-only log.
+  sessionStore.appendVerdict(directory, sessionId, { kind: "assessment", data })
 }
 
 async function waitForResponse(client: any, sessionId: string): Promise<string | null> {
@@ -1502,8 +1460,10 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     try {
       const state = await supervisorStore.load(directory, sessionId)
       if (state.projectDir === dir) return
-      state.projectDir = dir
-      await supervisorStore.save(directory, sessionId, state)
+      // mutate(), not save(): a blind whole-state overwrite would clobber any
+      // field another writer changed since `load` — attempts and the goal now
+      // live in the SAME state.json.
+      await supervisorStore.mutate(directory, sessionId, (s) => { s.projectDir = dir })
     } catch (e: any) {
       debug("failed to persist session projectDir (non-fatal):", e?.message || e)
     }
@@ -2152,6 +2112,10 @@ Do NOT call this tool:
 
         const sessionDirectory = resolveSessionDirectory(messages || [], directory)
         await rememberSessionDirectory(sessionId, sessionDirectory)
+        // Retention sweep for per-session state dirs, throttled to once a day
+        // per project. Best-effort by contract: it never throws, never blocks
+        // supervision, and never touches the live session.
+        try { maybeGcSessions(sessionDirectory, { protect: sessionId }) } catch { /* best effort */ }
         if (sessionDirectory !== directory) {
           debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
         }
@@ -2240,7 +2204,7 @@ Do NOT call this tool:
           const shouldReset = goal.lastTurnKey != null
           goal = { ...goal, lastTurnKey: lastUserMsgId, ...(shouldReset ? { attempts: 0 } : {}) }
           sup.goal = goal
-          try { await supervisorStore.save(directory, sessionId, sup) } catch { /* best effort */ }
+          try { await supervisorStore.mutate(directory, sessionId, (s) => { s.goal = goal }) } catch { /* best effort */ }
         }
         const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
 
@@ -2506,7 +2470,9 @@ Continue now.`
             // be silently misclassified as the recoverable per-turn case).
             const deadlineHit = t.reason === "deadline"
             if (deadlineHit) {
-              await supervisorStore.save(directory, sessionId, { ...sup, mode: "reflection", autopilot: false, goal: t.goal })
+              await supervisorStore.mutate(directory, sessionId, (s) => {
+                s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+              })
             }
             attempts.delete(attemptKey)
             lastReflectedMsgId.set(sessionId, lastUserMsgId)
@@ -2543,8 +2509,9 @@ Continue now.`
             }
             // Clear the session goal too: leaving it in state keeps mode/goal
             // bookkeeping alive for a condition that is already satisfied.
-            const achievedState: any = { ...sup, mode: "reflection", autopilot: false, goal: t.goal }
-            await supervisorStore.save(directory, sessionId, achievedState)
+            await supervisorStore.mutate(directory, sessionId, (s) => {
+              s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+            })
             try {
               await supervisorStore.clearGoal(directory, sessionId)
             } catch (e: any) {
@@ -2833,7 +2800,10 @@ Continue now.`
         // injected. If any earlier recheck early-returned (or promptAsync above
         // threw and returned), pendingGoalContinue was never set / never reached,
         // so goal.attempts stays unchanged — no silent budget loss.
-        if (pendingGoalContinue) await supervisorStore.save(directory, sessionId, pendingGoalContinue)
+        if (pendingGoalContinue) {
+          const pending = pendingGoalContinue
+          await supervisorStore.mutate(directory, sessionId, (s) => { s.goal = pending.goal })
+        }
 
         debug("Supervisor pushed continuation")
 

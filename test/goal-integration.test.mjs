@@ -14,6 +14,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
 import { readProjectGoalHistory } from "../core/goal.mjs"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 
 // ---------------------------------------------------------------------------
 // Test infrastructure
@@ -137,7 +138,6 @@ describe("integration: supervisor goal loop", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-goal-test-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -161,8 +161,7 @@ describe("integration: supervisor goal loop", () => {
     assert.ok(result.includes("Goal set"), `Expected 'Goal set' in result, got: ${result}`)
 
     // Read state file
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.mode, "goal")
     assert.equal(state.goal.condition, "all tests pass")
@@ -188,8 +187,7 @@ describe("integration: supervisor goal loop", () => {
     assert.ok(result.includes("cleared"), `Expected 'cleared' in result, got: ${result}`)
 
     // Read state file
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.mode, "reflection")
     assert.equal(state.goal, undefined)
@@ -219,8 +217,9 @@ describe("integration: supervisor goal loop", () => {
     const { client, getEphemeralPrompts } = createMockClient(messages)
 
     // Write goal state directly (same pattern as no-model-switch test)
+    ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      statePath(tmpDir, SESSION_ID),
       JSON.stringify({
         mode: "goal",
         autopilot: false,
@@ -271,8 +270,9 @@ describe("integration: supervisor goal loop", () => {
     // Write goal state with attempts already at the default max (16) and a
     // lastTurnKey that matches the current turn, so the per-turn reset does
     // not fire and the cap is genuinely reached.
+    ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      statePath(tmpDir, SESSION_ID),
       JSON.stringify({
         mode: "goal",
         autopilot: false,
@@ -297,8 +297,7 @@ describe("integration: supervisor goal loop", () => {
     // Wait for async processing
     await new Promise(r => setTimeout(r, 5000))
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active at the per-turn cap, got: ${state.goal.status}`)
     assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
@@ -320,8 +319,9 @@ describe("integration: supervisor goal loop", () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
+    ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      statePath(tmpDir, SESSION_ID),
       JSON.stringify({
         mode: "goal",
         autopilot: false,
@@ -342,8 +342,7 @@ describe("integration: supervisor goal loop", () => {
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
     await new Promise(r => setTimeout(r, 5000))
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active after the per-turn reset, got: ${state.goal.status}`)
     assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
@@ -369,8 +368,9 @@ describe("integration: supervisor goal loop", () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
+    ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`),
+      statePath(tmpDir, SESSION_ID),
       JSON.stringify({
         mode: "goal",
         autopilot: false,
@@ -391,8 +391,7 @@ describe("integration: supervisor goal loop", () => {
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
     await new Promise(r => setTimeout(r, 5000))
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "exhausted", `Goal should be exhausted past its deadline, got: ${state.goal.status}`)
     assert.equal(state.mode, "reflection", `Mode should revert to reflection, got: ${state.mode}`)
@@ -468,8 +467,7 @@ describe("integration: supervisor goal loop", () => {
     assert.ok(result.includes(expected), "Reply must echo the truncated condition")
     assert.ok(!result.includes(longCondition), "Reply must NOT echo the untruncated condition")
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal.condition, expected, "Session state must store the truncated condition, matching Goal.md/history")
 
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "Goal.md")

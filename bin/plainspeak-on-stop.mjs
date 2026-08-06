@@ -243,15 +243,33 @@ export function supervisorGoalActive(cwd, sessionId) {
  * supervisor call that materially outlasts that window can still race past.
  */
 export function supervisorRecentlyBlocked(cwd, sessionId, sinceMs) {
-  try {
-    const p = path.join(cwd, SUPERVISOR_STATE_DIR, `verdict_${sessionId}.json`);
-    const st = fs.statSync(p);
-    if (st.mtimeMs < sinceMs - SUPERVISOR_FRESH_EPSILON_MS) return false;
-    const v = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return v?.injected === true;
-  } catch {
-    return false;
+  // Reads the NEW per-session layout first
+  // (.supervisor/sessions/<id>/verdicts.jsonl, append-only, full session id),
+  // falling back to the legacy overwrite-in-place
+  // .supervisor/verdict_<session_id>.json so a session mid-migration — or a
+  // downgraded plugin — is still covered.
+  const candidates = [
+    path.join(cwd, SUPERVISOR_STATE_DIR, 'sessions', sessionId, 'verdicts.jsonl'),
+    path.join(cwd, SUPERVISOR_STATE_DIR, `verdict_${sessionId}.json`),
+  ];
+  for (const p of candidates) {
+    try {
+      const st = fs.statSync(p);
+      if (st.mtimeMs < sinceMs - SUPERVISOR_FRESH_EPSILON_MS) continue;
+      const raw = fs.readFileSync(p, 'utf8');
+      // jsonl: the LAST line is the newest verdict. A single JSON object
+      // (legacy) parses as-is.
+      const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const v = JSON.parse(lines[i]);
+          if (v?.injected === true) return true;
+          break; // newest parseable record decides
+        } catch { /* skip corrupt line, try the one before it */ }
+      }
+    } catch { /* missing/unreadable — try the next candidate */ }
   }
+  return false;
 }
 
 async function sleep(ms) {

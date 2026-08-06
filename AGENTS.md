@@ -111,6 +111,24 @@ The regression guard is a banned-phrase grep over the SHIPPED rubric, plus an eq
 
 **NOT in scope:** `core/patterns.json`. That feeds a DIFFERENT judge (`core/judge-core.mjs`, the Stop classifier) with a DIFFERENT input contract — it still receives `tools_available_inferred` (the tool NAMES used), so its tool-referencing rules are not dead.
 
+### `test/session-store.test.mjs` — per-session state layout, session identity, GC
+
+`core/session-store.mjs` is THE single accessor for per-session machine state. `goalStore` (core/goal.mjs) and `supervisorStore` (opencode/supervisor-impl.ts) are now a behavioural facade and an async-signature adapter over it — not two implementations of one on-disk contract, which is the shape that produced every prior drift bug in this repo.
+
+Layout: `.supervisor/sessions/<full session id>/{state.json,verdicts.jsonl}`. Project CONFIG (`.agents/supervisor/*`) is untouched and is NOT sharded per session. Precedence is unchanged — session > project > shipped.
+
+**The bug.** `.supervisor/current_session` is ONE shared file every Stop hook in the project overwrites, so with two sessions in one repo `/supervisor off` disabled whichever stopped LAST, not the caller's. `bin/supervisor.mjs` now resolves the id as `--session <id>` (unique prefix expanded) → `$SUPERVISOR_SESSION_ID` (exported by the Stop hook from its own stdin `session_id`) → `$CLAUDE_SESSION_ID` → `current_session`, and the fallback is ANNOUNCED with the full id plus a warning naming any other recently-active session. An ambiguous id lists candidates and acts on nothing (exit 1).
+
+**Truncation.** The old `verdict_<sid8>.json` / `<sid8>_<ts>.json` keyed on the session id cut to 8 chars — two sessions sharing a prefix shared one verdict file. The new layout uses the full id; the test asserts two same-prefix ids do not collide.
+
+**Migration.** A legacy-only session (`goals/<sid>.json` + `<sid>_attempts.json` + `verdict_<sid>.json` + `disabled`) is read AND migrated forward on first load. The legacy files are deliberately LEFT IN PLACE — deleting them makes a downgrade silently drop an active goal — and GC reclaims them. Tests assert no goal, retry override, flag or disabled entry is lost.
+
+**Attempts moved into `state.json`, which created a new lost-update path:** the hook read `goalState` before `writeAttemptCounter` ran, then `goalStore.save(…{...goalState, goal})` clobbered the counter written in between. Every whole-state `save()` on a hot path in BOTH runtimes is now `sessionStore.mutate()` / `supervisorStore.mutate()` (locked read-modify-write). `test/goal-per-turn.test.mjs` is the regression guard — it drove `goal.attempts` to 1 instead of 7 on the naive version.
+
+**Concurrency.** Atomic write is temp+rename in the same dir, created 0600 so there is no world-readable window. Atomic write alone is NOT sufficient — it prevents a corrupt file, not a lost update — so `mutate()` serialises read-modify-write behind an O_EXCL lockfile with a 10s stale breaker, and degrades to last-writer-wins rather than blocking a turn.
+
+**GC.** `gcSessions()` drops dirs untouched >30 days, then caps at 200 (oldest first); `maybeGcSessions()` runs it from the Stop hook at most once/day per project, best-effort, never blocking, never touching the live session.
+
 ### `test/e2e-cc.mjs` — Claude Code Stop hook
 
 Real hook entry point: Stop payload on stdin, real transcript jsonl, stdout decision contract. `SUPERVISOR_FAKE_JUDGE` makes it deterministic; `SUPERVISOR_CC_LIVE=1` uses the real judge. The goal-achieved case asserts the session goal is CLEARED (not left as `status:'achieved'`) and that `.supervisor/goal-achieved.log` carries the record — clearing must never be silent.

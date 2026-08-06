@@ -8,8 +8,9 @@
  * callAnthropic → parseSelfAssessmentJson → evaluateSelfAssessment), and
  * injects a continuation prompt when the agent stopped prematurely.
  *
- * Artifacts under <cwd>/.supervisor/: verdict_<sid>.json, <sid>_attempts.json,
- * current_session, disabled, debug.log.
+ * Artifacts under <cwd>/.supervisor/: sessions/<session_id>/{state.json,
+ * verdicts.jsonl}, current_session, disabled, debug.log, health.json.
+ * See core/session-store.mjs — the single accessor for per-session state.
  *
  * Public API (re-exported for unit tests):
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
@@ -33,6 +34,7 @@ import {
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
 import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 import {
@@ -162,56 +164,33 @@ export function computeTurnKey(normalizedMessages) {
 }
 
 export function readAttempts(session_id, cwd, turnKey) {
-  const file = path.join(cwd, STATE_DIR, `${session_id}_attempts.json`);
-  let raw;
+  // Backed by .supervisor/sessions/<session_id>/state.json (core/session-store.mjs),
+  // which transparently migrates the legacy `.supervisor/<sid>_attempts.json`
+  // forward on first read. Same per-turn semantics as before: the count reads
+  // as 0 the moment turnKey moves, because a new real user message means a new
+  // turn and the persisted count belongs to a prior turn's escalation.
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    return sessionStore.readAttempts(cwd, session_id, turnKey);
   } catch {
-    return 0;
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (turnKey != null && parsed.turn_key != null && parsed.turn_key !== turnKey) {
-      // A new real user message means a new turn — the persisted count
-      // belongs to a prior turn's escalation and does not carry over.
-      return 0;
-    }
-    return typeof parsed.count === 'number' ? parsed.count : 0;
-  } catch {
-    debug({ msg: 'attempts_file_corrupt', file }, cwd);
+    debug({ msg: 'attempts_read_failed', session_id }, cwd);
     return 0;
   }
 }
 
 export function writeAttemptCounter(session_id, n, cwd, turnKey) {
-  const dir = path.join(cwd, STATE_DIR);
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${session_id}_attempts.json`);
-  let existingCount = 0;
-  let existingTurnKey;
+  // Monotonic within a turn; a new turn resets the comparison. Serialised
+  // read-modify-write + atomic temp+rename live in core/session-store.mjs.
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (typeof parsed.count === 'number') existingCount = parsed.count;
-    existingTurnKey = parsed.turn_key;
+    sessionStore.writeAttempts(cwd, session_id, n, turnKey);
   } catch {
-    /* missing or corrupt — treat as 0 */
+    debug({ msg: 'attempts_write_failed', session_id }, cwd);
   }
-  // A new turn means the previous count doesn't apply — the monotonic dedup
-  // guard below must not compare against a stale count from an earlier human
-  // turn, or the new turn's first write would be silently dropped.
-  const turnChanged = turnKey != null && existingTurnKey != null && existingTurnKey !== turnKey;
-  if (!turnChanged && n <= existingCount) return;
-  const tmp = path.join(dir, `${session_id}_attempts.${process.pid}.tmp`);
-  const record = { count: n, last_iso: new Date().toISOString() };
-  if (turnKey != null) record.turn_key = turnKey;
-  fs.writeFileSync(tmp, JSON.stringify(record), 'utf8');
-  fs.renameSync(tmp, file);
 }
 
 export function writeVerdict(session_id, verdictObj, cwd) {
-  const dir = path.join(cwd, STATE_DIR);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `verdict_${session_id}.json`), JSON.stringify(verdictObj, null, 2), 'utf8');
+  // Append-only .supervisor/sessions/<session_id>/verdicts.jsonl, replacing
+  // the overwrite-in-place `.supervisor/verdict_<sid>.json`.
+  sessionStore.appendVerdict(cwd, session_id, verdictObj);
 }
 
 /**
@@ -750,9 +729,22 @@ async function main() {
   const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
 
   // 1.5. Session-scoped disable check + record current session.
+  //
+  // `current_session` is still written, but it is now only a LAST-RESORT hint
+  // for interactive CLI use. It is a single shared file every session in the
+  // project overwrites, so with two concurrent sessions it names whichever
+  // stopped last — `/supervisor off` used to disable the wrong one. The
+  // authority is the `session_id` on this hook's stdin payload, which is
+  // exported below so any child process (including bin/supervisor.mjs) reads
+  // the CALLER's session, not the last writer's.
   const stateDir = path.join(cwd, STATE_DIR);
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(stateDir, 'current_session'), session_id, 'utf8');
+  process.env.SUPERVISOR_SESSION_ID = session_id;
+  // Retention sweep for per-session dirs. Throttled to once a day per project
+  // and fully best-effort — it must never block or fail a turn, and it never
+  // touches the live session.
+  try { maybeGcSessions(cwd, { protect: session_id }); } catch { /* best effort */ }
   const disabledFlag = path.join(stateDir, 'disabled');
   try {
     const disabledIds = fs.readFileSync(disabledFlag, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -805,7 +797,11 @@ async function main() {
       if (turnKey != null && (goal.lastTurnKey !== turnKey || goal.attempts !== attempts)) {
         goal = { ...goal, lastTurnKey: turnKey, attempts };
         goalState = { ...goalState, goal };
-        try { goalStore.save(cwd, session_id, goalState); } catch { /* best effort */ }
+        // mutate(), never save(): `goalState` was read before the attempt
+        // counter was touched, and attempts now live in the SAME state.json.
+        // A blind overwrite here would silently clobber the counter written
+        // by writeAttemptCounter — a lost update inside one process.
+        try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = goal; }); } catch { /* best effort */ }
       }
     } else if (mode === 'autopilot') {
       // Autopilot gets the higher budget (default 16), not the bare 3.
@@ -870,7 +866,7 @@ async function main() {
   function finishExhaustedGoal(t, baseRecord) {
     const deadlineHit = t.reason === 'deadline';
     if (deadlineHit) {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
     }
     writeVerdict(session_id, { ...baseRecord, goal: deadlineHit ? 'exhausted' : 'turn_budget_spent' }, cwd);
     debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
@@ -1139,7 +1135,7 @@ async function main() {
       reason: analysis.reason,
     });
     if (t.action === 'achieved') {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
       // An achieved goal must DIE: persisting status:'achieved' alone left
       // .agents/supervisor/Goal.md (or goal.md) on disk, so the next session
       // re-read it and the goal resurrected forever.
@@ -1181,7 +1177,7 @@ async function main() {
     if (!analysis.requiresHumanAction) {
       const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
       verdictRecord.feedback_reason = 'goal_continue';

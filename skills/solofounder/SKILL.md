@@ -67,7 +67,7 @@ separate `solofounder` supervisor mode any more — everything that made one dif
 the judge as a mandatory completion requirement) is now goal mode's default. This skill
 is the prompt-level layer on top: it arms a goal whose condition is the $1M ARR
 done-bar. Goal state lives in `.agents/supervisor/Goal.md` plus the per-session store
-under `.supervisor/goals/`. On every turn-end the hook judges the reply against that
+under `.supervisor/sessions/<sessionId>/state.json`. On every turn-end the hook judges the reply against that
 condition and — if unmet — forces a continuation instead of letting the agent stop.
 That hook IS the persistence motor; there is no separate `.autopilot/` engine to arm and
 no `active`/heartbeat file to write. Arming the goal below is a real tool call you make

@@ -26,6 +26,7 @@ import {
   stripStatusDirective,
 } from "../core/status-directive.mjs"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
+import { sessionStore } from "../core/session-store.mjs"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 const ACTIVE_SESSION_ID = "ses_composition123"
@@ -216,8 +217,7 @@ function writeState(dir, sessionId, state) {
 }
 
 function readState(dir, sessionId) {
-  const p = join(dir, ".supervisor", "goals", `${sessionId}.json`)
-  return existsSync(p) ? JSON.parse(readFileSync(p, "utf-8")) : {}
+  return sessionStore.load(dir, sessionId)
 }
 
 describe("autopilot nudge honours /supervisor:status off (opencode runtime)", () => {

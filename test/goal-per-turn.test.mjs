@@ -30,6 +30,7 @@ import {
   parseSupervisorCommand,
 } from '../core/goal.mjs';
 import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
+import { statePath, verdictsPath, sessionStore } from '../core/session-store.mjs';
 
 const mkcwd = () => fs.mkdtempSync(path.join(tmpdir(), 'sup-goal-turn-'));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -104,7 +105,7 @@ function mkTranscript(tmp, turns, name) {
 }
 
 function loadGoalState(tmp, sid) {
-  const p = path.join(tmp, '.supervisor', 'goals', `${sid}.json`);
+  const p = statePath(tmp, sid);
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
@@ -184,9 +185,11 @@ test(
 // cap with an active goal emits a real `turn_budget_spent` verdict (rather
 // than exiting silently) while leaving the goal active.
 
+/** Newest record from the append-only verdict log. */
 function loadVerdict(tmp, sid) {
-  const p = path.join(tmp, '.supervisor', `verdict_${sid}.json`);
-  return JSON.parse(fs.readFileSync(p, 'utf8'));
+  const v = sessionStore.lastVerdict(tmp, sid);
+  assert.ok(v, `no verdict recorded for ${sid} at ${verdictsPath(tmp, sid)}`);
+  return v;
 }
 
 test(
@@ -212,9 +215,7 @@ test(
     }
 
     // The single counter: goal.attempts must equal the file counter exactly.
-    const fileAttempts = JSON.parse(
-      fs.readFileSync(path.join(d, '.supervisor', `${sid}_attempts.json`), 'utf8')
-    ).count;
+    const fileAttempts = sessionStore.readAttempts(d, sid);
     assert.equal(fileAttempts, 7, 'file counter should be at the per-turn cap');
     assert.equal(
       loadGoalState(d, sid).goal.attempts, fileAttempts,

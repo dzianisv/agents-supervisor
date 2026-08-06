@@ -11,6 +11,7 @@ import {
   endsWithTrailingQuestion, computeTurnKey, buildFakeAssessment,
 } from '../bin/supervisor-on-stop.mjs';
 import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
+import { verdictsPath } from '../core/session-store.mjs';
 
 // Project root — used by new tests that must not write to /tmp.
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -127,7 +128,7 @@ test('readAttempts: turnKey passed against a file with no turn_key on disk is tr
 test('writeVerdict writes parseable json under .supervisor/', () => {
   const d = mkcwd();
   writeVerdict('s2', { category: 'summary_drift_stop', injected: true }, d);
-  const v = JSON.parse(fs.readFileSync(path.join(d, '.supervisor', 'verdict_s2.json'), 'utf8'));
+  const v = JSON.parse(fs.readFileSync(verdictsPath(d, 's2'), 'utf8'));
   assert.equal(v.category, 'summary_drift_stop');
   assert.equal(v.injected, true);
 });

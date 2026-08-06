@@ -20,9 +20,10 @@ Report the current supervisor state for this project.
      files are actually present.
    - Category list + inject categories currently in effect.
    - Pattern provenance (dataset size / premature %).
-   - Recent verdicts from `.supervisor/verdict_*.json` (last few), with category +
-     whether an inject fired.
-   - Whether the current session id is in `.supervisor/disabled`.
+   - Recent verdicts from `.supervisor/sessions/<id>/verdicts.jsonl` (last few,
+     newest first across sessions), with category + whether an inject fired.
+   - Which session id it resolved and WHERE that id came from.
+   - Whether that session id is in `.supervisor/disabled`.
 
 2. Summarize concisely for the user. If they asked to turn the supervisor on/off,
    tell them: `/supervisor:off` to disable this session, `/supervisor:on` to re-enable.

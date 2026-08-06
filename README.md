@@ -206,8 +206,8 @@ agent is not allowed to stop until the goal is met. While a goal is active the r
 budget rises to 16 per human turn (vs 3 normally) — on Claude Code the Stop hook
 clamps that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), so 16 requested
 means 7 effective there. State is per-session at
-`.supervisor/goals/<sessionId>.json` (mode 0600); budget is spent only when a
-continuation actually fires.
+`.supervisor/sessions/<sessionId>/state.json` (mode 0600); budget is spent only
+when a continuation actually fires.
 
 In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 
@@ -273,7 +273,7 @@ For web app / OpenCode API, call tools directly:
 - **Destructive-action flagging**: force-push, hard reset, history rewrite, branch deletion, `rm -rf`, and unapproved spend are flagged to the user for approval instead of being nudged
 - **Tool-activity telemetry**: a bounded, non-binding note (read/write tool-call counts) may be appended to the nudge as factual context — it never itself decides completion or emits a stop verdict
 
-State is per-session at `.supervisor/goals/<sessionId>.json`. When the budget
+State is per-session at `.supervisor/sessions/<sessionId>/state.json`. When the budget
 exhausts, autopilot disables itself automatically.
 
 ## How it decides
@@ -376,7 +376,7 @@ this corpus the cheap mode misses seven of every eight.
 
 Safety rails:
 - **Never fights supervisor.** Defers if a supervisor goal/autopilot is
-  active, and again if `.supervisor/verdict_<session_id>.json` shows
+  active, and again if `.supervisor/sessions/<session_id>/verdicts.jsonl` shows
   supervisor just blocked this same turn. Finishing the work beats polishing
   the prose.
 - **One rewrite per turn.** Hard cap, persisted under `.plainspeak/`. A second

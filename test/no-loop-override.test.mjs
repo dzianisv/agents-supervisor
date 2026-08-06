@@ -26,6 +26,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 
 const ACTIVE_SESSION_ID = "ses_loopcheck123"
 const EPHEMERAL_PREFIX = "ses_judge_loop_"
@@ -141,7 +142,6 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-autopilot-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -149,8 +149,9 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
     const messages = makeLoopyMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeIncompleteAssessment())
 
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${ACTIVE_SESSION_ID}.json`),
+      statePath(tmpDir, ACTIVE_SESSION_ID),
       JSON.stringify({ mode: "autopilot", autopilot: true })
     )
 
@@ -177,7 +178,6 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-reflection-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -231,8 +231,9 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     // activity. Turning it off here keeps this test about one thing: whether
     // loop-like TELEMETRY can override a "complete" verdict. It must not.
     // The status path's own behaviour is covered by the next test.
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${ACTIVE_SESSION_ID}.json`),
+      statePath(tmpDir, ACTIVE_SESSION_ID),
       JSON.stringify({ statusDiagram: false })
     )
 
