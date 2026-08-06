@@ -21,6 +21,7 @@ import {
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
   readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
+  isStatusDiagramEnabled,
 } from "../core/goal.mjs"
 import {
   isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
@@ -41,6 +42,12 @@ import {
   parseSelfAssessmentJson,
 } from "../core/assessment.mjs"
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from "../core/feedback.mjs"
+import {
+  appendStatusDirective,
+  appendStatusDirectiveToSystem,
+  checkStatusCompliance,
+  buildStatusCorrectionMessage,
+} from "../core/status-directive.mjs"
 import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
 import {
   extractLastAssistantText, findLastRelevantUserIndex, splitUserTurns,
@@ -268,7 +275,34 @@ export interface SupervisorState {
   mode?: SupervisorMode
   autopilot?: boolean        // autopilot mode: skip judge, always continue
   autoreview?: boolean       // cross-model review: gate behind explicit opt-in
+  /**
+   * status.md / roadmap directive. ABSENT MEANS ON — the flag exists only to
+   * turn the feature OFF, so every session that predates it (and every
+   * session that never touches the toggle) keeps the directive. Read it
+   * through isStatusDiagramEnabled(), never as a bare truthiness test.
+   */
+  statusDiagram?: boolean
+  /**
+   * The project directory this session works in, as resolved from its own
+   * transcript (`info.path.cwd` — see core/session-context.mjs).
+   *
+   * Persisted so the chat-system hook can scope its .supervisor/disabled
+   * lookup correctly WITHOUT depending on a warm in-memory cache. The cache
+   * empties on every server restart, and a restarted server would then read
+   * the wrong project's disabled file for every pre-existing session.
+   */
+  projectDir?: string
 }
+
+/**
+ * Default-on gate for the status directive. `undefined` (never toggled) and
+ * `true` both mean on; only an explicit `false` disables it.
+ *
+ * Re-exported from core/goal.mjs rather than reimplemented: the Claude Code
+ * hook reads the same on-disk key through the core copy, and two independent
+ * implementations of a default-ON flag drift into a default-OFF one silently.
+ */
+export { isStatusDiagramEnabled }
 
 function supervisorDir(directory: string): string {
   return join(directory, ".supervisor", "goals")
@@ -361,6 +395,13 @@ export const supervisorStore = {
   async setAutoreview(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
     const state = await supervisorStore.load(directory, sessionId)
     state.autoreview = enabled
+    await supervisorStore.save(directory, sessionId, state)
+    return state
+  },
+
+  async setStatusDiagram(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    const state = await supervisorStore.load(directory, sessionId)
+    state.statusDiagram = enabled
     await supervisorStore.save(directory, sessionId, state)
     return state
   },
@@ -720,6 +761,38 @@ function getLastRelevantUserMessageId(messages: any[]): string | null {
     }
   }
   return null
+}
+
+/**
+ * Epoch-ms start of the current HUMAN turn: the `time.created` of the last
+ * user message that is not a supervisor injection (same "relevant user
+ * message" rule as getLastRelevantUserMessageId, so the two always agree on
+ * which turn they mean).
+ *
+ * Returns 0 when it cannot be determined. Callers must treat 0 as "unknown"
+ * and degrade permissively — see checkStatusCompliance in
+ * core/status-directive.mjs, which lets any existing status.md count as fresh
+ * in that case rather than nagging on a guess.
+ */
+export function getLastRelevantUserMessageTime(messages: any[]): number {
+  if (!Array.isArray(messages)) return 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg?.info?.role !== "user") continue
+    let isSupervisor = false
+    for (const part of msg.parts || []) {
+      if (part.type === "text" && part.text) {
+        if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) {
+          isSupervisor = true
+          break
+        }
+      }
+    }
+    if (isSupervisor) continue
+    const created = msg?.info?.time?.created
+    return typeof created === "number" && Number.isFinite(created) ? created : 0
+  }
+  return 0
 }
 
 function isJudgeSession(sessionId: string, messages: any[], judgeSessionIds: Set<string>): boolean {
@@ -1409,6 +1482,40 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   const activeSupervisors = new Set<string>()
   const recentlyAbortedSessions = new Map<string, number>()
   const attempts = new Map<string, number>()
+  /**
+   * One-shot registry for the "completed but skipped the status checkpoint"
+   * correction: sessionId -> the lastUserMsgId it was already sent for.
+   * Mirrors lastReflectedMsgId's shape and purpose — at most ONE correction
+   * per human turn, ever, so this can never become a loop.
+   */
+  const statusCorrectionSent = new Map<string, string>()
+  /**
+   * sessionId -> the project directory that session is working in.
+   *
+   * A pure read-through cache in front of the DURABLE copy persisted in
+   * SupervisorState.projectDir. It is an optimisation only: every reader must
+   * fall back to the persisted value, because this map is empty after every
+   * server restart and a cache-only lookup would then silently scope the
+   * .supervisor/disabled check to the wrong project.
+   */
+  const sessionDirCache = new Map<string, string>()
+
+  /**
+   * Persist the session -> project-directory mapping so it survives a server
+   * restart. Best-effort and write-avoiding: only touches disk when the value
+   * actually changed, so this costs nothing on the steady-state path.
+   */
+  async function rememberSessionDirectory(sessionId: string, dir: string): Promise<void> {
+    sessionDirCache.set(sessionId, dir)
+    try {
+      const state = await supervisorStore.load(directory, sessionId)
+      if (state.projectDir === dir) return
+      state.projectDir = dir
+      await supervisorStore.save(directory, sessionId, state)
+    } catch (e: any) {
+      debug("failed to persist session projectDir (non-fatal):", e?.message || e)
+    }
+  }
   let toolSupervisorPrompt: string | null = null
   let currentSessionId: string | null = null  // tracks most recent active session for the toggle tool
 
@@ -1473,6 +1580,44 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       const next = lines.filter(l => !sessionMatchesDisabledLine(sessionId, l))
       if (next.length !== lines.length) await writeDisabledLines(dir, next)
     }
+  }
+
+  /**
+   * Gate for the always-on system-prompt injection of the status directive.
+   *
+   * Runs on the hot path of EVERY LLM request, so it must be cheap and must
+   * never call back into the server (it would be re-entering a server that is
+   * mid-request). Order is cheapest-first: in-memory checks before any
+   * filesystem read.
+   *
+   * The session's project directory comes from the DURABLE
+   * SupervisorState.projectDir, read out of the same `supervisorStore.load`
+   * this function already performs — not from the in-memory sessionDirCache,
+   * which is empty after every server restart. A cache-only lookup made this
+   * gate read the SERVER cwd's .supervisor/disabled for every pre-existing
+   * session after a restart, so a session disabled in project A silently
+   * kept getting the directive (and one disabled in the server cwd silently
+   * suppressed it for unrelated projects).
+   *
+   * Returns false — i.e. stays silent — for:
+   *  - requests with no sessionID (opencode also fires this hook for internal
+   *    agent-config generation, which has no session and no user turn),
+   *  - judge/ephemeral sessions the supervisor itself created,
+   *  - sessions listed in .supervisor/disabled,
+   *  - sessions with statusDiagram explicitly turned off.
+   */
+  async function shouldInjectStatusDirective(sessionID: string | undefined): Promise<boolean> {
+    if (!sessionID || typeof sessionID !== "string") return false
+    // Judge/cross-review sessions are registered here for their whole
+    // lifetime (see runSelfAssessment / runCrossModelReview); the
+    // transcript-scanning half of isJudgeSession needs messages we
+    // deliberately do not fetch on this path.
+    if (judgeSessionIds.has(sessionID)) return false
+    const state = await supervisorStore.load(directory, sessionID)
+    if (!isStatusDiagramEnabled(state)) return false
+    const sessionDir = state.projectDir || sessionDirCache.get(sessionID)
+    if (await isSessionDisabled(sessionID, sessionDir)) return false
+    return true
   }
 
   const setSupervisorDescription = "Use this for difficult or complex tasks to set supervisor guidance with a plan/checklist. Provide concrete steps and verification checks so supervisor can validate completion quality and catch missed work."
@@ -1560,7 +1705,23 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.setMode(directory, sid, "reflection")
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
+    // Filler-tolerant, same as the enable-axis above: the runtime may send
+    // `action: ""`/"null" for a request that only carried a mode.
     const action = requestedAction || "status"
+    // Status-directive toggle. Accepted as "status on"/"status off" (what the
+    // /supervisor and /supervisor:status templates route to) plus the
+    // hyphenated spellings, since models normalise inconsistently. Bare
+    // "status" is NOT handled here — it stays the read-only report below.
+    // The plain "off"/"on" actions are NOT handled here: they are the enable
+    // axis and were already dispatched above, before any mode branch.
+    if (action === "status on" || action === "status-on" || action === "statusdiagram on") {
+      await supervisorStore.setStatusDiagram(directory, sid, true)
+      return `Status checkpoint directive ENABLED for session ${sid.slice(0, 8)}…. Every turn will carry the status.md/roadmap instruction, and a completed task that skipped it gets one reminder.`
+    }
+    if (action === "status off" || action === "status-off" || action === "statusdiagram off") {
+      await supervisorStore.setStatusDiagram(directory, sid, false)
+      return `Status checkpoint directive DISABLED for session ${sid.slice(0, 8)}…. No status.md/roadmap instruction will be injected, and completion will not be gated on it.`
+    }
     if (action === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
       return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
@@ -1587,7 +1748,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
     const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
-    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}${goalText}`
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}${goalText}`
   }
 
   // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
@@ -1617,9 +1778,11 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   const resolveSessionDirectoryFor = async (sid: string): Promise<string> => {
     try {
       const { data } = await client.session.messages({ path: { id: sid } })
-      return resolveSessionDirectory(Array.isArray(data) ? data : [], directory)
+      const resolved = resolveSessionDirectory(Array.isArray(data) ? data : [], directory)
+      await rememberSessionDirectory(sid, resolved)
+      return resolved
     } catch {
-      return directory
+      return sessionDirCache.get(sid) ?? directory
     }
   }
 
@@ -1996,6 +2159,7 @@ Do NOT call this tool:
         debug("subagent-gate: supervising root session", sessionId)
 
         const sessionDirectory = resolveSessionDirectory(messages || [], directory)
+        await rememberSessionDirectory(sessionId, sessionDirectory)
         if (sessionDirectory !== directory) {
           debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
         }
@@ -2110,13 +2274,19 @@ Do NOT call this tool:
 
           // Normal autopilot nudge — no judge, no loop verdict, just continue.
           const activityLine = context.toolActivityNote ? `\n${context.toolActivityNote}\n` : ""
-          const nudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
+          const baseNudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
 
 You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
 ${activityLine}
 When you have genuinely completed ALL work (not just one step), call the autopilot_exit tool to hand control back.
 
 Continue now.`
+          // Gated by the same default-on `statusDiagram` flag the Claude Code
+          // hook uses (bin/supervisor-on-stop.mjs), so `/supervisor:status
+          // off` silences the directive on BOTH runtimes. Before this, the
+          // opencode nudge appended it unconditionally and the toggle was a
+          // half-truth.
+          const nudge = isStatusDiagramEnabled(sup) ? appendStatusDirective(baseNudge) : baseNudge
 
           await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${effectiveMaxAttempts})`, "info")
           try {
@@ -2437,6 +2607,11 @@ Continue now.`
         await writeVerdictSignal(directory, sessionId, analysis.complete, analysis.severity)
 
         if (analysis.complete) {
+          // Goal retirement runs FIRST and unconditionally. The status
+          // correction below can early-return, and a goal that survived that
+          // return would re-fire on every future turn and every future
+          // session — the two must not be able to step on each other.
+          //
           // Reflection-mode project goal (no session goal object, so the goal
           // loop above never ran): the condition WAS injected as a MANDATORY
           // completion requirement for this judgement, so complete === the
@@ -2457,6 +2632,62 @@ Continue now.`
               debug("retireProjectGoal failed (non-fatal):", e?.message || e)
             }
           }
+
+          // "Completed but skipped the status checkpoint" correction.
+          //
+          // Runs BEFORE the hard stop below, and is deliberately NOT part of
+          // the attempt budget: it is a one-line chore, not another
+          // continuation attempt, so it must not shorten the retries a real
+          // follow-up turn would get. Bounded by statusCorrectionSent to
+          // exactly ONE injection per human turn — the agent's reply to it
+          // triggers a fresh session.idle, and on that pass the key already
+          // matches, so we fall through to the normal stop whether or not the
+          // agent actually complied. No loop is possible.
+          const statusCorrectionKey = `${sessionId}:${lastUserMsgId}`
+          let correctionInjected = false
+          try {
+            if (
+              statusCorrectionSent.get(sessionId) !== lastUserMsgId &&
+              isStatusDiagramEnabled(sup)
+            ) {
+              // status.md belongs to the SESSION's own project, never the
+              // server cwd this plugin happens to run in (INCIDENT
+              // 2026-07-27 — see resolveProjectGoalForSession above).
+              const compliance = checkStatusCompliance({
+                lastAssistantText,
+                statusFilePath: join(sessionDirectory, "status.md"),
+                turnStartedAtMs: getLastRelevantUserMessageTime(messages || []),
+              })
+              if (!compliance.compliant) {
+                debug("Task complete but status checkpoint missing:", compliance.reason)
+                try {
+                  await client.session.promptAsync({
+                    path: { id: sessionId },
+                    body: { parts: [{ type: "text", text: `${FEEDBACK_MARKER} Status checkpoint\n\n${buildStatusCorrectionMessage()}` }] },
+                  })
+                  correctionInjected = true
+                  await showToast(client, directory, "Task complete — asking for the status checkpoint", "info")
+                } catch (e: any) {
+                  debug("promptAsync failed (status correction):", e?.message || e)
+                  reportError(e, { plugin: "supervisor-3", op: "prompt-status-correction" })
+                }
+              }
+            }
+          } catch (e: any) {
+            // Never let this gate change whether a completed task stops.
+            debug("status correction check failed:", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "status-correction-check" })
+          }
+
+          if (correctionInjected) {
+            statusCorrectionSent.set(sessionId, lastUserMsgId)
+            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            attempts.delete(attemptKey)
+            debug("Supervisor injected status checkpoint correction for", statusCorrectionKey)
+            return
+          }
+
+
           attempts.delete(attemptKey)
           lastReflectedMsgId.set(sessionId, lastUserMsgId)
           await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
@@ -2562,7 +2793,9 @@ Continue now.`
             // "Missing: fix build errors" as if both were this turn's fault.
             goal_condition: goal?.condition || injectedProjectGoalCondition || "",
           },
-          effectiveMaxAttempts
+          effectiveMaxAttempts,
+          // `/supervisor:status off` must silence the reflection path too.
+          { statusDirective: isStatusDiagramEnabled(sup) }
         )
 
         // Last-resort guard: never inject a message whose body is empty after
@@ -2627,13 +2860,15 @@ Continue now.`
       cfg.command = {
         ...(cfg.command || {}),
         supervisor: {
-          description: "Control the supervisor: status | on | off | reflection | autopilot | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
+          description: "Control the supervisor: status | status on|off | on | off | reflection | autopilot | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
           template: `Execute this supervisor command by calling the supervisor tool with the appropriate arguments.
 
 Command: "{{input}}"
 
 Routing rules:
 - empty or "status" → supervisor({ action: "status" })
+- "status on" → supervisor({ action: "status on" })
+- "status off" → supervisor({ action: "status off" })
 - "on" → supervisor({ action: "on" })
 - "off" → supervisor({ action: "off" })
 - "reflection" → supervisor({ mode: "reflection" })
@@ -2654,6 +2889,43 @@ Call the tool now. Do not explain, just execute the tool call.`
     },
     "tool.execute.before": async (input: { tool?: string; sessionID?: string }) => {
       currentSessionId = trackSessionScopedToolSession(currentSessionId, input)
+    },
+    /**
+     * Always-on status-directive injection.
+     *
+     * Registered under the FLAT dotted key, not a nested
+     * `experimental.chat.system.transform` object: opencode 1.17.9 resolves
+     * plugin hooks with a literal `hooks[name]` lookup
+     * (`Plugin.triggerFor` in the bundled runtime), so a nested object is
+     * never found. Verified empirically against a real `opencode serve` —
+     * the flat key fires with `(input, output)` where
+     * `input = {sessionID, model}` and `output = {system: string[]}`.
+     *
+     * Why this exists at all: the supervisor's other injection points
+     * (autopilot nudge, reflection feedback) only ride along on turns the
+     * supervisor itself pushes, which by definition excludes the FIRST turn
+     * of a session — the turn that establishes the roadmap. This closes that
+     * gap.
+     *
+     * Contract: never throw. This runs inside the user's own request; a
+     * failure here must degrade to "no directive", never to a broken turn.
+     */
+    "experimental.chat.system.transform": async (
+      input: { sessionID?: string; model?: unknown },
+      output: { system?: string[] }
+    ) => {
+      try {
+        if (!Array.isArray(output?.system)) return
+        if (!(await shouldInjectStatusDirective(input?.sessionID))) return
+        // Idempotent by marker — this hook fires more than once per user turn
+        // on opencode 1.17.9, and system arrays may be reused.
+        if (appendStatusDirectiveToSystem(output.system)) {
+          debug("status directive injected into system prompt for", input?.sessionID?.slice(0, 8))
+        }
+      } catch (e: any) {
+        debug("status directive injection failed:", e?.message || e)
+        reportError(e, { plugin: "supervisor-3", op: "status-directive-system" })
+      }
     },
     tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),

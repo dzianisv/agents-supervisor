@@ -173,7 +173,7 @@ check('attempt cap → stops injecting after max attempts', () => {
 });
 
 // ── Goal loop (Claude Code side) ──────────────────────────────────────────
-import { goalStore } from '../core/goal.mjs';
+import { goalStore, readGoalAchievedLog } from '../core/goal.mjs';
 
 check('goal active + judge complete → goal achieved, no inject', () => {
   const { dir, tp } = mkSession(completeTurns);
@@ -184,7 +184,18 @@ check('goal active + judge complete → goal achieved, no inject', () => {
   assert.equal(code, 0);
   assert.equal(stdout, '', 'no inject when goal achieved');
   assert.equal(verdict?.goal, 'achieved');
-  assert.equal(goalStore.load(dir, sid).goal.status, 'achieved');
+  // An achieved goal must DIE, not linger as status:'achieved'. Leaving it in
+  // the session store kept mode/goal bookkeeping alive for a condition that
+  // was already satisfied, and the project file resurrected it in the next
+  // session. The session goal is therefore cleared outright.
+  assert.equal(goalStore.load(dir, sid).goal, undefined, 'session goal must be cleared, not left as achieved');
+  // Clearing it must never be silent: the achievement is recorded durably in
+  // .supervisor/goal-achieved.log BEFORE anything is removed.
+  const log = readGoalAchievedLog(dir);
+  assert.ok(
+    log.some((r) => r.condition === 'the answer is given'),
+    `achievement must be recorded durably. goal-achieved.log was:\n${JSON.stringify(log)}`
+  );
 });
 
 check('goal active + premature stop → goal-continue inject (mentions goal)', () => {

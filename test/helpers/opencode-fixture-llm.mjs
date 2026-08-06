@@ -47,6 +47,13 @@ export function parseSupervisorRouting(rawText) {
   const lower = withoutSlash.toLowerCase()
 
   if (lower === "" || lower === "status") return { tool: "supervisor", args: { action: "status" } }
+  // Mirrors the "status on"/"status off" rows of the real routing table in
+  // opencode/supervisor-impl.ts's `/supervisor` command template. Must be
+  // tested BEFORE the bare "status" case above would otherwise swallow them —
+  // it does not, since that case is an exact match, but keeping them adjacent
+  // makes the precedence obvious.
+  if (lower === "status on") return { tool: "supervisor", args: { action: "status on" } }
+  if (lower === "status off") return { tool: "supervisor", args: { action: "status off" } }
   if (lower === "on") return { tool: "supervisor", args: { action: "on" } }
   if (lower === "off") return { tool: "supervisor", args: { action: "off" } }
   if (lower === "reflection") return { tool: "supervisor", args: { mode: "reflection" } }
@@ -81,10 +88,21 @@ function lastTextContent(messages) {
 
 /**
  * Start the fixture server on an ephemeral local port.
- * @returns {Promise<{ port: number, baseURL: string, close: () => Promise<void> }>}
+ *
+ * Every inbound chat-completions request is recorded (`getRequests()`) so a
+ * test can inspect what ACTUALLY reached the model — most importantly the
+ * resolved `system` messages. That is the only end-to-end observable for the
+ * `experimental.chat.system.transform` hook on opencode 1.17.9: the runtime
+ * does not persist `AssistantMessage.system` over the REST API (the SDK .d.ts
+ * declares the field, the server does not populate it), so asserting on the
+ * transcript would silently prove nothing.
+ *
+ * @returns {Promise<{ port: number, baseURL: string, getRequests: () => object[], getSystemPrompts: () => string[], close: () => Promise<void> }>}
  */
 export function startFixtureLlmServer() {
   let counter = 0
+  /** @type {object[]} every parsed chat-completions body, in arrival order. */
+  const requests = []
 
   const server = createServer((req, res) => {
     let body = ""
@@ -104,6 +122,7 @@ export function startFixtureLlmServer() {
       } catch {
         data = {}
       }
+      requests.push(data)
       const messages = Array.isArray(data.messages) ? data.messages : []
       const last = messages[messages.length - 1]
       const hasTools = Array.isArray(data.tools) && data.tools.length > 0
@@ -254,6 +273,23 @@ export function startFixtureLlmServer() {
       resolve({
         port,
         baseURL: `http://127.0.0.1:${port}/v1`,
+        /** Every chat-completions body received, in arrival order. */
+        getRequests: () => requests.slice(),
+        /**
+         * The concatenated `system`-role content of every request received.
+         * One entry per request, so a test can assert per-turn.
+         */
+        getSystemPrompts: () =>
+          requests.map((r) =>
+            (Array.isArray(r?.messages) ? r.messages : [])
+              .filter((m) => m?.role === "system")
+              .map((m) => (typeof m?.content === "string"
+                ? m.content
+                : Array.isArray(m?.content)
+                  ? m.content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("\n")
+                  : ""))
+              .join("\n")
+          ),
         close: () => new Promise((r) => server.close(() => r())),
       })
     })

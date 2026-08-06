@@ -499,6 +499,84 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     })
   })
 
+  // Proves the always-on status-directive injection works against the REAL
+  // opencode runtime, not just against our own idea of the hook contract.
+  //
+  // This is the one thing that could not be established by reading types:
+  // `@opencode-ai/plugin`'s shipped .d.ts (0.5.29) does not declare
+  // `experimental.chat.system.transform` at all, and opencode 1.17.9 resolves
+  // plugin hooks by a literal `hooks[name]` lookup — so the hook must be
+  // registered under the FLAT dotted key, and a nested
+  // `{experimental:{chat:{system:{transform}}}}` object is silently ignored.
+  // Verified empirically before it was written; this test keeps it verified.
+  //
+  // Observed at the fixture LLM, i.e. on the wire, because opencode 1.17.9
+  // does NOT expose the resolved system prompt over the REST API (it never
+  // populates `AssistantMessage.system` in the transcript response). Asserting
+  // on the transcript would therefore pass vacuously; asserting on what the
+  // model actually received cannot.
+  describe("status directive system-prompt injection", () => {
+    const MARKER = "<!-- supervisor:status-directive -->"
+
+    test("directive reaches the model on the FIRST turn, exactly once", { timeout: 300_000 }, async () => {
+      const before = fixtureLlm.getSystemPrompts().length
+
+      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+      assert.equal(createRes.status, 200)
+      const session = await createRes.json()
+
+      // The very first turn of the session — the one the supervisor's
+      // continuation-prompt path can never reach, which is the whole reason
+      // this hook exists.
+      await sendMessage(baseUrl, session.id, "Say hello.", 120_000, { model })
+
+      const systems = fixtureLlm.getSystemPrompts().slice(before)
+      assert.ok(systems.length > 0, "expected at least one model call for this turn")
+
+      const withMarker = systems.filter((s) => s.includes(MARKER))
+      assert.ok(
+        withMarker.length > 0,
+        `status directive never reached the model — the hook did not fire. System prompts seen:\n${systems.map((s) => s.slice(0, 300)).join("\n---\n")}`
+      )
+
+      // Idempotency, for real: opencode fires this hook more than once per
+      // user turn, so a naive push would duplicate the directive.
+      for (const s of withMarker) {
+        const copies = s.split(MARKER).length - 1
+        assert.equal(copies, 1, `status directive appears ${copies}x in one system prompt; must appear exactly once`)
+      }
+
+      // The directive's payload must actually be there, not just the marker.
+      assert.ok(withMarker[0].includes("ROADMAP"), "directive body (ROADMAP block) missing")
+      assert.ok(withMarker[0].includes("status.md"), "directive body (status.md instruction) missing")
+    })
+
+    test("/supervisor status off suppresses the directive for that session", { timeout: 300_000 }, async () => {
+      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
+      assert.equal(createRes.status, 200)
+      const session = await createRes.json()
+
+      const offRes = await sendMessage(baseUrl, session.id, "/supervisor status off", 120_000, { model })
+      const offContent = JSON.stringify(offRes).toLowerCase()
+      assert.ok(
+        offContent.includes("disabled") || offContent.includes("status"),
+        `Expected the toggle to acknowledge. Got: ${JSON.stringify(offRes).slice(0, 500)}`
+      )
+
+      // Only look at calls made AFTER the toggle landed.
+      const before = fixtureLlm.getSystemPrompts().length
+      await sendMessage(baseUrl, session.id, "Say hello again.", 120_000, { model })
+      const systems = fixtureLlm.getSystemPrompts().slice(before)
+      assert.ok(systems.length > 0, "expected at least one model call after the toggle")
+      for (const s of systems) {
+        assert.ok(
+          !s.includes(MARKER),
+          "status directive was injected even though /supervisor status off was set for this session"
+        )
+      }
+    })
+  })
+
   describe("autopilot mode", () => {
     // Uses the suite-level fixture `model` — no cooldown needed since the
     // fixture is local and instantaneous (no remote rate limiting to avoid).

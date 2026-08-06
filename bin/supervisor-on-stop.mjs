@@ -32,7 +32,8 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal } from '../core/goal.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 import {
   extractLastAssistantText, splitUserTurns, buildTurnEvidence, userMessageText,
@@ -923,7 +924,12 @@ async function main() {
     }
     const nextAttempt = attempts + 1;
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-    const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    // Parity with the OpenCode autopilot nudge (opencode/supervisor-impl.ts):
+    // the status/roadmap directive rides along with EVERY continuation, on
+    // both runtimes. Gated by the same default-on `statusDiagram` flag, so
+    // `/supervisor:status off` silences it here too.
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
     debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt }, cwd);
@@ -1087,6 +1093,10 @@ async function main() {
         goal_condition: goal?.condition || injectedProjectGoalCondition || '',
       },
       effectiveMax,
+      // Same default-on flag the autopilot nudge above honours, so
+      // `/supervisor:status off` silences BOTH continuation paths, not just
+      // one of them.
+      { statusDirective: isStatusDiagramEnabled(goalState) },
     );
   }
 

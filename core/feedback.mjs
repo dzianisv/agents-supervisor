@@ -1,5 +1,6 @@
 import { FEEDBACK_MARKER } from './evaluation.mjs'
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+import { appendStatusDirective, stripStatusDirective } from './status-directive.mjs'
 
 // Items matching any of these must never be presented as ordinary
 // agent-actionable work. Force-pushes, hard resets, history rewrites, branch
@@ -57,10 +58,15 @@ export function isActionlessVerdict(verdict) {
  */
 export function hasFeedbackBody(text) {
   if (typeof text !== 'string') return false
+  // The status/roadmap directive is appended to EVERY continuation message.
+  // It is boilerplate, not verdict content, so it must be removed before the
+  // body check — otherwise this guard can never return false and becomes
+  // dead code (which is exactly what the status-directive merge did to it).
+  const withoutDirective = stripStatusDirective(text)
   // The standing-goal section is context, never a per-turn gap, so it must
   // not by itself make a message look like it has something to say.
-  const goalIdx = text.indexOf(GOAL_SECTION_HEADING)
-  const perTurn = goalIdx === -1 ? text : text.slice(0, goalIdx)
+  const goalIdx = withoutDirective.indexOf(GOAL_SECTION_HEADING)
+  const perTurn = goalIdx === -1 ? withoutDirective : withoutDirective.slice(0, goalIdx)
   const body = perTurn
     .split('\n')
     .slice(1) // line 0 is the headline
@@ -81,12 +87,19 @@ export function hasFeedbackBody(text) {
  * core/evaluation.mjs's describeToolActivity, threaded into the judge prompt
  * via TaskContext.toolActivityNote) — it just never bypasses this function's
  * output.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.statusDirective=true] append the status/roadmap
+ *   directive. Defaults ON (the directive is default-on); callers pass
+ *   `isStatusDiagramEnabled(state)` so `/supervisor:status off` silences the
+ *   reflection path too, not just the autopilot nudge.
  */
 export function buildEscalatingFeedback(
   attemptCount,
   severity,
   verdict,
-  maxAttempts
+  maxAttempts,
+  opts = {}
 ) {
   const safeVerdict = verdict ?? {}
   // A standing goal is a long-lived project/session condition, NOT something
@@ -132,11 +145,15 @@ export function buildEscalatingFeedback(
     ? 'This assessment was not fully confident — if these are already handled, say so; otherwise please continue.'
     : 'Please address these issues and continue.'
 
-  return `${headline}
+  // The status/roadmap directive is appended LAST so it survives as the final
+  // instruction the agent reads — it is orthogonal to the judge's verdict and
+  // never replaces or reorders it.
+  const rendered = `${headline}
 ${feedbackStr}
 ${missing}
 ${nextActions}
 ${goalSection}
 
 ${closing}`
+  return opts?.statusDirective === false ? rendered : appendStatusDirective(rendered)
 }
