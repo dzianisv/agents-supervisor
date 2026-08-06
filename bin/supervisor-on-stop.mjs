@@ -34,6 +34,10 @@ import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback } from '../core/feedback.mjs';
 import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
+import {
+  extractLastAssistantText, splitUserTurns, buildTurnEvidence, userMessageText,
+} from '../core/task-context.mjs';
+import { shouldSkipReflection } from '../core/turn-classifier.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -570,31 +574,25 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
       ? normalizedMessages
       : normalizeTranscriptToMessages(normalizedMessages ?? []);
   const humanMessages = [];
-  let lastAssistantText = '';
 
   for (const msg of messages) {
     if (msg.info?.role === 'user') {
-      for (const part of msg.parts ?? []) {
-        if (part.type === 'text' && part.text) {
-          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
-          if (part.text.trim().startsWith('<task-notification>')) continue; // async notification metadata, not user task instructions
-          humanMessages.push(part.text);
-          break;
-        }
-      }
-    }
-    if (msg.info?.role === 'assistant') {
-      for (const part of msg.parts ?? []) {
-        if (part.type === 'text' && part.text) lastAssistantText = part.text;
-      }
+      const text = userMessageText(msg);
+      if (text != null) humanMessages.push(text);
     }
   }
+  // ONE shared extractor (core/task-context.mjs) — joins every text part of the
+  // last assistant message instead of arbitrarily keeping the first or the last.
+  const lastAssistantText = extractLastAssistantText(messages);
 
   if (humanMessages.length === 0) return null;
 
-  const taskSummary = humanMessages.length === 1
-    ? humanMessages[0]
-    : humanMessages.map((m, i) => `[${i + 1}] ${m}`).join('\n\n');
+  // Demand side split into the live ask vs bounded, already-addressed
+  // background; evidence side widened to the whole current turn INCLUDING tool
+  // results. See core/task-context.mjs for the forensics behind both.
+  const { currentTask, priorContext } = splitUserTurns(humanMessages);
+  const taskSummary = currentTask;
+  const turnEvidence = buildTurnEvidence(messages);
 
   const combinedText = `${humanMessages.join(' ')} ${lastAssistantText}`;
   const taskType = inferTaskType(combinedText);
@@ -621,7 +619,10 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
   const toolsSummary = commands.slice(-6).join('\n') || '(none)';
 
   return {
-    taskSummary, taskType, agentMode, humanMessages,
+    taskSummary, currentTask,
+    priorContext: priorContext || undefined,
+    turnEvidence: turnEvidence || undefined,
+    taskType, agentMode, humanMessages,
     toolsSummary, detectedSignals, recentCommands,
     pushedToDefaultBranch: pushedDefault,
     requiresTests, requiresBuild, requiresPR, requiresCI,
@@ -937,6 +938,20 @@ async function main() {
   const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
   if (!taskContext) {
     debug({ msg: 'no_task_context', session_id }, cwd);
+    process.exit(0);
+  }
+
+  // 5.5. Non-actionable turn gate — a completion judge only makes sense when
+  // the human asked for work. "Stop. Reflect.", "tldr", "thanks", "why did you
+  // stop" previously all ran the full judge as work orders (see
+  // core/turn-classifier.mjs). Bypassed entirely while a goal is active.
+  const turnGate = shouldSkipReflection({
+    text: taskContext.currentTask,
+    hasActiveGoal: !!goal,
+    mode: effectiveMode,
+  });
+  if (turnGate.skip) {
+    debug({ msg: 'non_actionable_turn', session_id, reason: turnGate.reason }, cwd);
     process.exit(0);
   }
 

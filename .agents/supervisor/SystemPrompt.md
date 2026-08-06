@@ -6,8 +6,19 @@ Analyze the task context, the agent's last response, and the tool signals to det
 ## Delivered Media Is Proof
 The supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the visible-media goal from what you actually see. When a "Delivered Media (supervisor-resolved)" note is present instead, treat a delivered artifact (an on-disk path or a SendUserFile delivery receipt with a file_uuid) TOGETHER WITH passing test results (e.g. a test-result JSON showing `OVERALL passed: True`) as VALID proof that a visible-media / "show me a video/screenshot" goal is met — mark such a task `complete`. NEVER instruct the agent to base64-encode, hexdump, or inline media into the chat; media delivery via file/SendUserFile is the correct and sufficient mechanism.
 
+## Current Task
+This is the user's LATEST request. It — and only it — is what you judge.
+
+{{currentTask}}
+
+{{#priorContext}}
+## Prior Context (background only)
+Earlier requests in this session. They were already addressed or superseded by the Current Task above. NEVER list them in `remaining_work`, `next_steps` or `needs_user_action`, and never judge the Current Task against them. They are here purely so you can resolve pronouns and references.
+
+{{priorContext}}
+{{/priorContext}}
+
 ## Task Context
-- Summary: {{taskSummary}}
 - Type: {{taskType}}
 - Mode: {{agentMode}}
 - Heuristic signals (repo checks; informative, not binding): {{requirements}}
@@ -19,8 +30,17 @@ The supervisor resolves media the agent delivered and may attach it directly to 
 ## Tool Commands Run
 {{toolsSummary}}
 
+{{#turnEvidence}}
+## Work Done Since That Request
+This is the agent's actual work on the Current Task: its messages, every tool it called, and each tool's RESULT. Treat it as primary evidence — if a check the rubric asks for was already run here and passed, it is DONE; do not list it as missing.
+
+{{turnEvidence}}
+{{/turnEvidence}}
+
 {{#lastAssistantText}}
 ## Agent's Last Response
+Any `[…truncated by supervisor: …]` marker below is the SUPERVISOR's own length cut, not the agent stopping. Never cite it as evidence that the response was incomplete, cut off, or ended mid-sentence.
+
 {{lastAssistantText}}
 {{/lastAssistantText}}
 

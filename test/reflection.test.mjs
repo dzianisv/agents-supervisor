@@ -65,7 +65,11 @@ describe('interpolateTemplate', () => {
 describe('reflection files exist', () => {
   test('SystemPrompt.md exists with expected markers', () => {
     const content = fs.readFileSync(path.join(SUPERVISOR_DIR, 'SystemPrompt.md'), 'utf-8');
-    assert.ok(content.includes('{{taskSummary}}'), 'missing {{taskSummary}} placeholder');
+    // {{taskSummary}} (the full session history) was replaced by {{currentTask}}
+    // + a clearly-labelled {{priorContext}} block — see core/task-context.mjs.
+    assert.ok(content.includes('{{currentTask}}'), 'missing {{currentTask}} placeholder');
+    assert.ok(content.includes('{{priorContext}}'), 'missing {{priorContext}} placeholder');
+    assert.ok(content.includes('{{turnEvidence}}'), 'missing {{turnEvidence}} placeholder');
     assert.ok(content.includes('## Task Context'), 'missing Task Context section');
     assert.ok(content.includes('## Response Format'), 'missing Response Format section');
     assert.ok(content.includes('{{toolsSummary}}'), 'missing {{toolsSummary}} placeholder');
@@ -98,6 +102,7 @@ describe('prompt assembly', () => {
 
     const vars = {
       taskSummary: sampleContext.taskSummary,
+      currentTask: sampleContext.taskSummary,
       taskType: sampleContext.taskType,
       agentMode: sampleContext.agentMode,
       requirements: requirements.join('; '),
@@ -198,7 +203,12 @@ describe('structural equivalence with old buildSelfAssessmentPrompt', () => {
   // The old buildSelfAssessmentPrompt had these required sections:
   const requiredSections = [
     ['Task Context', /## Task Context/],
-    ['Task Summary var', /\{\{taskSummary\}\}/],
+    // Was {{taskSummary}} — the whole "[1]..[n]" session history. Replaced by
+    // the currentTask / priorContext split (core/task-context.mjs) so the judge
+    // stops treating an earlier, already-handled turn as outstanding work.
+    ['Current Task var', /\{\{currentTask\}\}/],
+    ['Prior Context var (conditional)', /priorContext/],
+    ['Turn evidence var (conditional)', /turnEvidence/],
     ['Task Type var', /\{\{taskType\}\}/],
     ['Agent Mode var', /\{\{agentMode\}\}/],
     ['Requirements var', /\{\{requirements\}\}/],

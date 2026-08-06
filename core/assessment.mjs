@@ -1,5 +1,6 @@
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { loadShipped } from './patterns.mjs'
+import { PROMPT_TEXT_LIMIT, truncateForPrompt } from './task-context.mjs'
 
 /**
  * Pull the "background subagents/tasks still in flight" exemption straight from
@@ -79,7 +80,7 @@ export function parseRubric(md) {
 
 function buildToolSupervisorGuidanceSection(toolSupervisorPrompt) {
   if (!toolSupervisorPrompt) return ''
-  return `\n## Tool Supervisor Guidance\n${toolSupervisorPrompt.slice(0, 4000)}\n`
+  return `\n## Tool Supervisor Guidance\n${truncateForPrompt(toolSupervisorPrompt, PROMPT_TEXT_LIMIT, { keep: 'head', label: 'tool guidance' })}\n`
 }
 
 export function buildSelfAssessmentPrompt(
@@ -105,8 +106,12 @@ export function buildSelfAssessmentPrompt(
 
   const signalSummary = safeContext.detectedSignals.length ? safeContext.detectedSignals.join(', ') : 'none'
 
+  // Explicitly-marked, tail-preserving truncation. A bare slice(0, 4000) here
+  // caused 169 confirmed false "Task Incomplete" verdicts: the judge read the
+  // supervisor's own cut as the AGENT stopping mid-sentence. See
+  // core/task-context.mjs.
   const assistantSection = lastAssistantText
-    ? `\n## Agent's Last Response\n${lastAssistantText.slice(0, 4000)}\n`
+    ? `\n## Agent's Last Response\n${truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: "agent response" })}\n`
     : ''
 
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
@@ -115,13 +120,23 @@ export function buildSelfAssessmentPrompt(
   const attemptSection = currentAttempt > 0
     ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
     : ''
+  const currentTask = safeContext.currentTask || safeContext.taskSummary
+  const priorSection = safeContext.priorContext
+    ? `\n## Prior Context (ALREADY ADDRESSED — background only)\nThese are earlier requests in this session. They have already been handled or superseded. Do NOT list them as missing work, and do NOT judge the current turn against them.\n${safeContext.priorContext}\n`
+    : ''
+  const evidenceSection = safeContext.turnEvidence
+    ? `\n## Work Done Since That Request (this turn's evidence: agent messages + tool calls WITH results)\n${safeContext.turnEvidence}\n`
+    : ''
+
   return `SELF-ASSESS SUPERVISOR
 
 You are evaluating an agent's work against workflow requirements.
 Analyze the task context, the agent's last response, and the tool signals to determine whether the task is complete.
 
+## Current Task (the user's LATEST request — judge ONLY this)
+${currentTask}
+${priorSection}
 ## Task Context
-- Summary: ${safeContext.taskSummary}
 - Type: ${safeContext.taskType}
 - Mode: ${safeContext.agentMode}
 - Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
@@ -129,7 +144,7 @@ Analyze the task context, the agent's last response, and the tool signals to det
 ${safeContext.toolActivityNote ? `- ${safeContext.toolActivityNote}\n` : ''}
 ## Tool Commands Run
 ${safeContext.toolsSummary}
-${assistantSection}${attemptSection}
+${evidenceSection}${assistantSection}${attemptSection}
 ${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ''}Return JSON only:
 {
   "task_summary": "brief description of what was done",
@@ -174,13 +189,20 @@ export function buildJudgePrompt(
   rubric
 ) {
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
+  const currentTask = context.currentTask || context.taskSummary
+  const priorSection = context.priorContext
+    ? `\n## Prior Context (ALREADY ADDRESSED — background only, never missing work)\n${context.priorContext}\n`
+    : ''
+  const evidenceSection = context.turnEvidence
+    ? `\n## Work Done Since That Request (agent messages + tool calls WITH results)\n${context.turnEvidence}\n`
+    : ''
   return `ANALYZE SUPERVISOR
 
 You are validating an agent's self-assessment against workflow requirements.
 
-## Task Summary
-${context.taskSummary}
-
+## Current Task (the user's LATEST request — judge ONLY this)
+${currentTask}
+${priorSection}
 ## Task Type
 ${context.taskType}
 
@@ -193,9 +215,9 @@ ${context.taskType}
 
 ## Tool Signals
 ${context.toolsSummary}
-
+${evidenceSection}
 ## Agent Self-Assessment
-${selfAssessment.slice(0, 4000)}
+${truncateForPrompt(selfAssessment, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'self-assessment' })}
 ${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
 
 Rules:
