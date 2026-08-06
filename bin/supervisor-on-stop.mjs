@@ -36,7 +36,7 @@ import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeH
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 import {
-  extractLastAssistantText, splitUserTurns, buildTurnEvidence, userMessageText,
+  extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
 } from '../core/task-context.mjs';
 import { shouldSkipReflection } from '../core/turn-classifier.mjs';
 
@@ -588,12 +588,13 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
 
   if (humanMessages.length === 0) return null;
 
-  // Demand side split into the live ask vs bounded, already-addressed
-  // background; evidence side widened to the whole current turn INCLUDING tool
-  // results. See core/task-context.mjs for the forensics behind both.
-  const { currentTask, priorContext } = splitUserTurns(humanMessages);
+  // `currentTask` is NOT judge context — it feeds the non-actionable turn gate
+  // and `taskSummary`. The judge reads `conversationChain` only: the plain
+  // alternating conversation, no tool calls / inputs / results. Must stay
+  // identical to buildTaskContext in opencode/supervisor-impl.ts.
+  const currentTask = currentUserTask(humanMessages);
   const taskSummary = currentTask;
-  const turnEvidence = buildTurnEvidence(messages);
+  const conversationChain = buildConversationChain(messages);
 
   const combinedText = `${humanMessages.join(' ')} ${lastAssistantText}`;
   const taskType = inferTaskType(combinedText);
@@ -621,8 +622,7 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
 
   return {
     taskSummary, currentTask,
-    priorContext: priorContext || undefined,
-    turnEvidence: turnEvidence || undefined,
+    conversationChain: conversationChain || undefined,
     taskType, agentMode, humanMessages,
     toolsSummary, detectedSignals, recentCommands,
     pushedToDefaultBranch: pushedDefault,

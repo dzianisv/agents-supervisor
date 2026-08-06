@@ -22,7 +22,7 @@ import { join } from 'node:path'
 import { extractGoalCondition, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt } from './assessment.mjs'
 import { loadParsedRubric, formatRubricMarkdown } from './rubric-loader.mjs'
-import { PROMPT_TEXT_LIMIT, truncateForPrompt } from './task-context.mjs'
+import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
 
 /**
  * Interpolate a simple mustache-like template:
@@ -180,25 +180,42 @@ export async function buildReflectionPrompt({
   const projectGoalCondition = !goalSection ? extractGoalCondition(goalFile) : ''
   const effectiveGoalSection = goalSection || (projectGoalCondition ? buildGoalRequirementSection(projectGoalCondition) : undefined)
 
+  // Judge context. Both runtimes supply a real `conversationChain`; the
+  // fallback synthesizes a one-turn chain so a legacy context (bare
+  // taskSummary + last response) still renders the same shape instead of an
+  // empty judge prompt.
+  const currentTaskText = safeContext.currentTask || safeContext.taskSummary || ''
+  const conversationChain =
+    safeContext.conversationChain ||
+    formatConversationTurns([
+      {
+        user: currentTaskText,
+        assistant: lastAssistantText
+          ? truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'agent response' })
+          : '',
+      },
+    ]) ||
+    undefined
+
   const templateVars = {
-    // Legacy var, kept so pre-existing custom SystemPrompt.md files that use
-    // {{taskSummary}} keep working. It now renders the CURRENT ask only — never
-    // the whole "[1]..[n]" session history that let a 20-turn session's judge
-    // demand turn 1's deliverables on turn 20.
+    // Legacy vars, kept so pre-existing custom SystemPrompt.md files keep
+    // rendering something sensible. Both are the CURRENT ask only — never the
+    // whole "[1]..[n]" session history that let a 20-turn session's judge demand
+    // turn 1's deliverables on turn 20.
     taskSummary: safeContext.currentTask || safeContext.taskSummary,
-    // The judge's demand side, split so the prompt can label them differently.
     currentTask: safeContext.currentTask || safeContext.taskSummary,
-    priorContext: safeContext.priorContext || undefined,
-    // The judge's evidence side: everything the agent did since that ask,
-    // including tool RESULTS (previously invisible to the judge entirely).
-    turnEvidence: safeContext.turnEvidence || undefined,
+    // THE judge's context: the plain alternating conversation, and nothing
+    // else. Tool calls / tool results / the prior-context split were removed
+    // deliberately (see core/task-context.mjs).
+    conversationChain,
     taskType: safeContext.taskType,
     agentMode: safeContext.agentMode,
     requirements: requirements.join('; '),
     signals: safeContext.detectedSignals.length ? safeContext.detectedSignals.join(', ') : 'none',
-    toolsSummary: safeContext.toolsSummary,
     // Explicitly-marked, tail-preserving truncation — a bare slice(0, 4000)
-    // here made the judge blame the agent for the supervisor's own cut.
+    // here made the judge blame the agent for the supervisor's own cut. The
+    // shipped template no longer renders this (the chain's final assistant turn
+    // IS the last response); it stays for custom templates that still use it.
     lastAssistantText: lastAssistantText
       ? truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'agent response' })
       : undefined,
@@ -207,11 +224,6 @@ export async function buildReflectionPrompt({
     maxAttempts: String(effectiveCap),
     projectInstructions: agents ? agents.slice(0, 800) : undefined,
     goalSection: effectiveGoalSection || undefined,
-    // Non-binding evidence only (see core/evaluation.mjs's describeToolActivity)
-    // — never a verdict. The judge template may cite this as bounded factual
-    // context; it must never be treated as (or substituted for) the judge's
-    // own completion decision.
-    toolActivityNote: safeContext.toolActivityNote || undefined,
   }
 
   // If the system prompt file exists, use the file-based approach

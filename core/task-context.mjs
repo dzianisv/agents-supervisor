@@ -16,9 +16,22 @@
  *    EVERY user message ever sent in the session (unbounded, unweighted), while
  *    the evidence side was ONE assistant message's text with zero tool results.
  *    A user who changed topic still got judged against turn 1.
- *    => Split demand into `currentTask` (judge this) vs `priorContext`
- *    (already-addressed background), and widen evidence to the whole current
- *    turn including tool RESULTS.
+ *
+ * WHAT THE JUDGE GETS NOW (owner decision, 2026-08-06):
+ *
+ *   The judge's context is the plain alternating conversation chain and
+ *   NOTHING else:
+ *
+ *       user:      <text>
+ *       assistant: <text>
+ *       user:      <text>
+ *       assistant: <text>
+ *
+ *   Deliberately dropped, with the tradeoff accepted: tool calls, tool inputs
+ *   and tool results; the numbered `[1]..[n]` demand blob; and the separate
+ *   currentTask / priorContext / turnEvidence split. The judge can no longer
+ *   independently verify a claim ("tests pass") against a tool result — it
+ *   judges the conversation the way a human reading the transcript would.
  *
  * Everything here is pure and synchronous so both runtimes (the OpenCode plugin
  * and the Claude Code Stop hook) share one implementation and one test suite.
@@ -44,16 +57,21 @@ import { SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER } from './evaluation.mjs'
  */
 export const PROMPT_TEXT_LIMIT = 12000
 
-/** How many earlier user turns may appear as prior context. */
-export const PRIOR_CONTEXT_MAX_TURNS = 4
-/** Total char budget for the prior-context block. */
-export const PRIOR_CONTEXT_MAX_CHARS = 2000
-/** Per-turn char budget inside the prior-context block. */
-export const PRIOR_CONTEXT_TURN_MAX_CHARS = 500
-/** Per-tool-result char budget inside the evidence block. */
-export const TOOL_RESULT_MAX_CHARS = 300
-/** Total char budget for the current-turn evidence block. */
-export const TURN_EVIDENCE_MAX_CHARS = 8000
+/**
+ * Total char budget for the whole conversation chain handed to the judge.
+ *
+ * The MOST RECENT user+assistant pair is exempt: it is always included in full
+ * (each message capped at PROMPT_TEXT_LIMIT) even when it alone blows this
+ * budget, because that pair IS the thing being judged. This number only bounds
+ * how much OLDER conversation rides along as context.
+ */
+export const CHAIN_MAX_CHARS = 10000
+
+/**
+ * Below this many remaining chars an older turn is dropped rather than trimmed
+ * — a 40-char sliver of a request is noise, not context.
+ */
+export const CHAIN_MIN_TURN_CHARS = 200
 
 /**
  * The marker appended/prepended whenever WE cut text. Without this the judge
@@ -119,7 +137,7 @@ export function userMessageText(msg) {
 }
 
 /**
- * THE single assistant-text extractor.
+ * THE single assistant-text extractor, per message.
  *
  * Before this existed there were two, and they disagreed:
  * `extractLastAssistantText` returned the FIRST text part of the last assistant
@@ -128,24 +146,35 @@ export function userMessageText(msg) {
  * calls) each dropped content the other kept, and which one fed the judge
  * depended on which call site you were looking at.
  *
- * This joins ALL text parts of the last assistant message that has any — a
- * superset of both old behaviours, losing nothing.
+ * This joins ALL text parts of one assistant message — a superset of both old
+ * behaviours, losing nothing. `extractLastAssistantText` and
+ * `buildConversationChain` both go through here; there is still exactly one
+ * extractor.
  *
+ * @param {any} msg
+ * @returns {string} '' when the message is not an assistant message with text
+ */
+export function assistantMessageText(msg) {
+  if (msg?.info?.role !== 'assistant') return ''
+  const texts = []
+  for (const part of msg?.parts || []) {
+    if (part?.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+      texts.push(part.text)
+    }
+  }
+  return texts.join('\n\n')
+}
+
+/**
+ * The text of the last assistant message that has any.
  * @param {any[]} messages
  * @returns {string}
  */
 export function extractLastAssistantText(messages) {
   if (!Array.isArray(messages)) return ''
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (msg?.info?.role !== 'assistant') continue
-    const texts = []
-    for (const part of msg.parts || []) {
-      if (part?.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
-        texts.push(part.text)
-      }
-    }
-    if (texts.length) return texts.join('\n\n')
+    const text = assistantMessageText(messages[i])
+    if (text) return text
   }
   return ''
 }
@@ -167,138 +196,190 @@ export function findLastRelevantUserIndex(messages) {
 }
 
 /**
- * Split the session's human messages into what the judge must judge
- * (`currentTask` — the latest ask) and what it must NOT re-open
- * (`priorContext` — bounded, clearly-labelled, already-addressed background).
- *
- * The old behaviour concatenated all of them into one unweighted `[1]..[n]`
- * blob, which is what let a 20-turn session's judge demand turn 1's deliverables
- * on turn 20 ("open the PR and deploy" -> "commit PRD.md and TDD.md").
- *
- * @param {string[]} humanMessages in chronological order
- * @param {{maxTurns?: number, maxChars?: number, turnMaxChars?: number}} [opts]
- * @returns {{currentTask: string, priorContext: string}}
+ * The user's LATEST real ask. Used by the non-actionable-turn gate and as
+ * `taskSummary`, NOT as judge context (the judge reads the chain).
+ * @param {string[]} humanMessages chronological
+ * @returns {string}
  */
-export function splitUserTurns(humanMessages, opts = {}) {
-  const {
-    maxTurns = PRIOR_CONTEXT_MAX_TURNS,
-    maxChars = PRIOR_CONTEXT_MAX_CHARS,
-    turnMaxChars = PRIOR_CONTEXT_TURN_MAX_CHARS,
-  } = opts
+export function currentUserTask(humanMessages) {
   const msgs = (Array.isArray(humanMessages) ? humanMessages : []).filter(
     (m) => typeof m === 'string' && m.trim()
   )
-  if (msgs.length === 0) return { currentTask: '', priorContext: '' }
-
-  const currentTask = msgs[msgs.length - 1]
-  const earlier = msgs.slice(0, -1)
-  if (earlier.length === 0) return { currentTask, priorContext: '' }
-
-  const windowed = earlier.slice(-maxTurns)
-  const offset = earlier.length - windowed.length
-
-  // Fill from the most recent backwards so the char cap drops the STALEST
-  // turns first, never the ones nearest the current ask.
-  const lines = []
-  let used = 0
-  for (let i = windowed.length - 1; i >= 0; i--) {
-    const line = `[turn ${offset + i + 1}] ${truncateForPrompt(windowed[i], turnMaxChars, { keep: 'head', label: 'earlier user message' })}`
-    if (used + line.length > maxChars && lines.length > 0) break
-    lines.unshift(line)
-    used += line.length
-  }
-  return { currentTask, priorContext: lines.join('\n\n') }
+  return msgs.length ? msgs[msgs.length - 1] : ''
 }
 
-function summarizeToolInput(toolName, input) {
-  if (!input || typeof input !== 'object') return ''
-  if (toolName === 'bash' && typeof input.command === 'string') return input.command
-  const filePath = input.file_path || input.filePath || input.path
-  if (typeof filePath === 'string' && filePath) return filePath
-  if (typeof input.description === 'string' && input.description) return input.description
-  if (typeof input.pattern === 'string' && input.pattern) return input.pattern
-  if (typeof input.prompt === 'string' && input.prompt) return input.prompt.slice(0, 150)
-  try {
-    return JSON.stringify(input).slice(0, 200)
-  } catch {
-    return ''
+// ---------------------------------------------------------------------------
+// The conversation chain — the judge's ONLY context.
+// ---------------------------------------------------------------------------
+
+const TURN_SEPARATOR = '\n\n---\n\n'
+
+/**
+ * Group the transcript into alternating human/assistant turns.
+ *
+ * A turn opens on a real HUMAN user message and absorbs every assistant
+ * message until the next one. Supervisor injections (SELF_ASSESSMENT_MARKER /
+ * FEEDBACK_MARKER) and `<task-notification>` metadata are not human turns —
+ * they are filtered by `userMessageText`, so assistant work that follows them
+ * stays attached to the human turn it actually belongs to.
+ *
+ * Assistant text that precedes the first human message has no turn to belong
+ * to and is dropped: a chain must start with a user.
+ *
+ * @param {any[]} messages
+ * @returns {{user: string, assistant: string}[]} oldest → newest
+ */
+export function collectConversationTurns(messages) {
+  if (!Array.isArray(messages)) return []
+  /** @type {{user: string, assistant: string[]}[]} */
+  const turns = []
+  for (const msg of messages) {
+    const role = msg?.info?.role
+    if (role === 'user') {
+      const text = userMessageText(msg)
+      if (text == null || !text.trim()) continue
+      turns.push({ user: text, assistant: [] })
+      continue
+    }
+    if (role !== 'assistant') continue
+    const text = assistantMessageText(msg)
+    if (!text || turns.length === 0) continue
+    turns[turns.length - 1].assistant.push(text)
+  }
+  return turns.map((t) => ({ user: t.user, assistant: t.assistant.join('\n\n') }))
+}
+
+function renderTurn(turn) {
+  const blocks = [`user:\n${turn.user}`]
+  if (turn.assistant) blocks.push(`assistant:\n${turn.assistant}`)
+  return blocks.join('\n\n')
+}
+
+/**
+ * Same principle as `truncationNotice`: whenever WE shorten the conversation,
+ * say so in the supervisor's own name. Without this the judge reads a missing
+ * earlier turn as the agent never having been asked, or a shortened reply as
+ * the agent stopping mid-sentence.
+ */
+function chainTrimNotice(droppedTurns, trimmedTurns) {
+  const bits = []
+  if (droppedTurns > 0) bits.push(`${droppedTurns} earlier turn(s) omitted entirely`)
+  if (trimmedTurns > 0) bits.push(`${trimmedTurns} message(s) shortened`)
+  const what = bits.join(' and ') || 'earlier conversation shortened'
+  return `[…conversation trimmed by supervisor: ${what} to fit the prompt budget. This cut was made by the supervisor, NOT by the agent — do NOT treat missing or shortened text as the agent stopping mid-sentence, skipping work, or producing an incomplete response.]`
+}
+
+/**
+ * Render already-selected turns as the readable chain. Exported so callers
+ * that have a user/assistant pair but no transcript (legacy prompt builders)
+ * emit the exact same shape.
+ *
+ * @param {{user: string, assistant?: string}[]} turns oldest → newest
+ * @param {{droppedTurns?: number, trimmedTurns?: number}} [opts]
+ * @returns {string}
+ */
+export function formatConversationTurns(turns, opts = {}) {
+  const list = (Array.isArray(turns) ? turns : []).filter(
+    (t) => t && typeof t.user === 'string' && t.user.trim()
+  )
+  if (list.length === 0) return ''
+  const body = list.map((t) => renderTurn({ user: t.user, assistant: t.assistant || '' })).join(TURN_SEPARATOR)
+  const dropped = opts.droppedTurns || 0
+  const trimmed = opts.trimmedTurns || 0
+  if (dropped <= 0 && trimmed <= 0) return body
+  return `${chainTrimNotice(dropped, trimmed)}\n\n${body}`
+}
+
+/** Cap each side of a turn at `limit`, reporting whether anything was cut. */
+function capTurn(turn, limit) {
+  const user = truncateForPrompt(turn.user, limit, { keep: 'head', label: 'user message' })
+  const assistant = turn.assistant
+    ? truncateForPrompt(turn.assistant, limit, { keep: 'tail', label: 'agent response' })
+    : ''
+  const cut = user !== turn.user || assistant !== turn.assistant
+  return { turn: { user, assistant }, cut }
+}
+
+/** Squeeze a turn into `budget` chars rather than dropping it outright. */
+function fitTurn(turn, budget) {
+  const LABEL_OVERHEAD = 24 // "user:\n" + "\n\nassistant:\n"
+  const room = Math.max(budget - LABEL_OVERHEAD, 2 * 60)
+  const userLimit = Math.max(60, Math.floor(room * 0.4))
+  const assistantLimit = Math.max(60, room - userLimit)
+  return {
+    user: truncateForPrompt(turn.user, userLimit, { keep: 'head', label: 'earlier user message' }),
+    assistant: turn.assistant
+      ? truncateForPrompt(turn.assistant, assistantLimit, { keep: 'tail', label: 'earlier agent response' })
+      : '',
   }
 }
 
 /**
- * Everything the agent actually DID since the user's latest ask: all assistant
- * text plus every tool call WITH ITS RESULT.
+ * Build the judge's context: the plain alternating conversation.
  *
- * Tool results were previously invisible to the judge — `state.output` was
- * referenced nowhere in the codebase, so the judge saw that `npm test` was
- * *invoked* but never that it *passed*, and then demanded the agent "run the
- * tests" it had already run.
+ * Budgeting walks BACKWARDS from the newest turn so the char cap sacrifices
+ * the stalest conversation first, never the ask being judged:
  *
- * SDK shape (verified against @opencode-ai/sdk `ToolPart`/`ToolState` and
- * against real rows in ~/.local/share/opencode/opencode.db):
- *   part.type === 'tool'
- *   part.tool   -> string  (tool name)
- *   part.state.status -> 'pending' | 'running' | 'completed' | 'error'
- *   part.state.input  -> object
- *   part.state.output -> STRING, present only when status === 'completed'
- *   part.state.error  -> STRING, present only when status === 'error'
+ *   1. The newest user+assistant pair is ALWAYS included, in full up to
+ *      `messageMaxChars`, even if it alone exceeds `maxChars`.
+ *   2. Older pairs are added while budget remains.
+ *   3. The first older pair that does not fit is TRIMMED into whatever budget
+ *      is left (if at least `minTurnChars` remain) rather than dropped.
+ *   4. Anything older than that is dropped.
+ *
+ * Any drop or trim prepends an explicit supervisor-attributed marker. Output
+ * is oldest → newest even though selection ran newest → oldest.
  *
  * @param {any[]} messages
- * @param {{resultMaxChars?: number, totalMaxChars?: number, fromIndex?: number}} [opts]
- * @returns {string} '' when there is no evidence
+ * @param {{maxChars?: number, messageMaxChars?: number, minTurnChars?: number}} [opts]
+ * @returns {string} '' when there is no human turn at all
  */
-export function buildTurnEvidence(messages, opts = {}) {
+export function buildConversationChain(messages, opts = {}) {
   const {
-    resultMaxChars = TOOL_RESULT_MAX_CHARS,
-    totalMaxChars = TURN_EVIDENCE_MAX_CHARS,
+    maxChars = CHAIN_MAX_CHARS,
+    messageMaxChars = PROMPT_TEXT_LIMIT,
+    minTurnChars = CHAIN_MIN_TURN_CHARS,
   } = opts
-  if (!Array.isArray(messages)) return ''
-  const start = opts.fromIndex ?? findLastRelevantUserIndex(messages)
-  const entries = []
+  const turns = collectConversationTurns(messages)
+  if (turns.length === 0) return ''
 
-  for (let i = start + 1; i < messages.length; i++) {
-    const msg = messages[i]
-    if (msg?.info?.role !== 'assistant') continue
-    for (const part of msg.parts || []) {
-      if (part?.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
-        entries.push(`[agent said]\n${part.text.trim()}`)
-        continue
-      }
-      if (part?.type !== 'tool') continue
-      const toolName = (part.tool || 'tool').toString()
-      const state = part.state || {}
-      const inputSummary = summarizeToolInput(toolName.toLowerCase(), state.input)
-      const header = `[tool] ${toolName}${inputSummary ? ` — ${inputSummary.replace(/\s+/g, ' ').slice(0, 200)}` : ''}`
-      if (state.status === 'completed' && typeof state.output === 'string' && state.output.trim()) {
-        entries.push(
-          `${header}\n  result: ${truncateForPrompt(state.output.trim(), resultMaxChars, { keep: 'head', label: 'tool result' }).replace(/\n/g, '\n  ')}`
-        )
-      } else if (state.status === 'error' && typeof state.error === 'string' && state.error.trim()) {
-        entries.push(
-          `${header}\n  ERROR: ${truncateForPrompt(state.error.trim(), resultMaxChars, { keep: 'head', label: 'tool error' }).replace(/\n/g, '\n  ')}`
-        )
-      } else {
-        entries.push(`${header}\n  (still running or no result recorded)`)
-      }
-    }
-  }
-
-  if (entries.length === 0) return ''
-
-  // Keep the TAIL: the most recent work is the evidence of completion.
-  const kept = []
+  const selected = []
   let used = 0
-  let dropped = 0
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (used + entries[i].length > totalMaxChars && kept.length > 0) {
-      dropped = i + 1
+  let droppedTurns = 0
+  let trimmedTurns = 0
+
+  for (let i = turns.length - 1; i >= 0; i--) {
+    // 1. The newest pair is exempt from the chain budget.
+    if (i === turns.length - 1) {
+      const { turn, cut } = capTurn(turns[i], messageMaxChars)
+      if (cut) trimmedTurns++
+      selected.push(turn)
+      used += renderTurn(turn).length
+      continue
+    }
+    const { turn, cut } = capTurn(turns[i], messageMaxChars)
+    const cost = renderTurn(turn).length + TURN_SEPARATOR.length
+    const remaining = maxChars - used
+    // 2. Fits whole.
+    if (cost <= remaining) {
+      if (cut) trimmedTurns++
+      selected.push(turn)
+      used += cost
+      continue
+    }
+    // 3. Doesn't fit but there is meaningful room: trim, don't drop.
+    if (remaining >= minTurnChars) {
+      const fitted = fitTurn(turns[i], remaining - TURN_SEPARATOR.length)
+      trimmedTurns++
+      selected.push(fitted)
+      droppedTurns = i
       break
     }
-    kept.unshift(entries[i])
-    used += entries[i].length
+    // 4. No meaningful room: everything from here down is dropped.
+    droppedTurns = i + 1
+    break
   }
-  const prefix = dropped > 0
-    ? `[…truncated by supervisor: ${dropped} earlier step(s) of this turn omitted for length; the most recent steps are shown below. This cut was made by the supervisor, NOT by the agent.]\n\n`
-    : ''
-  return prefix + kept.join('\n\n')
+
+  selected.reverse()
+  return formatConversationTurns(selected, { droppedTurns, trimmedTurns })
 }

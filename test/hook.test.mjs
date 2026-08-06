@@ -382,7 +382,7 @@ test('buildTaskContextFromTranscript: requiresPR/requiresCI stay true for coding
   assert.equal(ctx.requiresCI, true, 'real code-change task should still require CI');
 });
 
-test('buildTaskContextFromTranscript: latest turn is currentTask, earlier turns are prior context', () => {
+test('buildTaskContextFromTranscript: latest turn is currentTask; judge context is the whole chain', () => {
   const msgs = normalizeTranscriptToMessages([
     { type: 'user', message: { role: 'user', content: 'first task' } },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
@@ -391,12 +391,18 @@ test('buildTaskContextFromTranscript: latest turn is currentTask, earlier turns 
   const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
   assert.ok(ctx);
   // Was: taskSummary joined EVERY user message as "[1]..[n]", unweighted, so a
-  // 20-turn session's judge demanded turn 1's deliverables on turn 20. Now the
-  // latest ask is the demand and earlier turns are labelled background.
+  // 20-turn session's judge demanded turn 1's deliverables on turn 20. currentTask
+  // is now the latest ask (turn gate input only); the judge reads the full
+  // alternating conversation instead.
   assert.equal(ctx.currentTask, 'second task');
   assert.equal(ctx.taskSummary, 'second task');
-  assert.match(ctx.priorContext, /first task/);
-  assert.ok(!ctx.priorContext.includes('second task'));
+  assert.match(ctx.conversationChain, /user:\nfirst task/);
+  assert.match(ctx.conversationChain, /assistant:\nok/);
+  assert.match(ctx.conversationChain, /user:\nsecond task/);
+  assert.ok(
+    ctx.conversationChain.indexOf('first task') < ctx.conversationChain.indexOf('second task'),
+    'chain must read oldest -> newest'
+  );
 });
 
 test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
@@ -406,7 +412,7 @@ test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
   const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
   assert.ok(ctx);
   // All required TaskContext fields must be present
-  for (const field of ['taskSummary', 'taskType', 'agentMode', 'humanMessages',
+  for (const field of ['taskSummary', 'currentTask', 'conversationChain', 'taskType', 'agentMode', 'humanMessages',
     'toolsSummary', 'detectedSignals', 'recentCommands', 'pushedToDefaultBranch',
     'requiresTests', 'requiresBuild', 'requiresPR', 'requiresCI',
     'requiresLocalTests', 'requiresLocalTestsEvidence']) {

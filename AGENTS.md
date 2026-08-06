@@ -73,7 +73,9 @@ opencode run "print hello" --model anthropic/claude-opus-4.6
 
 ### `test/task-context.test.mjs` — judge input
 
-`extractLastAssistantText` is the SINGLE extractor (`core/task-context.mjs`); two copies previously disagreed on which text part of the last assistant message wins. Also covers the `currentTask` / `priorContext` / `turnEvidence` split, and `truncateForPrompt` — tail-preserving by default (the verdict lives at the END of a long reply), explicit truncation marker, `PROMPT_TEXT_LIMIT = 12000` as the one limit.
+`extractLastAssistantText` is the SINGLE extractor (`core/task-context.mjs`); two copies previously disagreed on which text part of the last assistant message wins. It is now factored through `assistantMessageText`, which `buildConversationChain` also uses — still one extractor.
+
+The judge's context is `buildConversationChain`: the plain alternating `user:` / `assistant:` conversation, oldest→newest, and nothing else. Tool calls, tool inputs, tool results, the `[1]..[n]` demand blob, and the old `currentTask`/`priorContext`/`turnEvidence` split are all gone (owner decision — the judge can no longer independently verify a claim against a tool result). Budget: `CHAIN_MAX_CHARS = 10000`, newest pair always in full up to `PROMPT_TEXT_LIMIT`, older pairs trimmed before dropped, any cut carries an explicit supervisor-attributed marker. `currentTask` survives as the non-actionable-turn-gate input and `taskSummary`, not as judge input. Also covers `truncateForPrompt` — tail-preserving by default (the verdict lives at the END of a long reply), explicit truncation marker, `PROMPT_TEXT_LIMIT = 12000` as the one limit.
 
 ### `test/turn-classifier.test.mjs` — non-actionable turn gate
 

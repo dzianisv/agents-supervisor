@@ -50,8 +50,8 @@ import {
 } from "../core/status-directive.mjs"
 import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
 import {
-  extractLastAssistantText, findLastRelevantUserIndex, splitUserTurns,
-  buildTurnEvidence, userMessageText,
+  extractLastAssistantText, findLastRelevantUserIndex, currentUserTask,
+  buildConversationChain, userMessageText,
 } from "../core/task-context.mjs"
 import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
 
@@ -67,7 +67,7 @@ export {
   DEFAULT_RUBRIC, parseRubric, buildTaskContext,
 }
 export { getLastSessionCwd, resolveSessionDirectory }
-export { extractLastAssistantText, splitUserTurns, buildTurnEvidence, findLastRelevantUserIndex }
+export { extractLastAssistantText, currentUserTask, buildConversationChain, findLastRelevantUserIndex }
 export { classifyTurn, shouldSkipReflection }
 
 export function detectSupervisorActionInText(text: string): "off" | "on" | null {
@@ -517,21 +517,16 @@ interface TaskContext extends WorkflowRequirements {
    * which let the judge demand turn 1's deliverables on turn 20.
    */
   taskSummary: string
-  /** The user's LATEST request — the only thing the judge should act on. */
+  /** The user's LATEST request. Feeds the non-actionable turn gate — NOT the judge. */
   currentTask: string
   /**
-   * Bounded, labelled summary of EARLIER user turns. Supplied to the judge as
-   * already-addressed background so it can resolve references, explicitly NOT
-   * as outstanding work.
+   * THE judge's context, and the only one: the plain alternating conversation
+   * (`user:` / `assistant:` blocks, oldest first, newest pair always in full).
+   * Tool calls, tool inputs and tool results are deliberately absent — the
+   * judge reads the conversation the way a human would. See
+   * core/task-context.mjs.
    */
-  priorContext?: string
-  /**
-   * Everything the agent did since `currentTask` was asked: assistant messages
-   * plus every tool call WITH its result. Tool results were previously invisible
-   * to the judge (`state.output` was read nowhere), so it could not see that a
-   * check it was about to demand had already run and passed.
-   */
-  turnEvidence?: string
+  conversationChain?: string
   taskType: TaskType
   agentMode: AgentMode
   humanMessages: string[]
@@ -1139,16 +1134,14 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
 
   if (humanMessages.length === 0) return null
 
-  // Demand side, split: the judge is told to act on currentTask and to treat
-  // priorContext as already-addressed background. taskSummary stays for
-  // backward compatibility (routing/goal-derivation prompts, CC parity) but is
-  // now the CURRENT ask, not the whole "[1]..[n]" session history.
-  const { currentTask, priorContext } = splitUserTurns(humanMessages)
+  // `currentTask` is NOT judge context any more — it feeds the non-actionable
+  // turn gate and `taskSummary`. The judge reads `conversationChain` only.
+  const currentTask = currentUserTask(humanMessages)
   const taskSummary = currentTask
 
-  // Evidence side: everything the agent did SINCE that ask — all assistant
-  // messages plus every tool call with its RESULT (state.output/state.error).
-  const turnEvidence = buildTurnEvidence(messages)
+  // THE judge's context: the plain alternating user/assistant conversation.
+  // Tool calls, tool inputs and tool results are deliberately NOT here.
+  const conversationChain = buildConversationChain(messages)
 
   const combinedText = `${humanMessages.join(" ")} ${lastAssistantText}`
   const taskType = inferTaskType(combinedText)
@@ -1185,8 +1178,7 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
   return {
     taskSummary,
     currentTask,
-    priorContext: priorContext || undefined,
-    turnEvidence: turnEvidence || undefined,
+    conversationChain: conversationChain || undefined,
     taskType,
     agentMode,
     humanMessages,

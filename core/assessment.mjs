@@ -1,6 +1,33 @@
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { loadShipped } from './patterns.mjs'
-import { PROMPT_TEXT_LIMIT, truncateForPrompt } from './task-context.mjs'
+import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
+
+/**
+ * The judge's ONLY context block: the plain alternating conversation.
+ *
+ * `context.conversationChain` is built by core/task-context.mjs from the real
+ * transcript. The fallback synthesizes a one-turn chain so legacy callers that
+ * hand over a bare `{taskSummary}` plus the agent's last response still render
+ * the exact same shape — there is one prompt layout, not two.
+ */
+function buildConversationSection(context, lastAssistantText) {
+  const chain =
+    context?.conversationChain ||
+    formatConversationTurns([
+      {
+        user: context?.currentTask || context?.taskSummary || '',
+        assistant: lastAssistantText
+          ? truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'agent response' })
+          : '',
+      },
+    ])
+  return `## Conversation
+This is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing work. Any \`[…truncated by supervisor: …]\` or \`[…conversation trimmed by supervisor: …]\` marker is the SUPERVISOR's own length cut, never the agent stopping mid-sentence.
+
+${chain}
+`
+}
+
 
 /**
  * Pull the "background subagents/tasks still in flight" exemption straight from
@@ -106,45 +133,25 @@ export function buildSelfAssessmentPrompt(
 
   const signalSummary = safeContext.detectedSignals.length ? safeContext.detectedSignals.join(', ') : 'none'
 
-  // Explicitly-marked, tail-preserving truncation. A bare slice(0, 4000) here
-  // caused 169 confirmed false "Task Incomplete" verdicts: the judge read the
-  // supervisor's own cut as the AGENT stopping mid-sentence. See
-  // core/task-context.mjs.
-  const assistantSection = lastAssistantText
-    ? `\n## Agent's Last Response\n${truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: "agent response" })}\n`
-    : ''
-
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
   const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const currentAttempt = attemptCount || 0
   const attemptSection = currentAttempt > 0
     ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
     : ''
-  const currentTask = safeContext.currentTask || safeContext.taskSummary
-  const priorSection = safeContext.priorContext
-    ? `\n## Prior Context (ALREADY ADDRESSED — background only)\nThese are earlier requests in this session. They have already been handled or superseded. Do NOT list them as missing work, and do NOT judge the current turn against them.\n${safeContext.priorContext}\n`
-    : ''
-  const evidenceSection = safeContext.turnEvidence
-    ? `\n## Work Done Since That Request (this turn's evidence: agent messages + tool calls WITH results)\n${safeContext.turnEvidence}\n`
-    : ''
 
   return `SELF-ASSESS SUPERVISOR
 
 You are evaluating an agent's work against workflow requirements.
-Analyze the task context, the agent's last response, and the tool signals to determine whether the task is complete.
+Read the conversation below and determine whether the task is complete.
 
-## Current Task (the user's LATEST request — judge ONLY this)
-${currentTask}
-${priorSection}
+${buildConversationSection(safeContext, lastAssistantText)}
 ## Task Context
 - Type: ${safeContext.taskType}
 - Mode: ${safeContext.agentMode}
 - Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
 - Detected signals: ${signalSummary}
-${safeContext.toolActivityNote ? `- ${safeContext.toolActivityNote}\n` : ''}
-## Tool Commands Run
-${safeContext.toolsSummary}
-${evidenceSection}${assistantSection}${attemptSection}
+${attemptSection}
 ${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ''}Return JSON only:
 {
   "task_summary": "brief description of what was done",
@@ -189,20 +196,11 @@ export function buildJudgePrompt(
   rubric
 ) {
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
-  const currentTask = context.currentTask || context.taskSummary
-  const priorSection = context.priorContext
-    ? `\n## Prior Context (ALREADY ADDRESSED — background only, never missing work)\n${context.priorContext}\n`
-    : ''
-  const evidenceSection = context.turnEvidence
-    ? `\n## Work Done Since That Request (agent messages + tool calls WITH results)\n${context.turnEvidence}\n`
-    : ''
   return `ANALYZE SUPERVISOR
 
 You are validating an agent's self-assessment against workflow requirements.
 
-## Current Task (the user's LATEST request — judge ONLY this)
-${currentTask}
-${priorSection}
+${buildConversationSection(context, '')}
 ## Task Type
 ${context.taskType}
 
@@ -213,9 +211,6 @@ ${context.taskType}
 - CI checks required: ${context.requiresCI}
 - Local test commands required: ${context.requiresLocalTests}
 
-## Tool Signals
-${context.toolsSummary}
-${evidenceSection}
 ## Agent Self-Assessment
 ${truncateForPrompt(selfAssessment, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'self-assessment' })}
 ${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
