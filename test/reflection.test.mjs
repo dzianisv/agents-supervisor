@@ -125,7 +125,7 @@ describe('prompt assembly', () => {
     // Contains context from vars
     assert.ok(assembled.includes('Implement user authentication with JWT tokens'), 'task summary missing');
     assert.ok(assembled.includes('feature'), 'task type missing');
-    assert.ok(assembled.includes('npm test, git commit'), 'signals missing');
+    assert.ok(!assembled.includes('npm test, git commit'), 'tool-derived signals must not render into the judge prompt');
     assert.ok(assembled.includes('Tests required'), 'requirements missing');
 
     // Contains patterns
@@ -211,7 +211,10 @@ describe('structural equivalence with old buildSelfAssessmentPrompt', () => {
     ['Task Type var', /\{\{taskType\}\}/],
     ['Agent Mode var', /\{\{agentMode\}\}/],
     ['Requirements var', /\{\{requirements\}\}/],
-    ['Signals var', /\{\{signals\}\}/],
+    // {{signals}} is GONE: detectSignals() derives test-command / gh-pr-* /
+    // git-push from the tool command log — the exact evidence class PR #61
+    // removed from the judge. Rendering it contradicted this very template's
+    // "You do not see the agent's tool calls or their results".
     ['Attempt section (conditional)', /attemptSection/],
     ['Project Instructions (conditional)', /projectInstructions/],
     ['Goal section (conditional)', /goalSection/],

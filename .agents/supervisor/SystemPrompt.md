@@ -20,7 +20,6 @@ This is the conversation between the user and the agent, oldest first.
 - Type: {{taskType}}
 - Mode: {{agentMode}}
 - Heuristic signals (repo checks; informative, not binding): {{requirements}}
-- Detected signals: {{signals}}
 
 {{#attemptSection}}
 ## Supervisor History

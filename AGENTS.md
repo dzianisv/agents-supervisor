@@ -101,6 +101,16 @@ Every case here passes on each branch alone and fails on the naive union. No tex
 - **Goal retirement must run BEFORE the status correction's early return.** The correction `return`s out of the completion path; a goal retired after it would survive into every future turn and every future session.
 - **`action: off/on` must still be evaluated before `mode`,** and `status on|off` must toggle the directive only — never the enable axis.
 
+### `test/rubric-prose-evidence.test.mjs` — the judge reads prose, not a tool log
+
+PR #61 made the conversation chain the judge's only input, which left rubric rules asserting things the judge can no longer observe ("the tool commands show ONLY read operations", "write/edit tool calls in tool commands", "no write/tool evidence"). Dead rubric text is worse than none — the judge can only hallucinate compliance against a field it never receives.
+
+The regression guard is a banned-phrase grep over the SHIPPED rubric, plus an equality assertion that its two copies have not drifted: `.agents/supervisor/Patterns.md` (read by `core/reflection-prompt.mjs`, both runtimes' reflection path) and `STATIC_RUBRIC` in `core/assessment.mjs` (→ `DEFAULT_RUBRIC`, read by opencode's `loadRubric()` fallback and the `buildSelfAssessmentPrompt`/`buildJudgePrompt` default). Eight rules were rewritten to test the agent's PROSE instead: the report must name a checkable specific (file path, PR/issue number, command AND what it returned, a count), and vagueness — not a missing tool call — is what makes a claim unverified. Two rules were added: SPECIFICITY TEST and DO NOT INVENT EVIDENCE (never assume a step happened because it is standard practice; never assume it did NOT because an earlier turn omitted it).
+
+`{{signals}}` was also removed from the judge prompt: `detectSignals` derives `test-command`/`gh-pr-*`/`git-push` from the tool command log, so rendering it contradicted `SystemPrompt.md`'s own "You do not see the agent's tool calls or their results".
+
+**NOT in scope:** `core/patterns.json`. That feeds a DIFFERENT judge (`core/judge-core.mjs`, the Stop classifier) with a DIFFERENT input contract — it still receives `tools_available_inferred` (the tool NAMES used), so its tool-referencing rules are not dead.
+
 ### `test/e2e-cc.mjs` — Claude Code Stop hook
 
 Real hook entry point: Stop payload on stdin, real transcript jsonl, stdout decision contract. `SUPERVISOR_FAKE_JUDGE` makes it deterministic; `SUPERVISOR_CC_LIVE=1` uses the real judge. The goal-achieved case asserts the session goal is CLEARED (not left as `status:'achieved'`) and that `.supervisor/goal-achieved.log` carries the record — clearing must never be silent.
