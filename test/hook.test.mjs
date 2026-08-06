@@ -382,7 +382,7 @@ test('buildTaskContextFromTranscript: requiresPR/requiresCI stay true for coding
   assert.equal(ctx.requiresCI, true, 'real code-change task should still require CI');
 });
 
-test('buildTaskContextFromTranscript: multi-message summary uses numbered format', () => {
+test('buildTaskContextFromTranscript: latest turn is currentTask, earlier turns are prior context', () => {
   const msgs = normalizeTranscriptToMessages([
     { type: 'user', message: { role: 'user', content: 'first task' } },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
@@ -390,8 +390,13 @@ test('buildTaskContextFromTranscript: multi-message summary uses numbered format
   ]);
   const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
   assert.ok(ctx);
-  assert.match(ctx.taskSummary, /\[1\].*first task/);
-  assert.match(ctx.taskSummary, /\[2\].*second task/);
+  // Was: taskSummary joined EVERY user message as "[1]..[n]", unweighted, so a
+  // 20-turn session's judge demanded turn 1's deliverables on turn 20. Now the
+  // latest ask is the demand and earlier turns are labelled background.
+  assert.equal(ctx.currentTask, 'second task');
+  assert.equal(ctx.taskSummary, 'second task');
+  assert.match(ctx.priorContext, /first task/);
+  assert.ok(!ctx.priorContext.includes('second task'));
 });
 
 test('buildTaskContextFromTranscript: has required TaskContext fields', () => {

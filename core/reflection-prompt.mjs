@@ -22,6 +22,7 @@ import { join } from 'node:path'
 import { extractGoalCondition, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt } from './assessment.mjs'
 import { loadParsedRubric, formatRubricMarkdown } from './rubric-loader.mjs'
+import { PROMPT_TEXT_LIMIT, truncateForPrompt } from './task-context.mjs'
 
 /**
  * Interpolate a simple mustache-like template:
@@ -180,13 +181,27 @@ export async function buildReflectionPrompt({
   const effectiveGoalSection = goalSection || (projectGoalCondition ? buildGoalRequirementSection(projectGoalCondition) : undefined)
 
   const templateVars = {
-    taskSummary: safeContext.taskSummary,
+    // Legacy var, kept so pre-existing custom SystemPrompt.md files that use
+    // {{taskSummary}} keep working. It now renders the CURRENT ask only — never
+    // the whole "[1]..[n]" session history that let a 20-turn session's judge
+    // demand turn 1's deliverables on turn 20.
+    taskSummary: safeContext.currentTask || safeContext.taskSummary,
+    // The judge's demand side, split so the prompt can label them differently.
+    currentTask: safeContext.currentTask || safeContext.taskSummary,
+    priorContext: safeContext.priorContext || undefined,
+    // The judge's evidence side: everything the agent did since that ask,
+    // including tool RESULTS (previously invisible to the judge entirely).
+    turnEvidence: safeContext.turnEvidence || undefined,
     taskType: safeContext.taskType,
     agentMode: safeContext.agentMode,
     requirements: requirements.join('; '),
     signals: safeContext.detectedSignals.length ? safeContext.detectedSignals.join(', ') : 'none',
     toolsSummary: safeContext.toolsSummary,
-    lastAssistantText: lastAssistantText ? lastAssistantText.slice(0, 4000) : undefined,
+    // Explicitly-marked, tail-preserving truncation — a bare slice(0, 4000)
+    // here made the judge blame the agent for the supervisor's own cut.
+    lastAssistantText: lastAssistantText
+      ? truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'agent response' })
+      : undefined,
     attemptSection: currentAttempt > 0 ? 'true' : undefined,
     attemptNumber: String(currentAttempt + 1),
     maxAttempts: String(effectiveCap),

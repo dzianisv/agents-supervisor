@@ -42,6 +42,11 @@ import {
 } from "../core/assessment.mjs"
 import { buildEscalatingFeedback } from "../core/feedback.mjs"
 import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
+import {
+  extractLastAssistantText, findLastRelevantUserIndex, splitUserTurns,
+  buildTurnEvidence, userMessageText,
+} from "../core/task-context.mjs"
+import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -55,6 +60,8 @@ export {
   DEFAULT_RUBRIC, parseRubric, buildTaskContext,
 }
 export { getLastSessionCwd, resolveSessionDirectory }
+export { extractLastAssistantText, splitUserTurns, buildTurnEvidence, findLastRelevantUserIndex }
+export { classifyTurn, shouldSkipReflection }
 
 export function detectSupervisorActionInText(text: string): "off" | "on" | null {
   if (!text || typeof text !== "string") return null
@@ -463,7 +470,27 @@ interface WorkflowRequirements {
 }
 
 interface TaskContext extends WorkflowRequirements {
+  /**
+   * Backward-compatible alias of `currentTask`. It used to be every user
+   * message in the session joined as "[1]..[n]" — unbounded and unweighted,
+   * which let the judge demand turn 1's deliverables on turn 20.
+   */
   taskSummary: string
+  /** The user's LATEST request — the only thing the judge should act on. */
+  currentTask: string
+  /**
+   * Bounded, labelled summary of EARLIER user turns. Supplied to the judge as
+   * already-addressed background so it can resolve references, explicitly NOT
+   * as outstanding work.
+   */
+  priorContext?: string
+  /**
+   * Everything the agent did since `currentTask` was asked: assistant messages
+   * plus every tool call WITH its result. Tool results were previously invisible
+   * to the judge (`state.output` was read nowhere), so it could not see that a
+   * check it was about to demand had already run and passed.
+   */
+  turnEvidence?: string
   taskType: TaskType
   agentMode: AgentMode
   humanMessages: string[]
@@ -1024,33 +1051,31 @@ async function getRepoSignals(directory: string): Promise<{ hasTestScript: boole
 async function buildTaskContext(messages: any[], directory: string): Promise<TaskContext | null> {
   if (!Array.isArray(messages)) return null
   const humanMessages: string[] = []
-  let lastAssistantText = ""
 
   for (const msg of messages) {
     if (msg.info?.role === "user") {
-      for (const part of msg.parts || []) {
-        if (part.type === "text" && part.text) {
-          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue
-          if (part.text.trim().startsWith("<task-notification>")) continue // async notification metadata, not user task instructions
-          humanMessages.push(part.text)
-          break
-        }
-      }
-    }
-    if (msg.info?.role === "assistant") {
-      for (const part of msg.parts || []) {
-        if (part.type === "text" && part.text) {
-          lastAssistantText = part.text
-        }
-      }
+      const text = userMessageText(msg)
+      if (text != null) humanMessages.push(text)
     }
   }
 
+  // ONE extractor, shared with the reflection call site (core/task-context.mjs).
+  // Previously this kept the LAST text part while extractLastAssistantText took
+  // the FIRST, so the judge's "agent's last response" depended on the call site.
+  const lastAssistantText = extractLastAssistantText(messages)
+
   if (humanMessages.length === 0) return null
 
-  const taskSummary = humanMessages.length === 1
-    ? humanMessages[0]
-    : humanMessages.map((msg, i) => `[${i + 1}] ${msg}`).join("\n\n")
+  // Demand side, split: the judge is told to act on currentTask and to treat
+  // priorContext as already-addressed background. taskSummary stays for
+  // backward compatibility (routing/goal-derivation prompts, CC parity) but is
+  // now the CURRENT ask, not the whole "[1]..[n]" session history.
+  const { currentTask, priorContext } = splitUserTurns(humanMessages)
+  const taskSummary = currentTask
+
+  // Evidence side: everything the agent did SINCE that ask — all assistant
+  // messages plus every tool call with its RESULT (state.output/state.error).
+  const turnEvidence = buildTurnEvidence(messages)
 
   const combinedText = `${humanMessages.join(" ")} ${lastAssistantText}`
   const taskType = inferTaskType(combinedText)
@@ -1086,6 +1111,9 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
 
   return {
     taskSummary,
+    currentTask,
+    priorContext: priorContext || undefined,
+    turnEvidence: turnEvidence || undefined,
     taskType,
     agentMode,
     humanMessages,
@@ -1103,17 +1131,8 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
   }
 }
 
-function extractLastAssistantText(messages: any[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (msg.info?.role === "assistant") {
-      for (const part of msg.parts || []) {
-        if (part.type === "text" && part.text) return part.text
-      }
-    }
-  }
-  return ""
-}
+// extractLastAssistantText now lives in core/task-context.mjs (imported above)
+// and is the SINGLE extractor used by both this file and buildTaskContext.
 
 async function analyzeSelfAssessmentWithLLM(
   client: any,
@@ -2026,6 +2045,25 @@ Do NOT call this tool:
         const sup = await supervisorStore.load(directory, sessionId)
         const mode = resolveSupervisorMode(sup) as SupervisorMode
         let goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+
+        // ── Non-actionable turn gate ─────────────────────────────────────
+        // A completion judge only makes sense when the human actually asked for
+        // work. Observed misfires this prevents: user said "Stop. Reflect." and
+        // the supervisor demanded a prod canary + feature-flag flip 66 s later;
+        // "why did you stop . answer short" got a 6-item mandatory-GOAL list;
+        // "tldr" and "thanks" ran the full judge as work orders.
+        // Deliberately conservative (core/turn-classifier.mjs) and fully
+        // bypassed while a goal or autopilot is active.
+        const turnGate = shouldSkipReflection({
+          text: context.currentTask,
+          hasActiveGoal: !!goal,
+          mode,
+        })
+        if (turnGate.skip) {
+          debug("Skipping reflection —", turnGate.reason, "for", sessionId.slice(0, 8))
+          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          return
+        }
         // A goal's attempt budget is per-human-turn, not cumulative for the
         // whole session: once the human speaks again the previous turn's
         // escalation no longer applies, so goal.attempts resets instead of
