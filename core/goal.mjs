@@ -255,7 +255,28 @@ export const goalStore = {
     goalStore.save(cwd, sessionId, state);
     return state;
   },
+  /**
+   * Mirror of the OpenCode-side supervisorStore.setStatusDiagram so both
+   * runtimes read the same on-disk key. ABSENT MEANS ON — only an explicit
+   * `false` disables the status.md/roadmap directive, so every session
+   * written before this key existed keeps the feature. Read it through
+   * isStatusDiagramEnabled(), never as a bare truthiness test.
+   */
+  setStatusDiagram(cwd, sessionId, enabled) {
+    const state = goalStore.load(cwd, sessionId);
+    state.statusDiagram = enabled;
+    goalStore.save(cwd, sessionId, state);
+    return state;
+  },
 };
+
+/**
+ * Default-on gate for the status directive. `undefined` (never toggled) and
+ * `true` both mean on. Shared by both runtimes.
+ */
+export function isStatusDiagramEnabled(state) {
+  return state?.statusDiagram !== false;
+}
 
 // --- project-level goal (.agents/supervisor/Goal.md) -----------------------
 //

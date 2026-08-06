@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
-import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
+import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled } from '../core/goal.mjs';
 
 const cwd = process.cwd();
 const patterns = loadPatterns({ cwd });
@@ -44,11 +44,15 @@ if (cur) {
     const goalState = goalStore.load(cwd, cur);
     const effectiveMode = resolveSupervisorMode(goalState);
     line('effective mode', effectiveMode);
+    // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
+    line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
   } catch {
     line('effective mode', '(unknown)');
+    line('status directive', 'on (default)');
   }
 } else {
   line('effective mode', 'reflection (default — no session)');
+  line('status directive', 'on (default — no session)');
 }
 
 let disabled = [];

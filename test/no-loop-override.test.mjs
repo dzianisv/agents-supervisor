@@ -213,6 +213,17 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     const messages = makeLoopyMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
 
+    // Isolate the invariant under test. The status-checkpoint correction
+    // (core/status-directive.mjs) is an ORTHOGONAL, one-shot injection on the
+    // complete path — it keys off status.md/roadmap evidence, never off tool
+    // activity. Turning it off here keeps this test about one thing: whether
+    // loop-like TELEMETRY can override a "complete" verdict. It must not.
+    // The status path's own behaviour is covered by the next test.
+    writeFileSync(
+      join(tmpDir, ".supervisor", "goals", `${ACTIVE_SESSION_ID}.json`),
+      JSON.stringify({ statusDiagram: false })
+    )
+
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
     await new Promise((r) => setTimeout(r, 5000))
@@ -221,5 +232,39 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     // nudge just because the tool-call pattern looks loop-like.
     const activePrompts = getActiveSessionPrompts()
     assert.equal(activePrompts.length, 0, "no continuation should be injected when the judge says complete, regardless of tool-activity pattern")
+  })
+
+  test("complete verdict + missing status checkpoint → one status reminder, and it is NOT a loop/STOP script", async () => {
+    // The status-checkpoint correction is the ONE thing allowed to speak after
+    // a "complete" verdict, and only because the agent skipped an explicit
+    // instruction — not because anything was inferred from tool activity. This
+    // pins that: exactly one injection, about status.md, carrying none of the
+    // scripted loop-detector language this whole file exists to forbid.
+    const messages = makeLoopyMessages()
+    const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
+
+    // No status.md in tmpDir and the final assistant text has no roadmap
+    // block => non-compliant. statusDiagram is left absent, i.e. default ON.
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+    await new Promise((r) => setTimeout(r, 5000))
+
+    const activePrompts = getActiveSessionPrompts()
+    assert.equal(activePrompts.length, 1, "exactly one status-checkpoint reminder should be injected")
+
+    const text = activePrompts[0]?.body?.parts?.[0]?.text || ""
+    assert.match(text, /status\.md/, "the reminder must be about the status checkpoint")
+    assert.match(text, /ROADMAP/, "the reminder must carry the directive")
+    // Same forbidden-script assertions as every other case in this file.
+    assert.doesNotMatch(text, /STOP: Planning Loop Detected/)
+    assert.doesNotMatch(text, /STOP: Action Loop Detected/)
+    assert.doesNotMatch(text, /\bSTOP\b/)
+    assert.doesNotMatch(text, /DO NOT:/)
+
+    // One-shot: a second idle on the SAME turn must stay silent, or the
+    // correction would be a loop of its own.
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+    await new Promise((r) => setTimeout(r, 3000))
+    assert.equal(getActiveSessionPrompts().length, 1, "the correction must fire at most once per turn")
   })
 })

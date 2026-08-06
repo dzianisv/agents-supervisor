@@ -1,5 +1,6 @@
 import { FEEDBACK_MARKER } from './evaluation.mjs'
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+import { appendStatusDirective } from './status-directive.mjs'
 
 // Items matching any of these must never be presented as ordinary
 // agent-actionable work. Force-pushes, hard resets, history rewrites, branch
@@ -66,10 +67,13 @@ export function buildEscalatingFeedback(
     ? 'This assessment was not fully confident — if these are already handled, say so; otherwise please continue.'
     : 'Please address these issues and continue.'
 
-  return `${headline}
+  // The status/roadmap directive is appended LAST so it survives as the final
+  // instruction the agent reads — it is orthogonal to the judge's verdict and
+  // never replaces or reorders it.
+  return appendStatusDirective(`${headline}
 ${feedbackStr}
 ${missing}
 ${nextActions}
 
-${closing}`
+${closing}`)
 }
