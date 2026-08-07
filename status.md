@@ -6,37 +6,39 @@
 allegedly kept pushing a session that was mid-conversation with the user.
 
 ```
-ROADMAP  ████████████████████  8/8 done
- [x] 1. Grep CC transcripts for injections (session 98473024, 105 Stop-hook msgs)
- [x] 2. Map supervisor stand-down conditions + session-id resolution (file:line)
- [x] 3. Verify H1 (own injection resets turn budget) — REFUTED as cause here
- [x] 4. Verify H2 (/supervisor off ignored) — REFUTED; disable was honoured
+ROADMAP  ████████████████████  12/12 done
+ [x] 1. Grep CC transcripts (session 98473024, 105 Stop-hook msgs)
+ [x] 2. Map stand-down conditions + session-id resolution (file:line)
+ [x] 3. Verify H1 (own injection resets turn budget) — REFUTED as the cause
+ [x] 4. Verify H2 (/supervisor off ignored)         — REFUTED, disable honoured
  [x] 5. Report findings + ranked fix list
- [x] 6. Fix #1 foreign-Stop-hook turn-key leak  -> PR #63 (ff658c2)
- [x] 7. Fix #3 no-progress gate, threshold 2   -> PR #63 (e7c58eb + follow-up)
- [x] 8. Fix #2 plugin cache — cache is CORRECT; main is behind -> PR #64
+ [x] 6. Fix #1 foreign-Stop-hook turn-key leak      -> #63 merged
+ [x] 7. Fix #3 no-progress gate (threshold 2)       -> #63 merged
+ [x] 8. Drain the 5-branch unmerged stack           -> #61, #65 merged
+ [x] 9. Root-cause "fixes never land": manifest version never bumped
+ [x] 10. Release 0.3.1 + `claude plugin update`     -> #66 merged, cache d4013b4
+ [x] 11. OpenClawBot CI-guard hook refire cap       -> OpenClawBot#3653 (open)
+ [x] 12. Delete 6 merged branches + worktrees; PR backlog now empty
 
 WHY SLOW
- - Misattribution cost a full investigation round. The 105 injections were NOT
+ - Misattribution cost a full round. The 105 injections were NOT
    agents-supervisor: 49 = Claude Code NATIVE /goal sentinel, 54 = OpenClawBot's
    own claude-post-merge-ci-guard-hook.sh. agents-supervisor injected 0 times.
  - First no-progress gate was a boolean (stand down on 1st repeat) and silently
-   collapsed every per-turn budget to 1 injection. Caught by e2e-cc in CI, not
-   locally. Reworked to a repeat COUNTER, threshold 2.
+   collapsed every per-turn budget to 1 injection. CI caught it, not local runs.
+ - #61 squash-merge orphaned the stacked PR #64; had to reopen as #65 and
+   hand-rebase #63 through a semantic conflict (goalStore -> sessionStore).
 
 NEXT
- - Review + merge PR #63. Then drain the 5-branch unmerged stack (#61 -> #64)
-   so main, and therefore the installed plugin cache, actually runs these fixes.
+ - Merge OpenClawBot#3653. Claude Code restart required for 0.3.1 to take effect.
+ - Not done: fix #4 (opencode has no pre-judge human-block guard),
+   fix #6 (184 orphan goal files in OpenClawBot/.supervisor/goals/),
+   `npm test` glob on main still matches the E2E (flaky, pre-existing).
 ```
 
-Test evidence for PR #63 (final):
-```
-node --test 'test/!(e2e-*).test.mjs'   -> tests 411  pass 411  fail 0
-node --test test/e2e-opencode.test.mjs -> tests 10   pass 10   fail 0
-node test/e2e-cc.mjs                   -> 12 passed, 0 failed (fake judge)
-CI run 31211268180                     -> test PASS (4m28s)
-```
-
+Final state: `main` = `d4013b4`, installed plugin `0.3.1` = `d4013b4`, 0 open PRs,
+0 stale branches. Verified the shipped cache actually contains both fixes
+(`FOREIGN_STOP_HOOK_PREFIX`, `NO_PROGRESS_REPEAT_THRESHOLD`, `core/session-store.mjs`).
 
 Two tracks below. Earlier session worked track B, which is not code in this repo.
 
