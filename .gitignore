@@ -30,3 +30,6 @@ venv/
 # OS / editor
 .DS_Store
 *.log
+
+# a worktree symlinks this in; `node_modules/` does not match a symlink
+node_modules

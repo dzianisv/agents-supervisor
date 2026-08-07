@@ -26,7 +26,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
-  SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER,
+  FEEDBACK_MARKER,
+  isNonHumanUserMessage, isNonHumanUserText, hashReply, evaluateNoProgress,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
@@ -153,9 +154,14 @@ export function computeTurnKey(normalizedMessages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.info?.role !== 'user') continue;
+    // Machine-injected user records are not human turns. This covers BOTH
+    // this supervisor's own markers AND foreign Stop hooks (`isMeta:true` /
+    // `Stop hook feedback:`) — the latter used to flip the turn key on every
+    // Stop event, resetting readAttempts to 0 forever.
+    if (isNonHumanUserMessage(msg)) continue;
     for (const part of msg.parts ?? []) {
       if (part?.type !== 'text' || typeof part.text !== 'string') continue;
-      if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
+      if (isNonHumanUserText(part.text)) continue;
       const trimmed = part.text.trim();
       if (trimmed) return trimmed.slice(0, 300);
     }
@@ -265,12 +271,18 @@ export function buildStopContext(stopPayload, transcriptTail) {
   const user_messages = [];
   for (const entry of transcriptTail) {
     if (entry.type !== 'user') continue;
+    // Machine-injected records (this supervisor's own feedback, a foreign
+    // Stop hook, CC's isMeta inserts) are not things the human asked for —
+    // feeding them back as "user messages" lets the judge treat a hook's
+    // demand as a human demand.
+    if (entry?.isMeta === true) continue;
     const content = entry?.message?.content;
     if (typeof content === 'string' && content.trim()) {
-      user_messages.push(content.trim());
+      if (!isNonHumanUserText(content)) user_messages.push(content.trim());
     } else if (Array.isArray(content)) {
       for (const block of content) {
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          if (isNonHumanUserText(block.text)) continue;
           user_messages.push(block.text.trim());
         }
       }
@@ -332,7 +344,10 @@ export function normalizeTranscriptToMessages(transcriptTail) {
         }
       }
     }
-    messages.push({ info: { role }, parts });
+    // `isMeta` MUST survive normalization or isNonHumanUserMessage's condition
+    // (a) is dead code. CC sets it at the TOP level of the jsonl record (not
+    // inside `message`) — verified against a real transcript.
+    messages.push({ info: { role, isMeta: entry?.isMeta === true }, parts });
   }
   return messages;
 }
@@ -557,6 +572,10 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
 
   for (const msg of messages) {
     if (msg.info?.role === 'user') {
+      // ONE predicate. `userMessageText` (core/task-context.mjs) now routes
+      // through isNonHumanUserMessage/isNonHumanUserText, so a foreign Stop
+      // hook's injection is excluded here exactly as it is in computeTurnKey —
+      // no second copy of the filter lives in this function.
       const text = userMessageText(msg);
       if (text != null) humanMessages.push(text);
     }
@@ -906,6 +925,61 @@ async function main() {
   if (!ctx.final_assistant_text) {
     debug({ msg: 'no_assistant_text_after_poll', session_id, tail_len: tail.length }, cwd);
     process.exit(0);
+  }
+
+  // 4a-pre. NO-PROGRESS GATE (deterministic, no LLM).
+  //
+  // Observed degenerate steady state: the agent replied `Same. Standing by.`
+  // eight times in a row, each in answer to a fresh injection. If the agent's
+  // final text is unchanged (modulo whitespace/case) from the last Stop we
+  // saw in this session, another push is provably pointless — stand down.
+  //
+  // Placement: AFTER the cheap eligibility gates (loop guard, disabled,
+  // attempt cap) and AFTER the transcript flush poll, but BEFORE the autopilot
+  // fast-path (4a), the trailing-question guard (4b) and the judge. It
+  // therefore covers the reflection, goal AND autopilot paths — the observed
+  // loop was on the goal/autopilot path, which never reaches the judge.
+  //
+  // BUDGET: this gate does NOT call writeAttemptCounter — it is an
+  // ELIGIBILITY gate, not a spent attempt. Saturating the counter here would
+  // make "the agent repeated itself" indistinguishable from "the budget is
+  // spent", and a later Stop in the same turn would then take the
+  // budget-exhausted branch and fire its side effects (disable autopilot,
+  // write a goal-exhaust verdict) for the wrong reason. The gate re-derives
+  // the same answer for free on every Stop, so it needs no persistence of its
+  // own beyond the reply hash.
+  //
+  // COUNTER, NOT BOOLEAN: standing down on the FIRST repeat is strictly
+  // stronger than the per-turn attempt budget and would silently reduce every
+  // budget to a single injection — a stuck agent sometimes does move on the
+  // second or third push. We tolerate NO_PROGRESS_REPEAT_THRESHOLD - 1
+  // consecutive repeats and stand down on the next one.
+  const replyHash = hashReply(ctx.final_assistant_text);
+  // AUTOPILOT_EXIT must always reach 4a: it is the only thing that turns
+  // autopilot off, and standing down on a repeat of it would strand the
+  // session in autopilot forever.
+  const autopilotExiting = /(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text);
+  let priorReplyHash = null;
+  let priorRepeatCount = 0;
+  try {
+    const prior = goalStore.load(cwd, session_id);
+    priorReplyHash = prior.lastReplyHash ?? null;
+    priorRepeatCount = prior.replyRepeatCount ?? 0;
+  } catch { /* best effort */ }
+  const noProgress = evaluateNoProgress(ctx.final_assistant_text, priorReplyHash, priorRepeatCount);
+  if (!autopilotExiting && noProgress.standDown) {
+    debug({ msg: 'no_progress_gate', session_id, mode, goal: !!goal, attempts, hash: replyHash, repeats: noProgress.repeatCount, action: 'stand_down' }, cwd);
+    process.exit(0);
+  }
+  // Locked-ish read-modify-write: never save() a whole state object read
+  // earlier in this turn, or the goal/attempts keys written above are lost.
+  try {
+    goalStore.mutate(cwd, session_id, (s) => {
+      s.lastReplyHash = noProgress.hash;
+      s.replyRepeatCount = noProgress.repeatCount;
+    });
+  } catch (e) {
+    debug({ msg: 'no_progress_gate_persist_failed', session_id, err: String(e?.message ?? e) }, cwd);
   }
 
   // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge

@@ -37,7 +37,9 @@
  * and the Claude Code Stop hook) share one implementation and one test suite.
  */
 
-import { SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER } from './evaluation.mjs'
+import {
+  isNonHumanUserMessage, isNonHumanUserText,
+} from './evaluation.mjs'
 
 /**
  * Single source of truth for how much of a free-text blob (the agent's last
@@ -111,25 +113,40 @@ export function truncateForPrompt(text, limit = PROMPT_TEXT_LIMIT, opts = {}) {
   return `${truncationNotice(limit, text.length, 'tail', label)}\n\n${text.slice(text.length - limit)}`
 }
 
-/** True when a user-role text part is a supervisor injection, not a human ask. */
+/**
+ * True when a user-role text part is a machine injection, not a human ask.
+ *
+ * Delegates to `isNonHumanUserText` (core/evaluation.mjs) — THE single
+ * predicate. This name used to carry its own narrower copy that only knew
+ * about THIS supervisor's markers, so a FOREIGN Stop hook's injection
+ * (`Stop hook feedback: …`, `isMeta:true`) read as a fresh human message.
+ * Kept as a named alias because it reads better at the call sites in this
+ * module; it must never grow a second implementation.
+ */
 export function isSupervisorInjectedText(text) {
-  if (typeof text !== 'string') return false
-  return text.includes(SELF_ASSESSMENT_MARKER) || text.includes(FEEDBACK_MARKER)
+  return isNonHumanUserText(text)
 }
 
 /**
  * The human-authored text of a user message, or null when the message carries
- * none (supervisor injection, async `<task-notification>` metadata, tool-only).
+ * none (supervisor injection, FOREIGN Stop-hook injection, `isMeta` insert,
+ * async `<task-notification>` metadata, tool-only).
+ *
  * Mirrors the filter buildTaskContext/buildTaskContextFromTranscript already
  * applied inline — extracted here so every caller agrees on what "a real user
- * turn" is.
+ * turn" is. `computeTurnKey` (bin/supervisor-on-stop.mjs) and
+ * `getLastRelevantUserMessageId` (opencode/supervisor-impl.ts) answer the same
+ * question through the same two evaluation.mjs helpers.
  * @param {any} msg
  * @returns {string|null}
  */
 export function userMessageText(msg) {
+  // Message-level check first: CC flags a hook insert with a top-level
+  // `isMeta`, which no per-part text inspection can see.
+  if (isNonHumanUserMessage(msg)) return null
   for (const part of msg?.parts || []) {
     if (part?.type !== 'text' || !part.text) continue
-    if (isSupervisorInjectedText(part.text)) continue
+    if (isNonHumanUserText(part.text)) continue
     if (part.text.trim().startsWith('<task-notification>')) continue
     return part.text
   }

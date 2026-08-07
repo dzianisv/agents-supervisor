@@ -160,17 +160,53 @@ check('trailing question in final message → waiting_for_user guard, no inject,
   assert.equal(verdict, null, 'guard exits before the assessment pipeline runs');
 });
 
+// Vary the assistant's final text per iteration. A real budget exercise looks
+// like this: the agent IS pushed and DOES say something new each time, it just
+// never finishes. Replaying one byte-identical reply would instead exercise the
+// no-progress gate (see below), which is a different mechanism and would cap
+// this at NO_PROGRESS_REPEAT_THRESHOLD injections regardless of the budget.
+function driftTurnsWithText(text) {
+  return [
+    driftTurns[0],
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'Edit', input: {} },
+      { type: 'text', text },
+    ] } },
+  ];
+}
+
 check('attempt cap → stops injecting after max attempts', () => {
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-cap';
-  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
-    last_assistant_message: driftTurns[1].message.content[1].text };
   let blocks = 0;
   for (let i = 0; i < 5; i++) {
+    const text = `I added the route to server.js (pass ${i}). Next step: run the tests to verify it.`;
+    fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
     const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
     if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
   }
   assert.equal(blocks, 3, `expected 3 injects (max), got ${blocks}`);
+});
+
+check('no-progress gate → 8 identical replies stand down on the 3rd', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-no-progress';
+  // Big budget so the ONLY thing that can stop this loop is the gate.
+  goalStore.setRetry(dir, sid, 16);
+  const text = 'Same. Standing by.';
+  fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+  const decisions = [];
+  for (let i = 0; i < 8; i++) {
+    const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+    decisions.push(!!(stdout && JSON.parse(stdout).decision === 'block'));
+  }
+  // reply 1: no prior hash → inject. reply 2: repeat 1 (< threshold) → inject.
+  // reply 3 onward: repeat >= 2 → stand down, forever.
+  assert.deepEqual(decisions.slice(0, 2), [true, true], 'first repeat must still be pushed');
+  assert.deepEqual(decisions.slice(2), [false, false, false, false, false, false],
+    'from the 3rd identical reply on, the gate must stand down every time');
 });
 
 // ── Goal loop (Claude Code side) ──────────────────────────────────────────
@@ -216,10 +252,22 @@ check('goal raises retry budget past the default 3 (injects a 4th time)', () => 
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-goal-budget';
   goalStore.setGoal(dir, sid, 'keep going');
-  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
-    last_assistant_message: driftTurns[1].message.content[1].text };
   let blocks = 0;
   for (let i = 0; i < 4; i++) {
+    // The agent must MOVE between pushes. One human message → one turn key, so
+    // varying only the assistant text keeps this inside a single turn (what the
+    // budget is scoped to) while modelling an agent that answers each
+    // injection. Replaying one frozen reply is the stuck-agent scenario the
+    // no-progress gate exists to stop — covered by its own case above.
+    const text = `I added the route to server.js. Next step ${i + 1}: run the tests to verify it.`;
+    fs.writeFileSync(tp, [
+      driftTurns[0],
+      { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'tool_use', name: 'Edit', input: {} },
+        { type: 'text', text },
+      ] } },
+    ].map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
     const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
     if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
   }

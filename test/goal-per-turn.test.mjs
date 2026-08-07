@@ -126,8 +126,22 @@ test(
 
     // HARD_CAP is 7 (see bin/supervisor-on-stop.mjs) — drive exactly to it
     // within the SAME human turn.
+    //
+    // The agent's reply must CHANGE on each push. The turn key is derived from
+    // the last human user message (computeTurnKey), so varying only the
+    // assistant text keeps us inside one turn — which is what this test is
+    // about — while modelling an agent that actually responds to each
+    // injection. Replaying one frozen reply instead would be a different
+    // scenario entirely (a stuck agent), and the no-progress gate in
+    // bin/supervisor-on-stop.mjs deliberately stands down on that after
+    // NO_PROGRESS_REPEAT_THRESHOLD identical replies — see
+    // test/no-progress-gate.test.mjs, which owns that contract.
     for (let i = 0; i < 7; i++) {
-      const out = runOnStop(payloadA);
+      const tp = mkTranscript(d, [
+        turnA[0],
+        { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Working on it — pass ${i + 1}.` }] } },
+      ], `turnA-${i}`);
+      const out = runOnStop({ ...payloadA, transcript_path: tp, last_assistant_message: `Working on it — pass ${i + 1}.` });
       assert.equal(out.code, 0, `call ${i + 1} should exit 0`);
       const parsed = JSON.parse(out.stdout);
       assert.equal(parsed.decision, 'block', `call ${i + 1} should inject a continuation`);
@@ -208,8 +222,14 @@ test(
     const payload = { session_id: sid, cwd: d, transcript_path: tp, last_assistant_message: 'Working on it.' };
 
     // Burn the whole per-turn budget (HARD_CAP = 7) inside ONE human turn.
+    // Fresh assistant text per push for the same reason as the test above —
+    // one human message, so one turn key, but an agent that actually moves.
     for (let i = 0; i < 7; i++) {
-      const out = runOnStop(payload);
+      const tpi = mkTranscript(d, [
+        turns[0],
+        { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Working on it — pass ${i + 1}.` }] } },
+      ], `budget-${i}`);
+      const out = runOnStop({ ...payload, transcript_path: tpi, last_assistant_message: `Working on it — pass ${i + 1}.` });
       assert.equal(out.code, 0, `call ${i + 1} should exit 0`);
       assert.equal(JSON.parse(out.stdout).decision, 'block', `call ${i + 1} should inject`);
     }
