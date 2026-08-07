@@ -15,7 +15,7 @@ import { execFile } from "child_process"
 // Shared goal-loop DECISION logic — single source of truth across runtimes.
 // (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
 import {
-  resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  resolveMaxAttempts, resolveTurnMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
@@ -62,7 +62,7 @@ import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
 // supervisor-impl.ts lives in opencode/, so ".." reaches the repo root.
 const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents", "supervisor")
-export { resolveMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
+export { resolveMaxAttempts, resolveTurnMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
 export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 export {
   buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody, retireProjectGoal,
@@ -713,15 +713,34 @@ async function getAgentsFile(directory: string): Promise<string> {
   return ""
 }
 
+/**
+ * Stable identity for one message — THE per-turn key (see
+ * getLastRelevantUserMessageId, which the attempt budget is scoped by).
+ *
+ * `msg.info.id` is checked, not just `msg.id`. opencode's REST transcript
+ * shape is `{ info: { id, role, time }, parts: [...] }` — there is NO
+ * top-level `id`, so the old `if (msg.id)` NEVER matched and every key fell
+ * through to the composite. Verified against a live server: `msg.id` is
+ * `undefined` and `msg.info.id` is `msg_fda79148d001bdPZnwwZoyiPGx`.
+ *
+ * That mattered because the composite is lossy: `info.time.start` is unset on
+ * user messages (only `created` exists), so every key degraded to
+ * `user:0:<first 20 characters>`. Two consecutive human turns sharing a
+ * 20-character prefix — "can you please check the alpha module" and "…the
+ * beta module" both key as `user:0:can you please check` — collided, and the
+ * second turn silently inherited the first turn's spent attempt budget, i.e.
+ * was never supervised at all.
+ */
 function getMessageSignature(msg: any): string {
-  if (msg.id) return msg.id
-  const role = msg.info?.role || "unknown"
-  const time = msg.info?.time?.start || 0
-  const textPart = msg.parts?.find((p: any) => p.type === "text")?.text?.slice(0, 20) || ""
+  const id = msg?.id || msg?.info?.id
+  if (id) return id
+  const role = msg?.info?.role || "unknown"
+  const time = msg?.info?.time?.created ?? msg?.info?.time?.start ?? 0
+  const textPart = msg?.parts?.find((p: any) => p.type === "text")?.text?.slice(0, 20) || ""
   return `${role}:${time}:${textPart}`
 }
 
-function getLastRelevantUserMessageId(messages: any[]): string | null {
+export function getLastRelevantUserMessageId(messages: any[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.info?.role === "user") {
@@ -1442,15 +1461,29 @@ Return a short paragraph plus bullet list of any gaps.`
 export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   initDebugLogger(directory)
   const judgeSessionIds = new Set<string>()
-  const lastReflectedMsgId = new Map<string, string>()
   const activeSupervisors = new Set<string>()
   const recentlyAbortedSessions = new Map<string, number>()
-  const attempts = new Map<string, number>()
+  /**
+   * In-memory tier of THE per-turn attempt counter. One entry per session,
+   * replaced when the turn moves, so it is bounded by live-session count.
+   *
+   * This is NOT a second stop mechanism. It is a monotonic floor under the
+   * persisted counter in `.supervisor/sessions/<id>/state.json`: reads take
+   * max(memory, disk) and writes go to both. Rationale — the persisted write
+   * is best-effort (an fs failure must never crash a turn), and without an
+   * in-memory floor a failed saturation write would let the same turn be
+   * supervised again. Disk gives cross-restart and cross-process safety;
+   * memory gives in-process safety when disk is unavailable. Same number,
+   * two tiers.
+   */
+  const memAttempts = new Map<string, { turnKey: string; count: number }>()
   /**
    * One-shot registry for the "completed but skipped the status checkpoint"
    * correction: sessionId -> the lastUserMsgId it was already sent for.
-   * Mirrors lastReflectedMsgId's shape and purpose — at most ONE correction
-   * per human turn, ever, so this can never become a loop.
+   * At most ONE correction per human turn, ever, so this can never become a
+   * loop. Kept alongside the attempt counter (which that path also saturates)
+   * because it is a different concern: "this chore was already asked for",
+   * not "this turn's budget is spent".
    */
   const statusCorrectionSent = new Map<string, string>()
   /**
@@ -1463,6 +1496,69 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
    * .supervisor/disabled check to the wrong project.
    */
   const sessionDirCache = new Map<string, string>()
+
+  /**
+   * THE per-turn attempt counter — read.
+   *
+   * Turn-scoped by construction: `sessionStore.readAttempts` returns 0 the
+   * moment the stored turnKey differs from `turnKey`, and the memory tier is
+   * compared on turnKey too. So a new human message resets the budget without
+   * anyone having to remember to clear anything (the class of bug the old
+   * `attempts.delete(attemptKey)` calls existed to paper over).
+   *
+   * Never throws: an unreadable state file must not stop supervision, and the
+   * memory tier still bounds the loop inside this process.
+   */
+  function readTurnAttempts(sessionId: string, turnKey: string): number {
+    const cached = memAttempts.get(sessionId)
+    const mem = cached && cached.turnKey === turnKey ? cached.count : 0
+    let disk = 0
+    try {
+      disk = sessionStore.readAttempts(directory, sessionId, turnKey) || 0
+    } catch (e: any) {
+      debug("attempts read failed (using in-memory tier):", e?.message || e)
+    }
+    return Math.max(mem, disk)
+  }
+
+  /**
+   * THE per-turn attempt counter — write. Memory first (cannot fail), then
+   * disk (best-effort). Monotonic within a turn on both tiers.
+   */
+  function writeTurnAttempts(sessionId: string, n: number, turnKey: string): void {
+    const cached = memAttempts.get(sessionId)
+    const base = cached && cached.turnKey === turnKey ? cached.count : 0
+    if (n > base || !cached || cached.turnKey !== turnKey) {
+      memAttempts.set(sessionId, { turnKey, count: Math.max(n, base) })
+    }
+    try {
+      sessionStore.writeAttempts(directory, sessionId, n, turnKey)
+    } catch (e: any) {
+      debug("attempts write failed (in-memory tier still holds):", e?.message || e)
+    }
+  }
+
+  /**
+   * Stand down for the REST of this human turn.
+   *
+   * There is exactly ONE way the per-turn loop stops: the counter reaching the
+   * budget. Every path whose intent is "do not supervise this turn again"
+   * therefore saturates the counter rather than setting a second boolean flag.
+   * The previous design had two mechanisms (a `lastReflectedMsgId` boolean AND
+   * this counter) and the boolean always won, which made the counter — and
+   * therefore `/supervisor retry N` — dead on this runtime.
+   *
+   * ONLY for paths that have already committed to supervising this turn
+   * (judge ran, or a judge/transport error ended the pass). Cheap, idempotent
+   * ELIGIBILITY gates — the subagent gate, `.supervisor/disabled`, the
+   * non-actionable/control-command turn gate — must plain-return instead:
+   * they re-derive the same answer for free on every idle, and saturating
+   * makes them indistinguishable from a genuinely spent budget, which then
+   * triggers the cap branch's side effects (see the turn-gate comment).
+   */
+  function standDownForTurn(sessionId: string, turnKey: string, budget: number): void {
+    writeTurnAttempts(sessionId, budget, turnKey)
+  }
 
   /**
    * Persist the session -> project-directory mapping so it survives a server
@@ -2187,10 +2283,77 @@ Do NOT call this tool:
         const lastUserMsgId = getLastRelevantUserMessageId(messages)
         if (!lastUserMsgId) return
 
+        // THE turn key. getLastRelevantUserMessageId deliberately SKIPS
+        // supervisor-injected user messages, so this stays pinned to the last
+        // HUMAN message across every injection in the turn — which is exactly
+        // what makes a per-turn counter possible. It is no longer the stop
+        // condition itself; the counter below is.
         const initialUserMsgId = lastUserMsgId
-        const attemptKey = `${sessionId}:${lastUserMsgId}`
-        const lastReflectedId = lastReflectedMsgId.get(sessionId)
-        if (lastUserMsgId === lastReflectedId) return
+        const turnKey = lastUserMsgId
+
+        // Supervisor goal/retry state, loaded BEFORE the budget gate: the gate
+        // needs the mode (goal/autopilot get the higher budget) and the
+        // `/supervisor retry N` override. Cheap — one small local JSON read —
+        // and it lets an already-spent turn bail before paying for
+        // buildTaskContext and the judge round-trip.
+        const sup = await supervisorStore.load(directory, sessionId)
+        const mode = resolveSupervisorMode(sup) as SupervisorMode
+        let goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+        const effectiveMaxAttempts = resolveTurnMaxAttempts({
+          mode,
+          sessionOverride: sup.maxAttempts,
+          config: await loadConfiguredMaxAttempts(),
+          // OpenCode has no platform ceiling on continuations (unlike Claude
+          // Code's Stop-hook block cap) — see resolveClaudeCodeHardCap.
+        })
+
+        // ── THE per-turn stop condition ──────────────────────────────────
+        //
+        // Exactly one mechanism ends a turn: this counter reaching the budget.
+        // Pre-increment check, mirroring bin/supervisor-on-stop.mjs — so
+        // `/supervisor retry N` yields exactly N injections (the old
+        // post-increment check yielded N-1, and `retry 1` yielded ZERO).
+        //
+        // TERMINATION: every injection path below writes count+1 before it
+        // prompts, and the agent's reply to that injection raises a fresh
+        // session.idle for the SAME turnKey. So each idle either injects and
+        // strictly increases the counter, or stands down (which saturates it).
+        // The counter is monotonic within a turn and bounded above by
+        // effectiveMaxAttempts, therefore the turn ends after at most
+        // effectiveMaxAttempts injections.
+        const currentAttemptCount = readTurnAttempts(sessionId, turnKey)
+        if (currentAttemptCount >= effectiveMaxAttempts) {
+          // Autopilot must not stay armed past its budget, or the next human
+          // turn silently resumes an unattended loop.
+          if (mode === "autopilot") {
+            try { await supervisorStore.setAutopilot(directory, sessionId, false) } catch { /* best effort */ }
+            await showToast(client, directory, `Autopilot budget exhausted (${effectiveMaxAttempts} attempts)`, "warning")
+          }
+          // An active goal must not die silently at the cap. Mirrors
+          // bin/supervisor-on-stop.mjs: goal.attempts is the SAME number as
+          // the counter, so decideGoalTransition is guaranteed to report
+          // "exhausted" here, with reason "deadline" if the goal also outlived
+          // its window — and only a deadline is a real end-of-goal. The
+          // attempts cap is per-human-turn, so persisting "exhausted" for it
+          // would kill a goal the human is still driving.
+          if (goal) {
+            try {
+              const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMaxAttempts })
+              if (t.action === "exhausted" && t.reason === "deadline") {
+                await supervisorStore.mutate(directory, sessionId, (s) => {
+                  s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+                })
+                await showToast(client, directory, "Goal deadline reached — paused", "warning")
+              } else if (mode !== "autopilot") {
+                await showToast(client, directory, `Goal budget spent for this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
+              }
+            } catch (e: any) {
+              debug("goal transition at attempt cap failed (non-fatal):", e?.message || e)
+            }
+          }
+          debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", effectiveMaxAttempts, "mode:", mode, "goal:", !!goal)
+          return
+        }
 
         const context = await buildTaskContext(messages, sessionDirectory)
         if (!context) return
@@ -2199,13 +2362,6 @@ Do NOT call this tool:
         const customPrompt = await loadSupervisorPrompt(sessionDirectory)
         const agents = await getAgentsFile(sessionDirectory)
         const rubric = await loadRubric(sessionDirectory)
-        const currentAttemptCount = attempts.get(attemptKey) || 0
-        // Supervisor goal/retry state. A /supervisor:retry override applies even
-        // without a goal (sessionOverride). An active goal augments the judge
-        // rubric with a mandatory completion requirement and drives the goal loop.
-        const sup = await supervisorStore.load(directory, sessionId)
-        const mode = resolveSupervisorMode(sup) as SupervisorMode
-        let goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
 
         // ── Non-actionable turn gate ─────────────────────────────────────
         // A completion judge only makes sense when the human actually asked for
@@ -2222,27 +2378,37 @@ Do NOT call this tool:
         })
         if (turnGate.skip) {
           debug("Skipping reflection —", turnGate.reason, "for", sessionId.slice(0, 8))
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          // Plain return — deliberately does NOT touch the attempt counter.
+          //
+          // This is an ELIGIBILITY gate, not a stand-down: it is a pure
+          // function of the turn's own text, so it returns the same answer on
+          // every idle for this turn and needs no memory to terminate. It is
+          // also free (no judge, no LLM).
+          //
+          // Saturating here was actively harmful. opencode raises several
+          // `session.idle` events per turn, so a later pass would read the
+          // saturated counter, take the budget-exhausted branch, and fire that
+          // branch's SIDE EFFECTS — most damagingly `setAutopilot(false)`.
+          // Measured: `/supervisor autopilot` skipped itself as a control
+          // command, saturated the counter, and the next idle 34ms later
+          // disarmed autopilot before the user typed a single task.
           return
         }
         // A goal's attempt budget is per-human-turn, not cumulative for the
         // whole session: once the human speaks again the previous turn's
-        // escalation no longer applies, so goal.attempts resets instead of
-        // marching toward decideGoalTransition's exhausted cap forever (which
-        // killed the goal permanently, mid-session, with no verdict).
-        // lastTurnKey is only null on the very first pass after setGoal, so
-        // that first observation just stamps it without a spurious reset.
-        // Mirrors the identical reset in bin/supervisor-on-stop.mjs — including
-        // its turnKey != null guard: without it a null/undefined id makes the
-        // reset condition true on every idle, so attempts never accumulate and
-        // the loop never escalates or stands down.
-        if (goal && lastUserMsgId != null && goal.lastTurnKey !== lastUserMsgId) {
-          const shouldReset = goal.lastTurnKey != null
-          goal = { ...goal, lastTurnKey: lastUserMsgId, ...(shouldReset ? { attempts: 0 } : {}) }
+        // escalation no longer applies. goal.attempts is MIRRORED from the one
+        // turn-scoped counter above (which already resets itself when turnKey
+        // moves) rather than being a second, independently-incremented count —
+        // that duplicate was bug #57 on the Claude Code hook and this line is
+        // the same fix. lastTurnKey is still stamped so the persisted record
+        // says which human turn the count belongs to.
+        // The `lastUserMsgId != null` guard mirrors bin/supervisor-on-stop.mjs:
+        // without it a null id makes the condition true on every idle.
+        if (goal && lastUserMsgId != null && (goal.lastTurnKey !== lastUserMsgId || goal.attempts !== currentAttemptCount)) {
+          goal = { ...goal, lastTurnKey: lastUserMsgId, attempts: currentAttemptCount }
           sup.goal = goal
           try { await supervisorStore.mutate(directory, sessionId, (s) => { s.goal = goal }) } catch { /* best effort */ }
         }
-        const effectiveMaxAttempts = resolveMaxAttempts({ sessionOverride: sup.maxAttempts, config: await loadConfiguredMaxAttempts() })
 
         // ── Autopilot fast-path ──────────────────────────────────────────
         // Binding contract: autopilot is a STATIC nudge loop only. It never
@@ -2253,16 +2419,15 @@ Do NOT call this tool:
         // context, but it is never branched on to change what the nudge says
         // or to author a judgment.
         if (mode === "autopilot") {
-          const autopilotAttempt = (attempts.get(attemptKey) || 0) + 1
-          attempts.set(attemptKey, autopilotAttempt)
-
-          if (autopilotAttempt >= effectiveMaxAttempts) {
-            await supervisorStore.setAutopilot(directory, sessionId, false)
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
-            await showToast(client, directory, `Autopilot budget exhausted (${effectiveMaxAttempts} attempts)`, "warning")
-            debug("Autopilot budget exhausted for", sessionId.slice(0, 8))
-            return
-          }
+          // Budget exhaustion is handled by the ONE gate above, which also
+          // disarms autopilot. Reaching here means budget remains, so this
+          // nudge is attempt N of effectiveMaxAttempts — and because the
+          // counter is now persisted, that number is TRUE across idles and
+          // across a server restart. It used to always read "1/N".
+          const autopilotAttempt = currentAttemptCount + 1
+          // Write BEFORE prompting: if promptAsync throws we still burned the
+          // attempt, which fails toward termination rather than toward a loop.
+          writeTurnAttempts(sessionId, autopilotAttempt, turnKey)
 
           // Normal autopilot nudge — no judge, no loop verdict, just continue.
           const activityLine = context.toolActivityNote ? `\n${context.toolActivityNote}\n` : ""
@@ -2290,7 +2455,7 @@ Continue now.`
             debug("promptAsync failed (autopilot nudge):", e?.message || e)
             reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot" })
           }
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          debug("Autopilot nudge", autopilotAttempt, "/", effectiveMaxAttempts, "for", sessionId.slice(0, 8))
           return
         }
 
@@ -2380,11 +2545,11 @@ Continue now.`
             assessmentSession = data
           } catch {
             debug("Failed to create self-assessment session")
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
             return
           }
           if (!assessmentSession?.id) {
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
             return
           }
           judgeSessionIds.add(assessmentSession.id)
@@ -2419,8 +2584,7 @@ Continue now.`
         }
 
         if (!selfAssessment) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           return
         }
 
@@ -2429,8 +2593,7 @@ Continue now.`
         // Check if user sent a new message or aborted during assessment
         const abortTime = recentlyAbortedSessions.get(sessionId)
         if (abortTime) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           return
         }
 
@@ -2440,13 +2603,12 @@ Continue now.`
           currentMessages = Array.isArray(data) ? data : undefined
         } catch {
           debug("Session deleted during supervisor, aborting:", sessionId.slice(0, 8))
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           return
         }
         const currentUserMsgId = getLastRelevantUserMessageId(currentMessages || [])
         if (currentUserMsgId && currentUserMsgId !== initialUserMsgId) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, initialUserMsgId)
+          standDownForTurn(sessionId, initialUserMsgId, effectiveMaxAttempts)
           return
         }
 
@@ -2468,8 +2630,7 @@ Continue now.`
         }
 
         if (!analysis) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           await showToast(client, directory, "Supervisor analysis failed", "warning")
           return
         }
@@ -2510,8 +2671,7 @@ Continue now.`
                 s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
               })
             }
-            attempts.delete(attemptKey)
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
+            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
             await showToast(
               client,
               directory,
@@ -2676,23 +2836,25 @@ Continue now.`
 
           if (correctionInjected) {
             statusCorrectionSent.set(sessionId, lastUserMsgId)
-            lastReflectedMsgId.set(sessionId, lastUserMsgId)
-            attempts.delete(attemptKey)
+            // Stand down for the rest of the turn. The task is already
+            // COMPLETE — the correction is a one-line chore, not another
+            // continuation attempt — so there is no remaining budget worth
+            // preserving, and re-running the judge after it would cost a
+            // second full judge round-trip to reach the same verdict.
+            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
             debug("Supervisor injected status checkpoint correction for", statusCorrectionKey)
             return
           }
 
 
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
           debug("Supervisor complete")
           return
         }
 
         if (analysis.requiresHumanAction && !analysis.shouldContinue) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
           await showToast(client, directory, `Action needed: ${hint}`, "warning")
           debug("Supervisor requires human action (no agent-actionable work remaining)")
@@ -2716,8 +2878,7 @@ Continue now.`
           feedback: analysis.rawFeedback ?? analysis.reason,
         })
         if (!analysis.shouldContinue || actionlessVerdict) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           const standDownReason = actionlessVerdict
             ? "verdict had no actionable content (empty missing, empty next_actions, blank feedback)"
             : "judge did not ask to continue (shouldContinue=false)"
@@ -2734,39 +2895,35 @@ Continue now.`
           preFeedbackMessages = Array.isArray(data) ? data : undefined
         } catch {
           debug("Session deleted before feedback injection, aborting:", sessionId.slice(0, 8))
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           return
         }
         const preFeedbackUserMsgId = getLastRelevantUserMessageId(preFeedbackMessages || [])
         if (preFeedbackUserMsgId && preFeedbackUserMsgId !== initialUserMsgId) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, initialUserMsgId)
+          standDownForTurn(sessionId, initialUserMsgId, effectiveMaxAttempts)
           debug("User sent new message during analysis, skipping feedback")
           return
         }
         const preFeedbackAbort = recentlyAbortedSessions.get(sessionId)
         if (preFeedbackAbort) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           debug("Session aborted during analysis, skipping feedback")
           return
         }
 
+        // Burn one attempt. The budget CHECK lives in the single gate at the
+        // top of this handler (pre-increment, mirroring
+        // bin/supervisor-on-stop.mjs); this is only the write. There used to
+        // be a second `>= effectiveMaxAttempts` check right here, which made
+        // the effective budget N-1 and `/supervisor retry 1` a no-op.
+        //
         // Ordering invariant (see issue #57): the goal loop above runs BEFORE
-        // this per-message counter, so an active goal's budget check always
-        // gets first refusal and decideGoalTransition's reason:"attempts"
-        // branch stays reachable on this runtime. This counter is only the
-        // fallback cap for ordinary sessions without a goal. Do NOT move this
-        // check above the goal loop — that inversion is exactly what made the
-        // exhaust reason dead code on the Claude Code hook.
-        const nextAttemptCount = (attempts.get(attemptKey) || 0) + 1
-        attempts.set(attemptKey, nextAttemptCount)
-        if (nextAttemptCount >= effectiveMaxAttempts) {
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
-          await showToast(client, directory, `Max attempts (${effectiveMaxAttempts}) reached`, "warning")
-          debug("Max attempts reached for", sessionId.slice(0, 8))
-          return
-        }
+        // this, so an active goal's own transition gets first refusal and
+        // decideGoalTransition's reason:"attempts" branch stays reachable.
+        // Written BEFORE promptAsync so a failed injection still costs an
+        // attempt — failing toward termination, never toward a loop.
+        const nextAttemptCount = currentAttemptCount + 1
+        writeTurnAttempts(sessionId, nextAttemptCount, turnKey)
 
         // Reflection is the SOLE completion/progress judgement authority.
         // buildEscalatingFeedback is driven purely by the judge's own verdict
@@ -2777,7 +2934,6 @@ Continue now.`
         // buildReflectionPrompt/buildSelfAssessmentPrompt) — it never bypasses
         // the judge to construct feedback directly.
         const feedbackText = buildEscalatingFeedback(
-          nextAttemptCount,
           analysis.severity || "MEDIUM",
           {
             feedback: analysis.reason || "Task incomplete",
@@ -2790,7 +2946,6 @@ Continue now.`
             // "Missing: fix build errors" as if both were this turn's fault.
             goal_condition: goal?.condition || injectedProjectGoalCondition || "",
           },
-          effectiveMaxAttempts,
           // `/supervisor:status off` must silence the reflection path too.
           { statusDirective: isStatusDiagramEnabled(sup) }
         )
@@ -2799,8 +2954,7 @@ Continue now.`
         // rendering. isActionlessVerdict above should already have stood us
         // down; this catches any future verdict shape that slips past it.
         if (!hasFeedbackBody(feedbackText)) {
-          attempts.delete(attemptKey)
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           debug("Supervisor standing down, no injection: rendered feedback had an empty body")
           return
         }
@@ -2825,14 +2979,17 @@ Continue now.`
         } catch (e: any) {
           debug("promptAsync failed (feedback):", e?.message || e)
           reportError(e, { plugin: "supervisor-3", op: "prompt-feedback" })
-          lastReflectedMsgId.set(sessionId, lastUserMsgId)
+          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           return
         }
 
-        // Prevent supervisor loop: mark this task as reflected so the next
-        // session.idle (triggered by the agent responding to feedback) does not
-        // start another supervisor cycle for the same user message.
-        lastReflectedMsgId.set(sessionId, lastUserMsgId)
+        // NO stand-down here. This is the bug this branch exists to fix: the
+        // old code set the "already reflected this turn" boolean immediately
+        // after a SUCCESSFUL injection, so the session.idle raised by the
+        // agent's reply bailed at the top and the supervisor could never push
+        // twice in one human turn. The attempt counter was incremented above
+        // and then never read again. Termination is now the counter's job:
+        // the next idle re-enters with count+1 and stops at the budget.
 
         // Goal budget is burned ONLY here, after a continuation was actually
         // injected. If any earlier recheck early-returned (or promptAsync above

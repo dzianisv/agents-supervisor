@@ -191,3 +191,87 @@ by a per-turn probe string. 20/20 after the fix.
 ### `test/e2e-cc.mjs` — Claude Code Stop hook
 
 Real hook entry point: Stop payload on stdin, real transcript jsonl, stdout decision contract. `SUPERVISOR_FAKE_JUDGE` makes it deterministic; `SUPERVISOR_CC_LIVE=1` uses the real judge. The goal-achieved case asserts the session goal is CLEARED (not left as `status:'achieved'`) and that `.supervisor/goal-achieved.log` carries the record — clearing must never be silent.
+
+### `test/e2e-opencode.test.mjs` → `describe("per-turn attempt budget")` — ONE stop mechanism
+
+The opencode runtime could inject **at most once per human turn**. Claude Code
+could not — the two had silently diverged, and there was no opencode-path test
+covering a second injection on one turn (`test/e2e-cc.mjs`'s "goal raises retry
+budget past the default 3" spawns `bin/supervisor-on-stop.mjs`, CC only, and
+that passing test is what gave the false confidence).
+
+**The mechanism.** `getLastRelevantUserMessageId` skips supervisor-injected
+messages, so the turn key stays pinned to the last HUMAN message — that is what
+makes a per-turn counter possible, and it stays. What changed is the STOP
+condition. `if (lastUserMsgId === lastReflectedId) return` (a boolean set at 22
+sites, deleted at none, including immediately after a *successful* injection)
+is gone. The single stop is `attempts >= effectiveMaxAttempts`, checked
+**pre-increment** exactly as `bin/supervisor-on-stop.mjs:875` does — the old
+opencode check was post-increment, so the real budget was N−1 and
+`/supervisor retry 1` yielded ZERO injections.
+
+**Termination** is proved, not asserted: `settleInjections` always burns a full
+15s quiet window after the last change, i.e. it is a bounded wait for an
+injection N+1 that must never arrive. The counter is monotonic within a turn,
+every injection path writes count+1 *before* prompting (a failed `promptAsync`
+still costs an attempt — fail toward termination), and the turn ends after at
+most `effectiveMaxAttempts` injections. The suite is also proven SENSITIVE:
+re-adding the one deleted stand-down line after a successful injection turns
+"3 injections" into 1.
+
+**Two tiers, one counter.** `attempts` is persisted via `sessionStore`
+(`.supervisor/sessions/<id>/state.json`, locked `mutate()` — the lost-update
+path `test/goal-per-turn.test.mjs` guards) with an in-memory monotonic floor.
+That is not a second stop mechanism: reads take `max(memory, disk)`. Disk gives
+cross-restart and cross-process safety (32 accidental double-injections in the
+forensic sample came from the old in-memory-only map); memory keeps the loop
+bounded if the best-effort disk write fails.
+
+**Eligibility gates must NOT saturate the counter.** Only paths that already
+committed to supervising this turn stand down by writing the budget. The
+subagent gate, `.supervisor/disabled`, and the non-actionable/control-command
+turn gate plain-return — they re-derive the same answer for free on every idle.
+Saturating there made them indistinguishable from a spent budget, and opencode
+raises several `session.idle` events per turn, so a later pass took the
+budget-exhausted branch and fired its SIDE EFFECTS. Measured: `/supervisor
+autopilot` skipped itself as a control command, saturated the counter, and the
+next idle 34ms later called `setAutopilot(false)` — the command disarmed itself
+before the user typed a task.
+
+**`/supervisor …` is never work, in any mode.**
+`shouldSkipReflection` checks `isSupervisorControlTurn` BEFORE the
+goal/autopilot escape hatches — the only rule that does. Autopilot bypasses the
+turn gate by design, so with a real budget it burned the whole thing on its own
+command turn.
+
+**Budgets are now ONE rule** (`resolveTurnMaxAttempts`, core/goal.mjs), applied
+by both runtimes: `/supervisor retry N` > config > 16 for goal/autopilot > 3 for
+plain reflection, then clamped to the runtime's platform ceiling (Claude Code
+has one, opencode does not). opencode previously used 16 for everything, which
+was invisible only because its boolean gate made the budget unreachable.
+
+### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
+
+`getMessageSignature` only checked a top-level `msg.id`. opencode's REST
+transcript shape is `{ info: { id, role, time }, parts }` — there is no
+top-level `id` (verified live: `msg.id === undefined`,
+`msg.info.id === "msg_fda79148d001bdPZnwwZoyiPGx"`), so **every** key fell
+through to a `${role}:${time}:${first 20 chars}` composite, with `time.start`
+unset on user messages. "can you please check the alpha module" and "…the beta
+module" both keyed as `user:0:can you please check`, so the second turn
+inherited the first's spent budget and was never supervised — a silent
+supervision hole. Now `info.id` is used.
+
+### `buildEscalatingFeedback` takes no attempt count
+
+It used to accept `attemptCount` and `maxAttempts` and read NEITHER
+(`attemptCount` was never referenced; the `maxAttempts`-derived `effectiveCap`
+was computed and discarded). Both are removed rather than wired up: "one calm
+template, always" is a standing decision here, escalating tone is pressure to
+declare victory, and a silently-ignored parameter is an invitation to display a
+number the code cannot honour. `test/feedback.test.mjs` pins the arity. The
+attempt number is still rendered into the JUDGE's prompt
+(`core/reflection-prompt.mjs`, `core/assessment.mjs`), where it is genuinely
+read. The autopilot nudge still shows `(n/N)` — that counter is persisted now,
+so it counts up truthfully instead of always reading `1/N`.
+

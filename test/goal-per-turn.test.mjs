@@ -328,3 +328,49 @@ test('goal: SUPERVISOR_DUMP_PROMPT refuses a destination outside .supervisor/', 
   runOnStop(payload, { SUPERVISOR_DUMP_PROMPT: traversal });
   assert.equal(fs.existsSync(path.join(d, 'traversed.txt')), false, '.. traversal out of .supervisor/ must be rejected');
 });
+
+// ---------------------------------------------------------------------------
+// The per-turn KEY itself (opencode runtime).
+//
+// getLastRelevantUserMessageId is what scopes the attempt budget to one human
+// turn. If two different human turns produce the same key, the second turn
+// inherits the first's spent budget and is never supervised — a silent
+// supervision hole, not a loud failure.
+// ---------------------------------------------------------------------------
+const { getLastRelevantUserMessageId: turnKeyOf } = await import('../opencode/supervisor-impl.ts');
+
+const userMsg = (id, text, created = 0) => ({
+  info: { id, role: 'user', time: { created } },
+  parts: [{ type: 'text', text }],
+});
+
+test('turn key uses info.id — opencode transcripts have NO top-level msg.id', () => {
+  // Verified against a live server: msg.id is undefined, msg.info.id holds the
+  // real `msg_…` id. Reading only msg.id made every key fall through to the
+  // lossy `role:time:first20chars` composite.
+  assert.equal(turnKeyOf([userMsg('msg_abc123', 'do the thing')]), 'msg_abc123');
+});
+
+test('two human turns sharing a 20-character prefix get DIFFERENT turn keys', () => {
+  const a = turnKeyOf([userMsg('msg_aaa', 'can you please check the alpha module')]);
+  const b = turnKeyOf([userMsg('msg_bbb', 'can you please check the beta module')]);
+  assert.notEqual(a, b, 'same-prefix turns must not share a budget');
+});
+
+test('turn key still degrades gracefully when no id is present', () => {
+  const k = turnKeyOf([{ info: { role: 'user', time: { created: 123 } }, parts: [{ type: 'text', text: 'hello' }] }]);
+  assert.equal(k, 'user:123:hello', 'fallback must use time.created (time.start is unset on user messages)');
+});
+
+test('supervisor-injected messages are skipped so the key stays pinned to the HUMAN turn', () => {
+  // This is what makes a per-turn counter possible at all: every injection in
+  // the turn must resolve to the same key.
+  const chain = [
+    userMsg('msg_human', 'implement the retry helper in src/net/client.ts'),
+    { info: { id: 'msg_a1', role: 'assistant', time: { created: 2 } }, parts: [{ type: 'text', text: 'done' }] },
+    userMsg('msg_inject1', '## Supervisor: Task Incomplete (MEDIUM)\nkeep going'),
+    { info: { id: 'msg_a2', role: 'assistant', time: { created: 4 } }, parts: [{ type: 'text', text: 'more' }] },
+    userMsg('msg_inject2', '## Supervisor: Task Incomplete (HIGH)\nstill missing tests'),
+  ];
+  assert.equal(turnKeyOf(chain), 'msg_human');
+});

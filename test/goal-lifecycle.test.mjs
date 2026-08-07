@@ -201,12 +201,12 @@ describe('BUG A: auto-derived goals never create the durable project file', () =
 
 describe('BUG A: standing goal renders separately from per-turn gaps', () => {
   test('goal condition gets its own labelled section, not a ### Missing bullet', () => {
-    const out = buildEscalatingFeedback(1, 'MEDIUM', {
+    const out = buildEscalatingFeedback('MEDIUM', {
       missing: ['Fix the build errors in src/app.ts'],
       next_actions: ['Run npm run build'],
       feedback: 'build is red',
       goal_condition: 'Reach $1,000 MRR for VibeBrowser',
-    }, 16);
+    });
 
     assert.match(out, /### Standing goal \(not a gap in this turn\)/);
     assert.match(out, /### Standing goal[\s\S]*Reach \$1,000 MRR/);
@@ -219,12 +219,12 @@ describe('BUG A: standing goal renders separately from per-turn gaps', () => {
   });
 
   test('explicit goal_items are pulled out of ### Missing into the goal section', () => {
-    const out = buildEscalatingFeedback(1, 'HIGH', {
+    const out = buildEscalatingFeedback('HIGH', {
       missing: ['Capture the CUA demo video', 'Fix build errors'],
       next_actions: [],
       feedback: 'still red',
       goal_items: ['Capture the CUA demo video'],
-    }, 16);
+    });
     const missingBlock = out.split('### Missing')[1].split('###')[0];
     assert.match(missingBlock, /Fix build errors/);
     assert.doesNotMatch(missingBlock, /CUA demo video/);
@@ -232,17 +232,17 @@ describe('BUG A: standing goal renders separately from per-turn gaps', () => {
   });
 
   test('no goal -> no standing-goal section at all (unchanged output shape)', () => {
-    const out = buildEscalatingFeedback(1, 'LOW', {
+    const out = buildEscalatingFeedback('LOW', {
       missing: ['Add a test'], next_actions: [], feedback: 'x',
-    }, 16);
+    });
     assert.doesNotMatch(out, /Standing goal/);
   });
 
   test('destructive rewriting still applies inside the standing-goal section', () => {
-    const out = buildEscalatingFeedback(1, 'HIGH', {
+    const out = buildEscalatingFeedback('HIGH', {
       missing: ['Add a test'], next_actions: [], feedback: 'x',
       goal_items: ['Force-push the release branch'],
-    }, 16);
+    });
     assert.match(out, /Flag to the user for approval: Force-push the release branch/);
   });
 });
@@ -279,15 +279,15 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
   });
 
   test('hasFeedbackBody rejects a rendered message with an empty body', () => {
-    const empty = buildEscalatingFeedback(1, 'MEDIUM', { missing: [], next_actions: [], feedback: '' }, 16);
+    const empty = buildEscalatingFeedback('MEDIUM', { missing: [], next_actions: [], feedback: '' });
     assert.equal(hasFeedbackBody(empty), false, `rendered empty-bodied message was:\n${JSON.stringify(empty)}`);
 
-    const goalOnly = buildEscalatingFeedback(1, 'MEDIUM', {
+    const goalOnly = buildEscalatingFeedback('MEDIUM', {
       missing: [], next_actions: [], feedback: '', goal_condition: 'Reach $1,000 MRR',
-    }, 16);
+    });
     assert.equal(hasFeedbackBody(goalOnly), false, 'a standing goal is not a body');
 
-    const real = buildEscalatingFeedback(1, 'MEDIUM', { missing: ['Run tests'], next_actions: [], feedback: '' }, 16);
+    const real = buildEscalatingFeedback('MEDIUM', { missing: ['Run tests'], next_actions: [], feedback: '' });
     assert.equal(hasFeedbackBody(real), true);
   });
 

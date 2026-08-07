@@ -163,8 +163,11 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
 
   after(async () => {
     if (server) await server.stop()
-    // Force exit after a brief delay if node won't quit
-    setTimeout(() => process.exit(0), 500).unref()
+    // NOTE: no process.exit() here. This used to force-exit 500ms after this
+    // suite's teardown, which silently KILLED every describe declared after it
+    // in this file — the per-turn budget suites below reported nothing at all
+    // and the run still exited 0. The watchdog now lives in a single top-level
+    // `after` at the very END of the file.
   })
 
   test("health endpoint responds with healthy: true", { timeout: 30_000 }, async () => {
@@ -591,4 +594,366 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       )
     })
   })
+})
+
+// ===========================================================================
+// Per-turn attempt budget — the supervisor must be able to push MORE THAN
+// ONCE per human turn, and must provably stop at the budget.
+//
+// This suite exists because there was NO opencode-path coverage of a second
+// injection on the same human turn. `test/e2e-cc.mjs` covers the counter, but
+// it spawns bin/supervisor-on-stop.mjs — Claude Code only. That passing test
+// gave false confidence while the opencode runtime shipped a boolean
+// "already reflected this turn" gate that capped every turn at ONE injection
+// and left `/supervisor retry N` with no observable effect for any N.
+//
+// Each test drives a REAL `opencode serve` over REST and counts the
+// supervisor's own injected user messages in the real transcript.
+// ===========================================================================
+
+const FEEDBACK_MARKER = "## Supervisor:"
+const JUDGE_MARKER = "ANALYZE SUPERVISOR"
+const REFLECTION_MARKER = "# Reflection Prompt"
+
+/** A task the non-actionable-turn gate will NOT skip (names a real file). */
+function actionableTask(probe) {
+  return `Implement retry-with-backoff in src/net/client.ts and add a unit test for it. [${probe}]`
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/** Sentinel for `completeAfter`: always answer with an ACTIONLESS verdict. */
+const ACTIONLESS = -1
+
+/**
+ * Fixture steering for this suite.
+ *
+ * `judgeFor(ctx)` returns the JSON verdict string for one "ANALYZE SUPERVISOR"
+ * call. Everything else answers the supervisor's own background prompts
+ * deterministically.
+ *
+ * The final `text` branch is deliberately NOT the shipped fixture's fallback,
+ * which calls `autopilot_exit` whenever that tool is offered — and it is
+ * offered plugin-wide, on every session, so the shipped fallback would end an
+ * autopilot loop on nudge 1 and silently defeat the autopilot cap test.
+ */
+function budgetResponder(judgeFor) {
+  return (ctx) => {
+    const { fullText, lastText, hasTools, messages } = ctx
+    const prompt = (lastText || "").trimStart()
+    if (prompt.startsWith(JUDGE_MARKER)) return { text: judgeFor(ctx) }
+    if (prompt.startsWith(REFLECTION_MARKER) || fullText.includes("SELF-ASSESS SUPERVISOR")) {
+      // Deliberately PROSE, not the JSON the prompt asks for: a parseable
+      // self-assessment short-circuits into the deterministic
+      // evaluateSelfAssessment and the steerable second-stage judge never
+      // runs. Answering in prose is a real code path (it is what the LLM
+      // fallback exists for) and it is the only way to force a verdict here.
+      return { text: "I made the change and handed back for judgement." }
+    }
+    if (fullText.includes("DERIVE SUPERVISOR GOAL")) {
+      return { text: JSON.stringify({ goal: "all tests pass", falsifiable: true, rationale: "runnable" }) }
+    }
+    if (fullText.includes("CLASSIFY TASK ROUTING")) return { text: JSON.stringify({ category: "backend" }) }
+    if (fullText.includes("REVIEW SUPERVISOR COMPLETION")) return { text: "Review looks good." }
+    if (!hasTools) return { text: "Fixture session" }
+    const lastRole = messages[messages.length - 1]?.role
+    if (lastRole === "tool") return null
+    if (/^\/?supervisor\b/i.test(prompt)) return null
+    return { text: "Made some progress. Stopping here for now." }
+  }
+}
+
+/** Verdict JSON with the "keep going, here is what is missing" defaults. */
+function verdict(v = {}) {
+  return JSON.stringify({
+    complete: false,
+    severity: "MEDIUM",
+    feedback: "The retry helper is written but no test was added.",
+    missing: ["Unit test for the backoff schedule"],
+    next_actions: ["Add test/net-client.test.mjs covering the retry path"],
+    requires_human_action: false,
+    ...v,
+  })
+}
+
+/**
+ * Supervisor-injected user messages in a session's transcript, counted from
+ * `fromIndex`.
+ *
+ * `fromIndex` is not cosmetic. A `/supervisor autopilot` slash command is
+ * itself a human turn with its OWN turn key and its own budget, so the
+ * autopilot loop legitimately nudges it. Counting a delta across a snapshot
+ * lets the tail of that loop leak into the next turn's count; slicing at the
+ * task message cannot.
+ */
+async function countInjections(baseUrl, sessionId, fromIndex = 0) {
+  const res = await fetch(`${baseUrl}/session/${sessionId}/message`)
+  if (!res.ok) return 0
+  const all = await res.json()
+  if (!Array.isArray(all)) return 0
+  const msgs = all.slice(fromIndex)
+  return msgs.filter(
+    (m) =>
+      m?.info?.role === "user" &&
+      (m.parts || []).some((p) => p?.type === "text" && typeof p.text === "string" && p.text.includes(FEEDBACK_MARKER))
+  ).length
+}
+
+/**
+ * Wait until the injection count stops growing for `quietMs`, then return it.
+ *
+ * The quiet window is the TERMINATION proof: it is a bounded wait for an
+ * injection N+1 that must never arrive. Returning early on "count === expected"
+ * would prove only that the supervisor reached the budget, not that it stopped
+ * there — so this always burns the full quiet window after the last change.
+ */
+async function settleInjections(baseUrl, sessionId, { quietMs = 15_000, timeoutMs = 240_000, fromIndex = 0 } = {}) {
+  let last = await countInjections(baseUrl, sessionId, fromIndex)
+  let lastChange = Date.now()
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await sleep(500)
+    const n = await countInjections(baseUrl, sessionId, fromIndex)
+    if (n !== last) {
+      last = n
+      lastChange = Date.now()
+    } else if (Date.now() - lastChange >= quietMs) {
+      return last
+    }
+  }
+  throw new Error(`injections never settled (last=${last}) within ${timeoutMs}ms`)
+}
+
+describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
+  let server
+  let baseUrl
+  const model = { providerID: "test-fixture", modelID: "fixture-model" }
+  /** probe -> number of judge calls seen for that session so far. */
+  let judgeCalls
+  /** probe -> how many judge calls to answer "incomplete" before "complete". */
+  const completeAfter = new Map()
+
+  before(async () => {
+    judgeCalls = new Map()
+    server = await startLiveServer({
+      label: "budget",
+      responder: budgetResponder((ctx) => {
+        // Attribute the judge call to a session by its unique probe string —
+        // the judge prompt carries the conversation chain, which contains the
+        // human task text. Index arithmetic over a server-wide call list
+        // cannot express "this session"; content can.
+        const probe = [...completeAfter.keys()].find((p) => ctx.fullText.includes(p))
+        if (!probe) return verdict()
+        const n = (judgeCalls.get(probe) || 0) + 1
+        judgeCalls.set(probe, n)
+        const limit = completeAfter.get(probe)
+        // ACTIONLESS sentinel first: `-1` must not fall into the `n > limit`
+        // rule below, which is true for every n when limit is negative.
+        if (limit === ACTIONLESS) {
+          // No missing, no next actions, blank feedback.
+          return verdict({ feedback: "", missing: [], next_actions: [] })
+        }
+        if (limit !== Infinity && n > limit) {
+          return verdict({ complete: true, severity: "NONE", feedback: "All done.", missing: [], next_actions: [] })
+        }
+        return verdict()
+      }),
+    })
+    baseUrl = server.baseUrl
+  })
+
+  after(async () => {
+    if (server) await server.stop()
+  })
+
+  /**
+   * Drive one human turn on a fresh session with a given retry budget and
+   * return how many times the supervisor injected.
+   */
+  async function runTurn({ budget, probe, complete = Infinity, autopilot = false }) {
+    completeAfter.set(probe, complete)
+    const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+
+    await sendMessage(baseUrl, session.id, `/supervisor retry ${budget}`, 120_000, { model })
+    if (autopilot) {
+      await sendMessage(baseUrl, session.id, "/supervisor autopilot", 120_000, { model })
+      // The command turn is a human turn, and autopilot deliberately bypasses
+      // the non-actionable-turn gate, so it burns its OWN budget on it. Let
+      // that finish before the real turn starts, or its tail races the turn
+      // under test.
+      await settleInjections(baseUrl, session.id)
+    }
+    // Let any supervision of the COMMAND turns finish before the real turn.
+    await sleep(3000)
+    // Everything already in the transcript belongs to the COMMAND turns, which
+    // are separate human turns with their own turn key and their own budget.
+    const startIndex = (await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()).length
+
+    await sendMessage(baseUrl, session.id, actionableTask(probe), 180_000, { model })
+    const injections = await settleInjections(baseUrl, session.id, { fromIndex: startIndex })
+    return { sessionId: session.id, injections, startIndex }
+  }
+
+  test("injects N times in ONE human turn, where N is the configured budget, and then STOPS", { timeout: 600_000 }, async () => {
+    const { sessionId, injections } = await runTurn({ budget: 3, probe: "PROBE-BUDGET-3" })
+
+    // The headline regression: this was 1 for every budget before the fix.
+    assert.equal(
+      injections, 3,
+      `Expected exactly 3 supervisor injections in one human turn (the configured budget), got ${injections}. ` +
+      `1 means the boolean "already reflected this turn" gate is back.`
+    )
+
+    // Termination was already proven by settleInjections' quiet window (it
+    // waited 15s for a 4th injection that never came). Also assert the plugin
+    // says WHY it stopped, so a silent crash cannot masquerade as termination.
+    const log = server.debugLog()
+    assert.match(
+      log, /attempt-cap reached/,
+      "plugin debug log must record the attempt-cap stop, not just fall silent"
+    )
+
+    // The counter is PERSISTED, not in-memory-only.
+    const statePath = join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json")
+    assert.ok(existsSync(statePath), `expected persisted session state at ${statePath}`)
+    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    assert.equal(state.attempts?.count, 3, `persisted attempt counter should be 3, got ${JSON.stringify(state.attempts)}`)
+    assert.ok(state.attempts?.turnKey, "persisted counter must be scoped to a turn key")
+  })
+
+  test("/supervisor retry 1 and /supervisor retry 5 produce DIFFERENT injection counts", { timeout: 900_000 }, async () => {
+    const one = await runTurn({ budget: 1, probe: "PROBE-RETRY-1" })
+    const five = await runTurn({ budget: 5, probe: "PROBE-RETRY-5" })
+
+    assert.equal(one.injections, 1, `retry 1 must inject exactly once, got ${one.injections}`)
+    assert.equal(five.injections, 5, `retry 5 must inject exactly 5 times, got ${five.injections}`)
+    assert.notEqual(
+      one.injections, five.injections,
+      "retry 1 and retry 5 were identical — this is the user-visible bug: the budget had no effect"
+    )
+  })
+
+  test("a complete verdict ends the turn early, without consuming the budget", { timeout: 600_000 }, async () => {
+    // Budget 5, but the judge returns complete on its 3rd call — so injections
+    // 1 and 2 happen and the loop stops at 2, well short of 5.
+    const { injections } = await runTurn({ budget: 5, probe: "PROBE-COMPLETE-AT-3", complete: 2 })
+    assert.equal(injections, 2, `expected the loop to stop at 2 injections when the judge says complete, got ${injections}`)
+    assert.ok(injections < 5, "a complete verdict must dominate the budget")
+  })
+
+  test("an actionless verdict stands down immediately instead of burning the budget in a loop", { timeout: 600_000 }, async () => {
+    const { injections } = await runTurn({ budget: 5, probe: "PROBE-ACTIONLESS", complete: ACTIONLESS })
+    assert.equal(
+      injections, 0,
+      `a verdict with empty missing + empty next_actions + blank feedback must not be injected at all, got ${injections}`
+    )
+    assert.match(
+      server.debugLog(), /no actionable content/,
+      "plugin must record the actionless stand-down reason"
+    )
+  })
+
+  test("autopilot nudges repeatedly within one human turn and is capped by the same budget", { timeout: 600_000 }, async () => {
+    const { sessionId, injections, startIndex } = await runTurn({ budget: 3, probe: "PROBE-AUTOPILOT", autopilot: true })
+
+    assert.equal(injections, 3, `autopilot must nudge exactly 3 times for budget 3, got ${injections}`)
+
+    // The displayed "(n/N)" must be TRUE, not always "1/N". Before the fix the
+    // counter was in-memory and reset by the boolean gate, so every nudge
+    // rendered "Autopilot (1/3)".
+    const msgs = (await (await fetch(`${baseUrl}/session/${sessionId}/message`)).json()).slice(startIndex)
+    const headers = msgs
+      .filter((m) => m?.info?.role === "user")
+      .flatMap((m) => (m.parts || []).map((p) => p?.text || ""))
+      .map((t) => /Autopilot \((\d+)\/(\d+)\)/.exec(t))
+      .filter(Boolean)
+      .map((m) => `${m[1]}/${m[2]}`)
+    assert.deepEqual(
+      headers, ["1/3", "2/3", "3/3"],
+      `autopilot headers must count up truthfully, got ${JSON.stringify(headers)}`
+    )
+
+    // Budget exhaustion must disarm autopilot, or the next human turn silently
+    // resumes an unattended loop.
+    const state = JSON.parse(
+      readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
+    )
+    assert.notEqual(state.mode, "autopilot", "autopilot must be disarmed once its budget is spent")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Persistence across a real server restart. Its own describe block because it
+// stops and re-spawns the server over the SAME project dir and $HOME.
+// ---------------------------------------------------------------------------
+describe("per-turn budget survives a server restart", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
+  test("a restarted server resumes the spent budget instead of starting the turn over", { timeout: 900_000 }, async () => {
+    const model = { providerID: "test-fixture", modelID: "fixture-model" }
+    const probe = "PROBE-RESTART"
+    let serverA = await startLiveServer({ label: "restart-a", responder: budgetResponder(() => verdict()) })
+    let sessionId
+    let projectDir = serverA.projectDir
+    let isolatedHome = serverA.isolatedHome
+
+    try {
+      const session = await (await fetch(`${serverA.baseUrl}/session`, { method: "POST" })).json()
+      sessionId = session.id
+      await sendMessage(serverA.baseUrl, sessionId, "/supervisor retry 2", 120_000, { model })
+      await sleep(3000)
+      const startIndex = (await (await fetch(`${serverA.baseUrl}/session/${sessionId}/message`)).json()).length
+      await sendMessage(serverA.baseUrl, sessionId, actionableTask(probe), 180_000, { model })
+      const spent = await settleInjections(serverA.baseUrl, sessionId, { fromIndex: startIndex })
+      assert.equal(spent, 2, `expected the budget of 2 to be spent before the restart, got ${spent}`)
+    } finally {
+      await serverA.stop({ keepDirs: true })
+    }
+
+    // Restart over the same state. opencode persists sessions under $HOME; the
+    // supervisor persists its counter under <projectDir>/.supervisor.
+    const serverB = await startLiveServer({
+      label: "restart-b",
+      projectDir,
+      isolatedHome,
+      responder: budgetResponder(() => verdict()),
+    })
+    try {
+      const countBefore = await countInjections(serverB.baseUrl, sessionId)
+      assert.ok(countBefore >= 2, `restarted server must still see the pre-restart transcript, saw ${countBefore} injections`)
+
+      // Resume the SAME human turn. A message carrying FEEDBACK_MARKER is
+      // skipped by getLastRelevantUserMessageId, so the turn key does not
+      // move — this is exactly a mid-turn resume, not a new turn. A plain
+      // message would legitimately reset the budget and prove nothing.
+      await sendMessage(
+        serverB.baseUrl, sessionId,
+        `${FEEDBACK_MARKER} Continue\n\nKeep going on the same task.`,
+        180_000, { model },
+      )
+      const after = await settleInjections(serverB.baseUrl, sessionId)
+
+      assert.equal(
+        after, countBefore + 1,
+        `the restarted server must not inject again on an already-spent turn — ` +
+        `expected only the test's own probe message (${countBefore + 1}), got ${after}. ` +
+        `An in-memory-only counter resets to 0 on restart and would inject 2 more times.`
+      )
+      assert.match(
+        serverB.debugLog(), /attempt-cap reached/,
+        "restarted server must report the cap, proving it READ the persisted counter"
+      )
+    } finally {
+      await serverB.stop()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Last-resort watchdog for a stuck event loop, AFTER every suite in this file.
+//
+// Must be top-level and last: as a per-describe hook it force-exits the whole
+// process before later describes have run, which is exactly how the per-turn
+// budget suites above were silently skipped while the run still reported PASS.
+// ---------------------------------------------------------------------------
+after(() => {
+  setTimeout(() => process.exit(0), 2000).unref()
 })

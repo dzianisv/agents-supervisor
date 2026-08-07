@@ -11,12 +11,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  classifyTurn,
-  isNonActionableTurn,
-  shouldSkipReflection,
-  NON_ACTIONABLE_MAX_LEN,
-} from '../core/turn-classifier.mjs';
+import { classifyTurn, isNonActionableTurn, shouldSkipReflection, NON_ACTIONABLE_MAX_LEN, isSupervisorControlTurn } from '../core/turn-classifier.mjs';
 
 // Turns the supervisor must NOT judge for completion.
 const NON_ACTIONABLE = [
@@ -147,4 +142,55 @@ describe('shouldSkipReflection', () => {
     assert.equal(shouldSkipReflection().skip, true); // empty text -> nothing to judge
     assert.equal(shouldSkipReflection({}).skip, true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Supervisor CONTROL commands are never work — in ANY mode.
+//
+// This rule is checked BEFORE the goal/autopilot escape hatches, which is the
+// opposite of every other rule in this file. Reason: with a real per-turn
+// attempt budget, autopilot nudging its own `/supervisor autopilot` command
+// turn burns the whole budget in seconds and the exhaustion path then disarms
+// autopilot — i.e. the command turns itself off before the user types a task.
+// ---------------------------------------------------------------------------
+
+test('supervisor control commands are skipped even in autopilot/goal mode and with an active goal', () => {
+  const commands = [
+    '/supervisor autopilot',
+    '/supervisor retry 5',
+    '/supervisor set-goal all tests pass',
+    '/supervisor:status off',
+    '/supervisor off',
+    'supervisor status',
+    '/autopilot',
+  ];
+  for (const text of commands) {
+    for (const opts of [
+      { mode: 'autopilot' },
+      { mode: 'goal' },
+      { hasActiveGoal: true },
+      { mode: 'reflection' },
+    ]) {
+      const r = shouldSkipReflection({ text, ...opts });
+      assert.equal(r.skip, true, `"${text}" with ${JSON.stringify(opts)} must be skipped, got ${JSON.stringify(r)}`);
+      assert.equal(r.reason, 'supervisor-control-command');
+    }
+  }
+});
+
+test('a control command EMBEDDED in a real request stays actionable', () => {
+  // Deliberately narrow: only a whole-message command is a control turn.
+  const embedded = [
+    'run /supervisor retry 3 and then fix the failing build in src/app.ts',
+    'why does /supervisor off not persist? investigate core/session-store.mjs',
+  ];
+  for (const text of embedded) {
+    assert.equal(shouldSkipReflection({ text }).skip, false, `"${text}" must stay actionable`);
+  }
+});
+
+test('isSupervisorControlTurn tolerates junk input', () => {
+  for (const v of [undefined, null, 42, {}, '', '   ']) {
+    assert.equal(isSupervisorControlTurn(v), false);
+  }
 });

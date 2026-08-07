@@ -45,7 +45,7 @@ describe("empty-body guard survives the always-appended directive", () => {
   })
 
   test("REGRESSION: an actionless verdict still renders an empty body once the directive is appended", () => {
-    const rendered = buildEscalatingFeedback(1, "MEDIUM", { missing: [], next_actions: [], feedback: "" }, 16)
+    const rendered = buildEscalatingFeedback("MEDIUM", { missing: [], next_actions: [], feedback: "" })
     // The directive IS there — this is not a test that it was removed.
     assert.ok(rendered.includes(STATUS_DIRECTIVE_MARKER), "directive must still be appended by default")
     // ...and the guard must still see through it. Without stripStatusDirective
@@ -55,25 +55,21 @@ describe("empty-body guard survives the always-appended directive", () => {
   })
 
   test("REGRESSION: a standing-goal-only verdict is still bodyless with the directive appended", () => {
-    const rendered = buildEscalatingFeedback(
-      1,
-      "MEDIUM",
-      { missing: [], next_actions: [], feedback: "", goal_condition: "Reach $1,000 MRR" },
-      16
-    )
+    const rendered = buildEscalatingFeedback("MEDIUM",
+      { missing: [], next_actions: [], feedback: "", goal_condition: "Reach $1,000 MRR" })
     assert.ok(rendered.includes(STATUS_DIRECTIVE_MARKER))
     assert.equal(hasFeedbackBody(rendered), false, "a standing goal is context, not a body")
   })
 
   test("a real verdict still has a body", () => {
-    const rendered = buildEscalatingFeedback(1, "MEDIUM", { missing: ["Run tests"], next_actions: [], feedback: "" }, 16)
+    const rendered = buildEscalatingFeedback("MEDIUM", { missing: ["Run tests"], next_actions: [], feedback: "" })
     assert.equal(hasFeedbackBody(rendered), true)
   })
 
   test("the two guards agree: actionless verdict <-> bodyless render", () => {
     const verdict = { missing: [], next_actions: [], feedback: "" }
     assert.equal(isActionlessVerdict(verdict), true)
-    assert.equal(hasFeedbackBody(buildEscalatingFeedback(1, "LOW", verdict, 16)), false)
+    assert.equal(hasFeedbackBody(buildEscalatingFeedback("LOW", verdict)), false)
   })
 })
 
@@ -85,15 +81,15 @@ describe("statusDirective opt-out reaches the reflection path", () => {
   const verdict = { missing: ["Run tests"], next_actions: [], feedback: "build is red" }
 
   test("default is ON (absent option) — the directive is appended", () => {
-    assert.ok(buildEscalatingFeedback(1, "HIGH", verdict, 5).includes(STATUS_DIRECTIVE_MARKER))
-    assert.ok(buildEscalatingFeedback(1, "HIGH", verdict, 5, {}).includes(STATUS_DIRECTIVE_MARKER))
+    assert.ok(buildEscalatingFeedback("HIGH", verdict).includes(STATUS_DIRECTIVE_MARKER))
+    assert.ok(buildEscalatingFeedback("HIGH", verdict, {}).includes(STATUS_DIRECTIVE_MARKER))
     assert.ok(
-      buildEscalatingFeedback(1, "HIGH", verdict, 5, { statusDirective: true }).includes(STATUS_DIRECTIVE_MARKER)
+      buildEscalatingFeedback("HIGH", verdict, { statusDirective: true }).includes(STATUS_DIRECTIVE_MARKER)
     )
   })
 
   test("statusDirective:false omits it but keeps the whole verdict intact", () => {
-    const out = buildEscalatingFeedback(1, "HIGH", verdict, 5, { statusDirective: false })
+    const out = buildEscalatingFeedback("HIGH", verdict, { statusDirective: false })
     assert.ok(!out.includes(STATUS_DIRECTIVE_MARKER), "directive must be absent")
     assert.match(out, /Task Incomplete/)
     assert.match(out, /build is red/)
@@ -102,8 +98,8 @@ describe("statusDirective opt-out reaches the reflection path", () => {
   })
 
   test("only an explicit false disables it — undefined/null keep it on (default-ON flag)", () => {
-    assert.ok(buildEscalatingFeedback(1, "HIGH", verdict, 5, { statusDirective: undefined }).includes(STATUS_DIRECTIVE_MARKER))
-    assert.ok(buildEscalatingFeedback(1, "HIGH", verdict, 5, { statusDirective: null }).includes(STATUS_DIRECTIVE_MARKER))
+    assert.ok(buildEscalatingFeedback("HIGH", verdict, { statusDirective: undefined }).includes(STATUS_DIRECTIVE_MARKER))
+    assert.ok(buildEscalatingFeedback("HIGH", verdict, { statusDirective: null }).includes(STATUS_DIRECTIVE_MARKER))
   })
 
   test("both runtimes pass the gate through, rather than hard-coding it on", async () => {

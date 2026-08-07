@@ -69,12 +69,78 @@ export function resolveSupervisorMode(state = {}) {
   return DEFAULT_SUPERVISOR_MODE;
 }
 
-/** Priority: sessionOverride > config > 16. Clamped [1,100]; non-finite ignored. */
+/**
+ * Priority: sessionOverride > config > opts.fallback > 16.
+ * Clamped [1,100]; non-finite ignored.
+ *
+ * `fallback` exists so a runtime can supply its own *default* budget without
+ * weakening the explicit `/supervisor retry N` override, which must always
+ * win. Do not add a second precedence rule anywhere — pass `fallback` instead.
+ */
 export function resolveMaxAttempts(opts = {}) {
-  for (const c of [opts.sessionOverride, opts.config, DEFAULT_MAX_ATTEMPTS]) {
+  for (const c of [opts.sessionOverride, opts.config, opts.fallback, DEFAULT_MAX_ATTEMPTS]) {
     if (c !== undefined && Number.isFinite(c)) return Math.min(100, Math.max(1, Math.floor(c)));
   }
   return DEFAULT_MAX_ATTEMPTS;
+}
+
+/**
+ * The plain-reflection per-turn budget: how many times the supervisor may push
+ * an agent that never asked for an autonomous loop.
+ *
+ * 3, not DEFAULT_MAX_ATTEMPTS (16). Reflection is armed for EVERY session by
+ * default, and each attempt costs a judge round-trip plus a full agent turn.
+ * If three verdicts have not moved the agent, a fourth identical nudge is not
+ * the fix — that is precisely the "15 consecutive identical injections"
+ * pathology this repo already carries a guard for. 16 is reserved for the
+ * modes the user explicitly opted into (goal, autopilot) and for an explicit
+ * `/supervisor retry N`.
+ *
+ * Env names are the ones the Claude Code hook has always honoured, so the two
+ * runtimes read the SAME knob.
+ */
+export const DEFAULT_REFLECTION_MAX_ATTEMPTS = 3;
+export function resolveReflectionMaxAttempts(env = process.env) {
+  const raw = parseInt(
+    env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS ?? String(DEFAULT_REFLECTION_MAX_ATTEMPTS),
+    10,
+  );
+  return Number.isFinite(raw) ? Math.min(100, Math.max(1, raw)) : DEFAULT_REFLECTION_MAX_ATTEMPTS;
+}
+
+/**
+ * THE per-turn attempt budget, for both runtimes.
+ *
+ * This exists because the two runtimes had silently diverged: the Claude Code
+ * hook used 3 for plain reflection and 16 only for goal/autopilot, while the
+ * OpenCode plugin used 16 for everything. That divergence was invisible only
+ * because OpenCode's boolean "already reflected this turn" gate made its
+ * budget unreachable — the moment the counter became the real stop condition,
+ * OpenCode would have started running 16 unattended pushes per human message.
+ *
+ * Rules (identical on both runtimes):
+ *   - explicit `/supervisor retry N`   → N            (always wins)
+ *   - config `maxAttempts:` in yaml    → that value
+ *   - goal active or autopilot         → 16           (user opted into a loop)
+ *   - plain reflection                 → 3
+ *   - then clamp to `hardCap` if the runtime has a platform ceiling
+ *     (Claude Code does — see resolveClaudeCodeHardCap; OpenCode does not).
+ *
+ * @param {object} opts
+ * @param {string} [opts.mode] resolveSupervisorMode() output
+ * @param {number} [opts.sessionOverride] state.maxAttempts (`/supervisor retry N`)
+ * @param {number} [opts.config] runtime config file value
+ * @param {number} [opts.hardCap] platform ceiling, applied last
+ * @param {object} [opts.env] for tests
+ */
+export function resolveTurnMaxAttempts(opts = {}) {
+  const loopMode = opts.mode === 'goal' || opts.mode === 'autopilot';
+  const budget = resolveMaxAttempts({
+    sessionOverride: opts.sessionOverride,
+    config: opts.config,
+    fallback: loopMode ? DEFAULT_MAX_ATTEMPTS : resolveReflectionMaxAttempts(opts.env ?? process.env),
+  });
+  return Number.isFinite(opts.hardCap) ? Math.max(1, Math.min(budget, opts.hardCap)) : budget;
 }
 
 /** Parse `/supervisor` and colon command args into a typed action. */

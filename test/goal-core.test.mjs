@@ -7,7 +7,9 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { statePath } from '../core/session-store.mjs';
 import {
-  goalStore, resolveMaxAttempts, decideGoalTransition,
+  goalStore, resolveMaxAttempts, resolveTurnMaxAttempts,
+  resolveReflectionMaxAttempts, DEFAULT_REFLECTION_MAX_ATTEMPTS,
+  resolveClaudeCodeHardCap, decideGoalTransition,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
   DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode,
   extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
@@ -221,4 +223,70 @@ test('concurrent real processes: 0 conditions lost across N racing goal-set call
   // one wins is non-deterministic).
   const goalMd = fs.readFileSync(path.join(d, '.agents', 'supervisor', 'Goal.md'), 'utf8');
   assert.ok(conditions.includes(goalMd), `Goal.md current pointer must be one of the raced conditions, got: ${JSON.stringify(goalMd)}`);
+});
+
+// ---------------------------------------------------------------------------
+// resolveTurnMaxAttempts — THE per-turn budget rule, shared by both runtimes.
+//
+// Why one function: the two runtimes had silently diverged. The Claude Code
+// hook used 3 for plain reflection and 16 only for goal/autopilot; the OpenCode
+// plugin used 16 for EVERYTHING. That was invisible only because OpenCode's
+// boolean "already reflected this turn" gate made its budget unreachable — the
+// moment the counter became the real stop condition, OpenCode would have run
+// 16 unattended pushes per human message.
+// ---------------------------------------------------------------------------
+
+test('resolveTurnMaxAttempts: plain reflection defaults to 3, goal/autopilot to 16', () => {
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: {} }), DEFAULT_REFLECTION_MAX_ATTEMPTS);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: {} }), 3);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), DEFAULT_MAX_ATTEMPTS);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'autopilot', env: {} }), DEFAULT_MAX_ATTEMPTS);
+  // An unknown/absent mode is treated as plain reflection — the cautious side.
+  assert.equal(resolveTurnMaxAttempts({ env: {} }), 3);
+});
+
+test('resolveTurnMaxAttempts: /supervisor retry N wins for EVERY N, in every mode', () => {
+  // The user-visible bug this branch fixes: retry 1 and retry 5 used to be
+  // indistinguishable on OpenCode.
+  for (const mode of ['reflection', 'goal', 'autopilot']) {
+    for (let n = 1; n <= 20; n++) {
+      assert.equal(
+        resolveTurnMaxAttempts({ mode, sessionOverride: n, env: {} }), n,
+        `retry ${n} in ${mode} mode must resolve to exactly ${n}`,
+      );
+    }
+  }
+});
+
+test('resolveTurnMaxAttempts: precedence is retry > config > mode default', () => {
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', config: 8, env: {} }), 8);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', config: 8, sessionOverride: 2, env: {} }), 2);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', config: 4, env: {} }), 4);
+});
+
+test('resolveTurnMaxAttempts: clamps out-of-range values instead of disabling the loop', () => {
+  for (const bad of [0, -3, -1]) {
+    assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', sessionOverride: bad, env: {} }), 1);
+  }
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', sessionOverride: 500, env: {} }), 100);
+});
+
+test('resolveTurnMaxAttempts: hardCap applies last and only where a runtime has one', () => {
+  const cc = resolveClaudeCodeHardCap({});
+  assert.equal(cc, 7);
+  // Claude Code clamps; OpenCode (no hardCap) does not.
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', hardCap: cc, env: {} }), 7);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), 16);
+  // A hardCap must never raise a smaller budget.
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', sessionOverride: 2, hardCap: cc, env: {} }), 2);
+  // ...and never drop below 1.
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', hardCap: 0, env: {} }), 1);
+});
+
+test('resolveReflectionMaxAttempts honours the env knobs BOTH runtimes have always read', () => {
+  assert.equal(resolveReflectionMaxAttempts({}), 3);
+  assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: '6' }), 6);
+  assert.equal(resolveReflectionMaxAttempts({ REFLECTION_CC_MAX_ATTEMPTS: '5' }), 5);
+  assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: 'garbage' }), 3);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: { SUPERVISOR_MAX_ATTEMPTS: '6' } }), 6);
 });
