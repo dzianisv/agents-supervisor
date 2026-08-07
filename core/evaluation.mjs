@@ -93,22 +93,43 @@ export function hashReply(text) {
 }
 
 /**
- * The no-progress decision. Deterministic, no LLM.
- * True (= stand down) only when we have a previous reply hash for THIS session
- * and the current reply hashes to exactly the same normalized form: the agent
- * answered the last injection with a byte-identical (modulo whitespace/case)
- * reply, so pushing again is provably pointless.
+ * How many CONSECUTIVE identical replies are tolerated before the no-progress
+ * gate stands the supervisor down.
  *
- * No prior hash (first turn of a session) → false, always proceed.
+ * 2 means: the first repeat is allowed through (a stuck agent genuinely does
+ * sometimes need a second push before it moves — that is the whole reason the
+ * per-turn attempt budget exists), and the SECOND consecutive repeat (i.e. the
+ * third identical reply in a row) stands down. A boolean "stand down on the
+ * first repeat" gate is strictly stronger than the attempt budget and would
+ * silently reduce every budget to 1.
+ */
+export const NO_PROGRESS_REPEAT_THRESHOLD = 2
+
+/**
+ * The no-progress decision. Deterministic, no LLM. Counter, not boolean.
+ *
+ * Given the current reply and the (hash, count) carried for THIS session:
+ *   - identical normalized reply  → repeatCount + 1
+ *   - anything else               → repeatCount 0, hash updated
+ * Stand down only once repeatCount reaches the threshold.
+ *
+ * No prior hash (first turn of a session) → never stands down.
+ * Blank/absent current text → carried state is left untouched and we proceed;
+ * "nothing to compare" must not look like progress OR like a repeat.
+ *
  * @param {string} currentText
  * @param {string|null|undefined} previousHash
- * @returns {boolean}
+ * @param {number|null|undefined} previousCount
+ * @param {number} [threshold]
+ * @returns {{ hash: string|null, repeatCount: number, standDown: boolean }}
  */
-export function isNoProgressRepeat(currentText, previousHash) {
-  if (!previousHash) return false
-  const current = hashReply(currentText)
-  if (!current) return false
-  return current === previousHash
+export function evaluateNoProgress(currentText, previousHash, previousCount, threshold = NO_PROGRESS_REPEAT_THRESHOLD) {
+  const hash = hashReply(currentText)
+  const prior = Number.isFinite(previousCount) && previousCount > 0 ? Math.floor(previousCount) : 0
+  if (!hash) return { hash: previousHash ?? null, repeatCount: prior, standDown: false }
+  if (!previousHash || hash !== previousHash) return { hash, repeatCount: 0, standDown: false }
+  const repeatCount = prior + 1
+  return { hash, repeatCount, standDown: repeatCount >= threshold }
 }
 
 export const HUMAN_ONLY_ACTION_PATTERNS = [

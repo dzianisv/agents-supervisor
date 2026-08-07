@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
   FEEDBACK_MARKER,
-  isNonHumanUserMessage, isNonHumanUserText, hashReply, isNoProgressRepeat,
+  isNonHumanUserMessage, isNonHumanUserText, hashReply, evaluateNoProgress,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
@@ -948,21 +948,36 @@ async function main() {
   // write a goal-exhaust verdict) for the wrong reason. The gate re-derives
   // the same answer for free on every Stop, so it needs no persistence of its
   // own beyond the reply hash.
+  //
+  // COUNTER, NOT BOOLEAN: standing down on the FIRST repeat is strictly
+  // stronger than the per-turn attempt budget and would silently reduce every
+  // budget to a single injection — a stuck agent sometimes does move on the
+  // second or third push. We tolerate NO_PROGRESS_REPEAT_THRESHOLD - 1
+  // consecutive repeats and stand down on the next one.
   const replyHash = hashReply(ctx.final_assistant_text);
   // AUTOPILOT_EXIT must always reach 4a: it is the only thing that turns
   // autopilot off, and standing down on a repeat of it would strand the
   // session in autopilot forever.
   const autopilotExiting = /(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text);
   let priorReplyHash = null;
-  try { priorReplyHash = goalStore.load(cwd, session_id).lastReplyHash ?? null; } catch { /* best effort */ }
-  if (!autopilotExiting && isNoProgressRepeat(ctx.final_assistant_text, priorReplyHash)) {
-    debug({ msg: 'no_progress_gate', session_id, mode, goal: !!goal, attempts, hash: replyHash, action: 'stand_down' }, cwd);
+  let priorRepeatCount = 0;
+  try {
+    const prior = goalStore.load(cwd, session_id);
+    priorReplyHash = prior.lastReplyHash ?? null;
+    priorRepeatCount = prior.replyRepeatCount ?? 0;
+  } catch { /* best effort */ }
+  const noProgress = evaluateNoProgress(ctx.final_assistant_text, priorReplyHash, priorRepeatCount);
+  if (!autopilotExiting && noProgress.standDown) {
+    debug({ msg: 'no_progress_gate', session_id, mode, goal: !!goal, attempts, hash: replyHash, repeats: noProgress.repeatCount, action: 'stand_down' }, cwd);
     process.exit(0);
   }
   // Locked-ish read-modify-write: never save() a whole state object read
   // earlier in this turn, or the goal/attempts keys written above are lost.
   try {
-    goalStore.mutate(cwd, session_id, (s) => { s.lastReplyHash = replyHash; });
+    goalStore.mutate(cwd, session_id, (s) => {
+      s.lastReplyHash = noProgress.hash;
+      s.replyRepeatCount = noProgress.repeatCount;
+    });
   } catch (e) {
     debug({ msg: 'no_progress_gate_persist_failed', session_id, err: String(e?.message ?? e) }, cwd);
   }

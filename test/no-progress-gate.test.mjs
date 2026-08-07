@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { normalizeReplyText, hashReply, isNoProgressRepeat } from '../core/evaluation.mjs';
+import { normalizeReplyText, hashReply, evaluateNoProgress, NO_PROGRESS_REPEAT_THRESHOLD } from '../core/evaluation.mjs';
 import { goalStore } from '../core/goal.mjs';
 
 describe('normalizeReplyText', () => {
@@ -47,51 +47,67 @@ describe('hashReply', () => {
   });
 });
 
-describe('isNoProgressRepeat', () => {
-  test('identical normalized reply -> stand down', () => {
-    const prior = hashReply('Same. Standing by.');
-    assert.equal(isNoProgressRepeat('Same. Standing by.', prior), true);
+describe('evaluateNoProgress — consecutive-repeat counter', () => {
+  const REPLY = 'Same. Standing by.';
+
+  test('the threshold is a named exported constant, default 2', () => {
+    assert.equal(NO_PROGRESS_REPEAT_THRESHOLD, 2);
   });
 
-  test('whitespace-only difference -> stand down', () => {
-    const prior = hashReply('Same. Standing by.');
-    assert.equal(isNoProgressRepeat('Same.\n\nStanding    by.', prior), true);
+  test('first turn (no prior hash) → inject, counter 0', () => {
+    const r = evaluateNoProgress(REPLY, null, 0);
+    assert.equal(r.standDown, false);
+    assert.equal(r.repeatCount, 0);
+    assert.equal(r.hash, hashReply(REPLY));
+    assert.equal(evaluateNoProgress(REPLY, undefined, undefined).standDown, false);
+    assert.equal(evaluateNoProgress(REPLY, '', 0).standDown, false);
   });
 
-  test('case-only difference -> stand down', () => {
-    const prior = hashReply('Same. Standing by.');
-    assert.equal(isNoProgressRepeat('SAME. STANDING BY.', prior), true);
+  test('ONE repeat still injects — a stuck agent sometimes moves on the 2nd push', () => {
+    const r = evaluateNoProgress(REPLY, hashReply(REPLY), 0);
+    assert.equal(r.repeatCount, 1);
+    assert.equal(r.standDown, false);
   });
 
-  test('genuinely different reply -> proceed', () => {
-    const prior = hashReply('Same. Standing by.');
-    assert.equal(isNoProgressRepeat('Opened PR #62, CI green.', prior), false);
+  test('TWO consecutive repeats → stand down', () => {
+    const r = evaluateNoProgress(REPLY, hashReply(REPLY), 1);
+    assert.equal(r.repeatCount, 2);
+    assert.equal(r.standDown, true);
   });
 
-  test('a one-word difference is enough to proceed (no fuzzy threshold)', () => {
-    const prior = hashReply('Same. Standing by.');
-    assert.equal(isNoProgressRepeat('Same. Standing by, again.', prior), false);
+  test('whitespace/case-only differences still count as a repeat', () => {
+    assert.equal(evaluateNoProgress('SAME.\n\nStanding    BY.', hashReply(REPLY), 1).standDown, true);
   });
 
-  test('no prior hash (first turn) -> proceed', () => {
-    assert.equal(isNoProgressRepeat('Same. Standing by.', null), false);
-    assert.equal(isNoProgressRepeat('Same. Standing by.', undefined), false);
-    assert.equal(isNoProgressRepeat('Same. Standing by.', ''), false);
+  test('a different reply in between RESETS the counter', () => {
+    const different = evaluateNoProgress('Opened PR #62, CI green.', hashReply(REPLY), 1);
+    assert.equal(different.repeatCount, 0);
+    assert.equal(different.standDown, false);
+    assert.equal(different.hash, hashReply('Opened PR #62, CI green.'));
+    // and the next identical-to-THAT reply is only repeat 1 again
+    assert.equal(evaluateNoProgress('Opened PR #62, CI green.', different.hash, different.repeatCount).standDown, false);
   });
 
-  test('blank current text -> proceed (nothing to compare)', () => {
-    assert.equal(isNoProgressRepeat('', hashReply('Same. Standing by.')), false);
+  test('blank current text → carry prior state, never stand down', () => {
+    const r = evaluateNoProgress('', hashReply(REPLY), 1);
+    assert.equal(r.standDown, false);
+    assert.equal(r.hash, hashReply(REPLY));
+    assert.equal(r.repeatCount, 1);
   });
 
-  test('the observed 8-in-a-row loop stands down from the second reply on', () => {
-    let prior = null;
+  test('the observed 8-in-a-row loop stands down from the THIRD reply on', () => {
+    let hash = null;
+    let count = 0;
     const decisions = [];
     for (let i = 0; i < 8; i++) {
-      const reply = 'Same. Standing by.';
-      decisions.push(isNoProgressRepeat(reply, prior));
-      prior = hashReply(reply);
+      const r = evaluateNoProgress(REPLY, hash, count);
+      decisions.push(r.standDown);
+      if (r.standDown) continue;   // hook exits; state is not advanced
+      hash = r.hash;
+      count = r.repeatCount;
     }
-    assert.deepEqual(decisions, [false, true, true, true, true, true, true, true]);
+    assert.deepEqual(decisions, [false, false, true, true, true, true, true, true]);
+    assert.equal(decisions.indexOf(true), 2, 'stand-down must begin at the 3rd identical reply');
   });
 });
 
@@ -101,11 +117,12 @@ describe('goalStore.mutate — reply-hash persistence', () => {
     cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-noprogress-'));
   });
 
-  test('stores lastReplyHash in the existing per-session state file', () => {
+  test('stores lastReplyHash + replyRepeatCount in the existing per-session state file', () => {
     const sid = 'sess-abc';
-    goalStore.mutate(cwd, sid, (s) => { s.lastReplyHash = hashReply('Same. Standing by.'); });
+    goalStore.mutate(cwd, sid, (s) => { s.lastReplyHash = hashReply('Same. Standing by.'); s.replyRepeatCount = 1; });
     const loaded = goalStore.load(cwd, sid);
     assert.equal(loaded.lastReplyHash, hashReply('Same. Standing by.'));
+    assert.equal(loaded.replyRepeatCount, 1);
     // Same on-disk layout as every other per-session key — no new file.
     assert.ok(fs.existsSync(path.join(cwd, '.supervisor', 'goals', `${sid}.json`)));
   });
@@ -166,6 +183,6 @@ describe('the gate is wired into the hook', () => {
 
   test('AUTOPILOT_EXIT is never swallowed by the gate', () => {
     assert.match(src, /autopilotExiting/);
-    assert.match(src, /!autopilotExiting && isNoProgressRepeat/);
+    assert.match(src, /!autopilotExiting && noProgress\.standDown/);
   });
 });
