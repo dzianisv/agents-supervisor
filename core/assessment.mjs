@@ -151,7 +151,7 @@ ${buildConversationSection(safeContext, lastAssistantText)}
 - Mode: ${safeContext.agentMode}
 - Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
 ${attemptSection}
-${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ''}Return JSON only:
+${agents ? `## Project Instructions\n${truncateForPrompt(agents, 800, { keep: 'head', label: 'project instructions' })}\n\n` : ''}Return JSON only:
 {
   "task_summary": "brief description of what was done",
   "task_type": "feature|bugfix|refactor|docs|research|ops|other",

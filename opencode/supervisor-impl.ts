@@ -54,7 +54,7 @@ import {
 import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
 import {
   extractLastAssistantText, findLastRelevantUserIndex, currentUserTask,
-  buildConversationChain, userMessageText,
+  buildConversationChain, userMessageText, truncateForPrompt, PROMPT_TEXT_LIMIT,
 } from "../core/task-context.mjs"
 import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
 
@@ -674,7 +674,7 @@ async function loadSupervisorPrompt(directory: string): Promise<string | null> {
 
 function buildToolSupervisorGuidanceSection(toolSupervisorPrompt: string | null): string {
   if (!toolSupervisorPrompt) return ""
-  return `\n## Tool Supervisor Guidance\n${toolSupervisorPrompt.slice(0, 4000)}\n`
+  return `\n## Tool Supervisor Guidance\n${truncateForPrompt(toolSupervisorPrompt, PROMPT_TEXT_LIMIT, { keep: "head", label: "tool guidance" })}\n`
 }
 
 function resolveSupervisorPromptPrecedence(
@@ -1423,10 +1423,10 @@ ${context.taskType}
 ${context.toolsSummary}
 
 ## Agent Last Response
-${lastAssistantText.slice(0, 2000)}
+${truncateForPrompt(lastAssistantText, 2000, { keep: "tail", label: "agent response" })}
 
 ## Self-Assessment
-${selfAssessment.slice(0, 3000)}
+${truncateForPrompt(selfAssessment, 3000, { keep: "tail", label: "self-assessment" })}
 ${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
 
 ## Supervisor Analysis Verdict
