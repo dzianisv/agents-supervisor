@@ -51,12 +51,8 @@ test('appendStatusDirective trims trailing whitespace on the input', () => {
 });
 
 test('buildEscalatingFeedback ends with the directive and keeps the verdict sections', () => {
-  const out = buildEscalatingFeedback(
-    1,
-    'medium',
-    { feedback: 'x', missing: ['m'], next_actions: ['n'] },
-    3
-  );
+  const out = buildEscalatingFeedback('medium',
+    { feedback: 'x', missing: ['m'], next_actions: ['n'] });
   assert.ok(out.endsWith(STATUS_DIAGRAM_DIRECTIVE), 'directive must be last');
   assert.ok(out.includes('### Missing'), 'Missing section preserved');
   assert.ok(out.includes('### Next Actions'), 'Next Actions section preserved');

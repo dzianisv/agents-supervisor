@@ -133,6 +133,12 @@ export async function waitForHealth(url, timeoutMs = 90_000, attemptTimeoutMs = 
  * @param {object} [opts]
  * @param {string} [opts.root] parent dir for the isolated project/$HOME (default: os tmpdir)
  * @param {string} [opts.label] short label used in the temp dir names
+ * @param {string} [opts.projectDir] REUSE an existing project dir instead of minting one.
+ *   Pair with `isolatedHome` to restart a server over the same state — opencode
+ *   persists sessions under $HOME, and the supervisor persists per-session
+ *   machine state under <projectDir>/.supervisor. opencode.json is rewritten
+ *   either way, so the restarted server picks up the NEW fixture port.
+ * @param {string} [opts.isolatedHome] REUSE an existing $HOME (see `projectDir`)
  * @param {(ctx: object) => object|null} [opts.responder] fixture LLM steering hook
  * @param {(projectDir: string) => void} [opts.seedProject] runs after the project dir exists, BEFORE the server starts
  * @param {Record<string,unknown>} [opts.configPatch] merged into the generated opencode.json
@@ -144,8 +150,10 @@ export async function startLiveServer(opts = {}) {
   const label = opts.label || "live"
   mkdirSync(root, { recursive: true })
 
-  const projectDir = mkdtempSync(join(root, `proj-${label}-`))
-  const isolatedHome = mkdtempSync(join(root, `home-${label}-`))
+  const projectDir = opts.projectDir || mkdtempSync(join(root, `proj-${label}-`))
+  const isolatedHome = opts.isolatedHome || mkdtempSync(join(root, `home-${label}-`))
+  mkdirSync(projectDir, { recursive: true })
+  mkdirSync(isolatedHome, { recursive: true })
   const fixture = await startFixtureLlmServer({ responder: opts.responder })
   const model = { providerID: "test-fixture", modelID: "fixture-model" }
 

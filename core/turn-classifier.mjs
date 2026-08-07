@@ -124,16 +124,51 @@ export function isNonActionableTurn(text) {
 }
 
 /**
+ * A turn whose whole content is a supervisor CONTROL command
+ * (`/supervisor …`, `/supervisor:retry 3`, `/autopilot`). Never work, in ANY
+ * mode.
+ *
+ * This is checked BEFORE the goal/autopilot escape hatches, unlike every other
+ * rule here, and that ordering is load-bearing. Before the per-turn budget was
+ * real, autopilot injected at most once per turn, so nudging the
+ * `/supervisor autopilot` command turn itself cost one wasted message. With a
+ * real budget it is fatal: the command turn burns the ENTIRE budget within
+ * seconds and the exhaustion path disarms autopilot — so `/supervisor
+ * autopilot` would turn itself off before the user ever typed a task.
+ * Measured directly in test/e2e-opencode.test.mjs ("autopilot nudges
+ * repeatedly…"): the task turn ran in reflection mode with zero autopilot
+ * nudges.
+ *
+ * Deliberately narrow: the ENTIRE trimmed message must be the command, so
+ * "run /supervisor retry 3 then fix the build" stays actionable.
+ */
+const SUPERVISOR_CONTROL_TURN = /^\s*\/?(supervisor(:[a-z-]+)?|autopilot)\b[^\n]*$/i
+
+/**
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isSupervisorControlTurn(text) {
+  if (typeof text !== 'string') return false
+  const trimmed = text.trim()
+  if (trimmed === '') return false
+  return SUPERVISOR_CONTROL_TURN.test(trimmed)
+}
+
+/**
  * The decision the runtimes actually call.
  *
  * ESCAPE HATCH: an active goal (or autopilot) keeps supervising regardless —
  * a goal is a standing, user-set completion contract that outlives any single
- * chatty turn, so "thanks" must not silently disarm it.
+ * chatty turn, so "thanks" must not silently disarm it. The ONE thing that
+ * escape hatch does not cover is a supervisor control command; see
+ * isSupervisorControlTurn.
  *
  * @param {{text?: string, hasActiveGoal?: boolean, mode?: string}} opts
  * @returns {{skip: boolean, reason: string}}
  */
 export function shouldSkipReflection({ text, hasActiveGoal, mode } = {}) {
+  if (isSupervisorControlTurn(text)) return { skip: true, reason: 'supervisor-control-command' }
   if (hasActiveGoal) return { skip: false, reason: 'active-goal' }
   if (mode === 'autopilot' || mode === 'goal') return { skip: false, reason: `mode:${mode}` }
   const { actionable, category } = classifyTurn(text)
