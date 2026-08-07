@@ -222,7 +222,7 @@ export async function buildReflectionPrompt({
     attemptSection: currentAttempt > 0 ? 'true' : undefined,
     attemptNumber: String(currentAttempt + 1),
     maxAttempts: String(effectiveCap),
-    projectInstructions: agents ? agents.slice(0, 800) : undefined,
+    projectInstructions: agents ? truncateForPrompt(agents, 800, { keep: 'head', label: 'project instructions' }) : undefined,
     goalSection: effectiveGoalSection || undefined,
   }
 
