@@ -233,6 +233,15 @@ export function collectConversationTurns(messages) {
   if (!Array.isArray(messages)) return []
   /** @type {{user: string, assistant: string[]}[]} */
   const turns = []
+  // NOTE (checked, do not "fix"): a supervisor-injected user message is
+  // excluded from the chain, but the agent's REPLY to it is deliberately
+  // attached to the preceding HUMAN turn. It reads oddly in a prompt dump —
+  // the reply to a status-checkpoint correction appears inside an earlier
+  // turn's assistant block — but suppressing it would hide the agent's
+  // corrective work from the judge, which would then keep seeing only the
+  // first, incomplete attempt and re-inject forever. Pinned by
+  // test/task-context.test.mjs, "supervisor-injected messages are NEVER a turn
+  // in the chain" (it asserts `second attempt` IS present).
   for (const msg of messages) {
     const role = msg?.info?.role
     if (role === 'user') {

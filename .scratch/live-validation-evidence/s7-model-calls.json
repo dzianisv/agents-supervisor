@@ -1,0 +1,23 @@
+[
+  {
+    "i": 0,
+    "roles": "system,system,user,user",
+    "lastUser": "Add a changelog entry and commit it. LIVEVAL_S7_PROBE_TURN",
+    "hasStatusMarker": true,
+    "nTools": 0
+  },
+  {
+    "i": 1,
+    "roles": "system,system,user",
+    "lastUser": "Add a changelog entry and commit it. LIVEVAL_S7_PROBE_TURN",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 2,
+    "roles": "system,system,user,assistant,tool",
+    "lastUser": "Add a changelog entry and commit it. LIVEVAL_S7_PROBE_TURN",
+    "hasStatusMarker": true,
+    "nTools": 19
+  }
+]

@@ -1,0 +1,67 @@
+{
+  "info": {
+    "parentID": "msg_fd9c27d45001NURXi1j0LAiUV3",
+    "role": "assistant",
+    "mode": "build",
+    "agent": "build",
+    "path": {
+      "cwd": "/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10",
+      "root": "/"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "write": 0,
+        "read": 0
+      }
+    },
+    "modelID": "fixture-model",
+    "providerID": "test-fixture",
+    "time": {
+      "created": 1786064829837,
+      "completed": 1786064829870
+    },
+    "finish": "stop",
+    "id": "msg_fd9c27d8d001wKTOR3h6s11pdk",
+    "sessionID": "ses_0263d9800ffeuDGBvR6G23zF8D"
+  },
+  "parts": [
+    {
+      "type": "step-start",
+      "id": "prt_fd9c27da6001VBw5BDNknTnvyg",
+      "sessionID": "ses_0263d9800ffeuDGBvR6G23zF8D",
+      "messageID": "msg_fd9c27d8d001wKTOR3h6s11pdk"
+    },
+    {
+      "type": "text",
+      "text": "FAILED to disable supervisor for session ses_0263… — could not write .supervisor/disabled: EACCES: permission denied, open '/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10/.supervisor/disabled'. The supervisor is still ON. Mode also set to reflection.",
+      "time": {
+        "start": 1786064829863,
+        "end": 1786064829867
+      },
+      "id": "prt_fd9c27da7001dj5XMIA8Dg28Ql",
+      "sessionID": "ses_0263d9800ffeuDGBvR6G23zF8D",
+      "messageID": "msg_fd9c27d8d001wKTOR3h6s11pdk"
+    },
+    {
+      "reason": "stop",
+      "type": "step-finish",
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "write": 0,
+          "read": 0
+        }
+      },
+      "cost": 0,
+      "id": "prt_fd9c27dac001V09zB6mZjFTBSc",
+      "sessionID": "ses_0263d9800ffeuDGBvR6G23zF8D",
+      "messageID": "msg_fd9c27d8d001wKTOR3h6s11pdk"
+    }
+  ]
+}

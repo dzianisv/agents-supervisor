@@ -86,6 +86,20 @@ function lastTextContent(messages) {
   return ""
 }
 
+/** Concatenated `system`-role content of one request's messages. */
+function collectSystemText(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((m) => m?.role === "system")
+    .map((m) =>
+      typeof m?.content === "string"
+        ? m.content
+        : Array.isArray(m?.content)
+          ? m.content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("\n")
+          : ""
+    )
+    .join("\n")
+}
+
 /**
  * Start the fixture server on an ephemeral local port.
  *
@@ -97,9 +111,19 @@ function lastTextContent(messages) {
  * declares the field, the server does not populate it), so asserting on the
  * transcript would silently prove nothing.
  *
+ * `opts.responder` is an OPTIONAL escape hatch used by the live-validation
+ * harness (test/live-validation.mjs) to steer individual scenarios — e.g. to
+ * force an incomplete judge verdict so a continuation is actually injected,
+ * or an actionless one so the stand-down guard fires. It runs BEFORE all the
+ * default branches below and only takes effect when it returns a non-null
+ * value, so passing no options leaves this fixture byte-for-byte the same
+ * deterministic thing test/e2e-opencode.test.mjs has always used.
+ *
+ * @param {object} [opts]
+ * @param {(ctx: {body: object, messages: object[], fullText: string, systemText: string, lastText: string, hasTools: boolean, index: number}) => ({text: string}|{tool: string, args: object}|null|undefined)} [opts.responder]
  * @returns {Promise<{ port: number, baseURL: string, getRequests: () => object[], getSystemPrompts: () => string[], close: () => Promise<void> }>}
  */
-export function startFixtureLlmServer() {
+export function startFixtureLlmServer(opts = {}) {
   let counter = 0
   /** @type {object[]} every parsed chat-completions body, in arrival order. */
   const requests = []
@@ -165,6 +189,33 @@ export function startFixtureLlmServer() {
         res.write(sseChunk({}, "tool_calls"))
         res.write("data: [DONE]\n\n")
         res.end()
+      }
+
+      // 0. Optional per-scenario override (live-validation harness only).
+      //    Returns null/undefined to fall through to the default branches.
+      if (typeof opts.responder === "function") {
+        let decision = null
+        try {
+          decision = opts.responder({
+            body: data,
+            messages,
+            fullText,
+            systemText: collectSystemText(messages),
+            lastText: lastTextContent(messages),
+            hasTools,
+            index: counter,
+          })
+        } catch {
+          decision = null
+        }
+        if (decision && typeof decision.tool === "string") {
+          callTool(decision.tool, decision.args || {})
+          return
+        }
+        if (decision && typeof decision.text === "string") {
+          finishWithText(decision.text)
+          return
+        }
       }
 
       // 1. Finalize turn after a tool has executed — echo the tool's own
@@ -268,6 +319,16 @@ export function startFixtureLlmServer() {
 
   return new Promise((resolve, reject) => {
     server.on("error", reject)
+    // node:http closes an IDLE keep-alive socket after 5s by default. undici
+    // (which opencode's provider uses) keeps that socket in its pool and will
+    // happily send the next request onto it, racing the close — the request
+    // fails with a socket error and the AI SDK retries with exponential
+    // backoff. Observed as a ~60s stall in the middle of a supervisor pass
+    // with no error surfaced anywhere. Disable the idle timeout: this server
+    // lives for the duration of one test and is closed explicitly.
+    server.keepAliveTimeout = 0
+    server.headersTimeout = 0
+    server.requestTimeout = 0
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address()
       resolve({

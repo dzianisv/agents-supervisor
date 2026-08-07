@@ -1,0 +1,14 @@
+{
+  "legacyState": {
+    "mode": "goal",
+    "autopilot": false,
+    "maxAttempts": 9,
+    "goal": {
+      "condition": "legacy goal survived the migration",
+      "status": "active",
+      "attempts": 3,
+      "setAt": 1786064977719
+    }
+  },
+  "sessionId": "ses_0263b40d9ffey4BgTSWuv0hYZr"
+}

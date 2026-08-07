@@ -29,86 +29,26 @@
  * opencode server, the real plugin, and the real tool implementations are
  * still exercised end to end over real HTTP.
  *
+ * The spawn/teardown/health mechanics live in test/helpers/live-server.mjs so
+ * this file and test/live-validation.mjs cannot drift apart on isolation.
+ *
+ * DO NOT add this file to a `test/*.test.mjs` glob. It spawns a real server;
+ * `node --test` runs files concurrently, so the glob would start a second copy
+ * of this suite alongside 30+ unit files on the same cores. `npm test` and
+ * `npm run test:e2e` are separate for exactly that reason.
+ *
  * Run: node --experimental-strip-types --test test/e2e-opencode.test.mjs
  */
 
 import { describe, test, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { spawn, execSync } from "node:child_process"
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
+import { readFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
-import { fileURLToPath } from "node:url"
-import { createServer } from "node:net"
-import { startFixtureLlmServer } from "./helpers/opencode-fixture-llm.mjs"
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url))
-const REPO_ROOT = join(__dirname, "..")
-const PLUGIN_PATH = join(REPO_ROOT, "opencode", "supervisor.ts")
-
-// Ambient credential env vars known to auto-enable real remote providers in
-// this environment (GitHub Copilot/Models via gh CLI token, Cloudflare AI
-// Gateway, etc). Stripped from the spawned server's env as defense in depth
-// on top of the isolated $HOME — belt and suspenders so the isolated server
-// can never reach a real provider even by accident. This does NOT touch the
-// user's actual global config/credentials; it only affects this child
-// process's environment.
-const AMBIENT_PROVIDER_ENV_VARS = [
-  "GITHUB_TOKEN", "GH_TOKEN", "CLOUDFLARE_API_TOKEN",
-  "AZURE_DEV_AI_API_KEY", "AZURE_DEV_AI_BASE_URL",
-  "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
-]
-
-// Ambient env that reconfigures the *server itself* rather than a provider.
-// OPENCODE_SERVER_PASSWORD makes `opencode serve` demand HTTP basic auth, so
-// every unauthenticated request in this suite (including the health poll)
-// gets a 401. The opencode desktop app exports it into the user's shell, so
-// this suite must strip it to stay hermetic.
-const AMBIENT_SERVER_ENV_VARS = [
-  "OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER_USERNAME",
-  "OPENCODE_URL", "OPENCODE_CLIENT",
-]
+import { startLiveServer, hasOpencode } from "./helpers/live-server.mjs"
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Check if `opencode` binary is available in PATH. */
-function hasOpencode() {
-  try {
-    execSync("which opencode", { stdio: "pipe" })
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** Find a free TCP port by briefly binding to port 0. */
-function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const srv = createServer()
-    srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address()
-      srv.close(() => resolve(port))
-    })
-    srv.on("error", reject)
-  })
-}
-
-/** Poll a URL until it responds with status 200 or timeout expires. */
-async function waitForHealth(url, timeoutMs = 15_000, intervalMs = 500) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url)
-      if (res.ok) return
-    } catch {
-      // server not ready yet
-    }
-    await new Promise((r) => setTimeout(r, intervalMs))
-  }
-  throw new Error(`Server did not become healthy within ${timeoutMs}ms at ${url}`)
-}
 
 /**
  * Send a message to a session and wait for the full response.
@@ -137,6 +77,69 @@ async function sendMessage(baseUrl, sessionId, text, timeoutMs = 60_000, opts = 
   }
 }
 
+/** Every user-role text of one recorded chat-completions body, oldest first. */
+function userTextsOf(body) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : []
+  return msgs
+    .filter((m) => m?.role === "user")
+    .map((m) =>
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.filter((p) => p?.type === "text").map((p) => p.text).join("\n")
+          : ""
+    )
+}
+
+/** Concatenated system-role content of one recorded chat-completions body. */
+function systemTextOf(body) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : []
+  return msgs
+    .filter((m) => m?.role === "system")
+    .map((m) =>
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("\n")
+          : ""
+    )
+    .join("\n")
+}
+
+/**
+ * The model calls that belong to ONE specific user turn, identified by a probe
+ * string unique to that turn.
+ *
+ * WHY NOT `getSystemPrompts().slice(before)`: that slice is a GLOBAL,
+ * server-wide list, and this server is concurrent. The supervisor's own
+ * background work for an EARLIER session (most visibly its one-shot
+ * "status checkpoint missing" correction, which is injected into that other
+ * session and therefore legitimately carries the directive) lands in the
+ * slice whenever it happens to finish inside the ~500ms window between
+ * capturing `before` and asserting. That is the entire flake: measured 1
+ * failure in 16 runs of this file, and reproduced deterministically by
+ * waiting 20s after `before` — 2 offenders, both the status-correction turn
+ * of the PREVIOUS test's session. Index arithmetic cannot express "this
+ * session"; content can.
+ *
+ * `turnCalls` keeps only calls whose LAST user message is the probe turn —
+ * i.e. the user's own turn and its tool-loop follow-ups — which excludes the
+ * supervisor's ephemeral judge/self-assessment prompts (their last user
+ * message is the judge prompt) even though those quote the probe text back
+ * inside the conversation chain.
+ */
+function turnCalls(fixtureLlm, probe) {
+  return fixtureLlm.getRequests().filter((b) => {
+    const users = userTextsOf(b)
+    return users.length > 0 && users[users.length - 1].includes(probe)
+  })
+}
+
+/** Every model call that mentions the probe anywhere (superset of turnCalls). */
+function callsMentioning(fixtureLlm, probe) {
+  return fixtureLlm.getRequests().filter((b) => userTextsOf(b).some((t) => t.includes(probe)))
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -144,117 +147,22 @@ async function sendMessage(baseUrl, sessionId, text, timeoutMs = 60_000, opts = 
 const SKIP = !hasOpencode()
 
 describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
-  let serverProc
+  let server
   let baseUrl
   let tmpDir
-  let isolatedHome
   let fixtureLlm
   const model = { providerID: "test-fixture", modelID: "fixture-model" }
 
   before(async () => {
-    // 1. Isolated project directory (server cwd / project config root).
-    tmpDir = mkdtempSync(join(tmpdir(), "sup-e2e-oc-"))
-
-    // 2. Isolated $HOME — no global opencode.json, no auth.json, no global
-    //    plugins. See the module docstring above for why this matters.
-    isolatedHome = mkdtempSync(join(tmpdir(), "sup-e2e-home-"))
-
-    // 3. Local deterministic fixture LLM (see test/helpers/opencode-fixture-llm.mjs).
-    fixtureLlm = await startFixtureLlmServer()
-
-    // 4. Project config: only this worktree's plugin, and a custom
-    //    OpenAI-compatible provider pointing at the fixture (same mechanism
-    //    documented at https://opencode.ai/docs/providers/#atomic-chat).
-    const cfg = {
-      $schema: "https://opencode.ai/config.json",
-      plugin: [PLUGIN_PATH],
-      model: `${model.providerID}/${model.modelID}`,
-      provider: {
-        [model.providerID]: {
-          npm: "@ai-sdk/openai-compatible",
-          name: "Test Fixture (local, deterministic)",
-          options: {
-            baseURL: fixtureLlm.baseURL,
-            apiKey: "fixture-key",
-          },
-          models: {
-            [model.modelID]: {
-              name: "Fixture Model",
-              tool_call: true,
-              cost: { input: 0, output: 0 },
-              limit: { context: 32_000, output: 4096 },
-            },
-          },
-        },
-      },
-    }
-    writeFileSync(join(tmpDir, "opencode.json"), JSON.stringify(cfg, null, 2))
-
-    // 5. Spawn the real server with the isolated $HOME and without ambient
-    //    provider credentials.
-    const port = await findFreePort()
-    baseUrl = `http://127.0.0.1:${port}`
-    const childEnv = { ...process.env, HOME: isolatedHome, SUPERVISOR_DEBUG: "1" }
-    for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
-    for (const key of AMBIENT_SERVER_ENV_VARS) delete childEnv[key]
-
-    serverProc = spawn("opencode", ["serve", "--port", String(port), "--hostname", "127.0.0.1"], {
-      cwd: tmpDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-      env: childEnv,
-    })
-
-    let stderrBuf = ""
-    serverProc.stdout.on("data", (chunk) => {
-      process.stdout.write("[opencode.stdout] " + chunk.toString())
-    })
-    serverProc.stderr.on("data", (chunk) => {
-      const s = chunk.toString()
-      stderrBuf += s
-      process.stderr.write("[opencode.stderr] " + s)
-    })
-    serverProc.stdout?.unref?.()
-    serverProc.stderr?.unref?.()
-    serverProc.unref()
-
-    // 6. Wait for health.
-    try {
-      await Promise.race([
-        waitForHealth(`${baseUrl}/global/health`),
-        new Promise((_, reject) => {
-          serverProc.on("exit", (code) => {
-            reject(new Error(`opencode serve exited early (code ${code}). stderr:\n${stderrBuf}`))
-          })
-        }),
-      ])
-    } catch (err) {
-      serverProc.kill("SIGTERM")
-      throw err
-    }
-
+    server = await startLiveServer({ label: "e2e" })
+    baseUrl = server.baseUrl
+    tmpDir = server.projectDir
+    fixtureLlm = server.fixture
     process.stdout.write(`[e2e] fixture model: ${model.providerID}/${model.modelID} @ ${fixtureLlm.baseURL}\n`)
   })
 
   after(async () => {
-    // Kill the process group (detached spawn uses its own group)
-    if (serverProc && !serverProc.killed) {
-      try {
-        process.kill(-serverProc.pid, "SIGKILL")
-      } catch {
-        try { serverProc.kill("SIGKILL") } catch { /* ignore */ }
-      }
-    }
-    // Destroy remaining pipe streams to prevent hanging
-    serverProc?.stdout?.destroy()
-    serverProc?.stderr?.destroy()
-    // Close the fixture LLM server.
-    if (fixtureLlm) {
-      try { await fixtureLlm.close() } catch { /* ignore */ }
-    }
-    // Clean up temp directories.
-    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true })
-    if (isolatedHome) rmSync(isolatedHome, { recursive: true, force: true })
+    if (server) await server.stop()
     // Force exit after a brief delay if node won't quit
     setTimeout(() => process.exit(0), 500).unref()
   })
@@ -519,20 +427,22 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     const MARKER = "<!-- supervisor:status-directive -->"
 
     test("directive reaches the model on the FIRST turn, exactly once", { timeout: 300_000 }, async () => {
-      const before = fixtureLlm.getSystemPrompts().length
-
       const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
       assert.equal(createRes.status, 200)
       const session = await createRes.json()
 
       // The very first turn of the session — the one the supervisor's
       // continuation-prompt path can never reach, which is the whole reason
-      // this hook exists.
-      await sendMessage(baseUrl, session.id, "Say hello.", 120_000, { model })
+      // this hook exists. The probe makes the calls for THIS turn
+      // identifiable in a server-wide, concurrently-written request log; see
+      // turnCalls() for why an index slice cannot do that job.
+      const PROBE = "E2E_STATUS_FIRSTTURN_PROBE"
+      await sendMessage(baseUrl, session.id, `Say hello. ${PROBE}`, 120_000, { model })
 
-      const systems = fixtureLlm.getSystemPrompts().slice(before)
-      assert.ok(systems.length > 0, "expected at least one model call for this turn")
+      const calls = turnCalls(fixtureLlm, PROBE)
+      assert.ok(calls.length > 0, "expected at least one model call for this turn")
 
+      const systems = calls.map(systemTextOf)
       const withMarker = systems.filter((s) => s.includes(MARKER))
       assert.ok(
         withMarker.length > 0,
@@ -563,15 +473,26 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
         `Expected the toggle to acknowledge. Got: ${JSON.stringify(offRes).slice(0, 500)}`
       )
 
-      // Only look at calls made AFTER the toggle landed.
-      const before = fixtureLlm.getSystemPrompts().length
-      await sendMessage(baseUrl, session.id, "Say hello again.", 120_000, { model })
-      const systems = fixtureLlm.getSystemPrompts().slice(before)
-      assert.ok(systems.length > 0, "expected at least one model call after the toggle")
-      for (const s of systems) {
+      // Attribute calls by CONTENT, not by index. `getSystemPrompts().slice(before)`
+      // used to be the check here and it is the source of this file's only
+      // measured flake (1 in 16): the slice is server-wide, and the
+      // supervisor's own status-checkpoint correction for the PREVIOUS test's
+      // session legitimately carries the directive, so whenever that
+      // background turn landed inside the slice this assertion failed on a
+      // completely unrelated session.
+      const PROBE = "E2E_STATUS_OFF_PROBE"
+      await sendMessage(baseUrl, session.id, `Say hello again. ${PROBE}`, 120_000, { model })
+
+      // Superset on purpose: EVERY call that mentions this session's probe at
+      // all, including the supervisor's own judge prompts (which quote the
+      // conversation back). None of them may carry the directive.
+      const calls = callsMentioning(fixtureLlm, PROBE)
+      assert.ok(calls.length > 0, "expected at least one model call after the toggle")
+      for (const body of calls) {
+        const s = systemTextOf(body)
         assert.ok(
           !s.includes(MARKER),
-          "status directive was injected even though /supervisor status off was set for this session"
+          `status directive was injected even though /supervisor status off was set for this session. Offending call's last user text: ${(userTextsOf(body).pop() || "").slice(0, 200)}`
         )
       }
     })

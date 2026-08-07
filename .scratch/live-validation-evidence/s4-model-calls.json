@@ -1,0 +1,163 @@
+[
+  {
+    "i": 0,
+    "roles": "system,system,user,user",
+    "lastUser": "Add caching to src/a.ts with tests. LIVEVAL_S4_A_WORK1",
+    "hasStatusMarker": true,
+    "nTools": 0
+  },
+  {
+    "i": 1,
+    "roles": "system,system,user",
+    "lastUser": "Add caching to src/a.ts with tests. LIVEVAL_S4_A_WORK1",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 2,
+    "roles": "system,user,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 3,
+    "roles": "system,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 4,
+    "roles": "system,user,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 5,
+    "roles": "system,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 6,
+    "roles": "system,system,user,assistant,user",
+    "lastUser": "## Supervisor: Status checkpoint\n\nThe work looks complete, but the required status checkpoint is missing —\nyou did not update `status.md` or print the roadmap block this turn.\n\nDo only that now: update `status.md` and print the roadmap block. Do not\nstart new work, and do not re-do work that is already finished.\n\n<!-- supervisor:status-directive -->\n### Status checkpoint (required, every iteration",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 7,
+    "roles": "system,system,user,user",
+    "lastUser": "Add caching to src/b.ts with tests. LIVEVAL_S4_B_WORK1",
+    "hasStatusMarker": true,
+    "nTools": 0
+  },
+  {
+    "i": 8,
+    "roles": "system,system,user",
+    "lastUser": "Add caching to src/b.ts with tests. LIVEVAL_S4_B_WORK1",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 9,
+    "roles": "system,user,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 10,
+    "roles": "system,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 11,
+    "roles": "system,user,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 12,
+    "roles": "system,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 13,
+    "roles": "system,system,user,assistant,user",
+    "lastUser": "## Supervisor: Status checkpoint\n\nThe work looks complete, but the required status checkpoint is missing —\nyou did not update `status.md` or print the roadmap block this turn.\n\nDo only that now: update `status.md` and print the roadmap block. Do not\nstart new work, and do not re-do work that is already finished.\n\n<!-- supervisor:status-directive -->\n### Status checkpoint (required, every iteration",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 14,
+    "roles": "system,system,user,assistant,user,assistant,user",
+    "lastUser": "Please stop supervising this session. LIVEVAL_TURN_IT_OFF",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 15,
+    "roles": "system,user,assistant,user,assistant,user,assistant,tool",
+    "lastUser": "Please stop supervising this session. LIVEVAL_TURN_IT_OFF",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 16,
+    "roles": "system,user,assistant,user,assistant,user,assistant,tool,assistant,user",
+    "lastUser": "Now add an eviction policy too. LIVEVAL_S4_A_WORK2",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 17,
+    "roles": "system,system,user,assistant,user,assistant,user",
+    "lastUser": "Now add an eviction policy too. LIVEVAL_S4_B_WORK2",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 18,
+    "roles": "system,user,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 19,
+    "roles": "system,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 20,
+    "roles": "system,user,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 21,
+    "roles": "system,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 22,
+    "roles": "system,system,user,assistant,user,assistant,user,assistant,user",
+    "lastUser": "## Supervisor: Status checkpoint\n\nThe work looks complete, but the required status checkpoint is missing —\nyou did not update `status.md` or print the roadmap block this turn.\n\nDo only that now: update `status.md` and print the roadmap block. Do not\nstart new work, and do not re-do work that is already finished.\n\n<!-- supervisor:status-directive -->\n### Status checkpoint (required, every iteration",
+    "hasStatusMarker": true,
+    "nTools": 19
+  }
+]

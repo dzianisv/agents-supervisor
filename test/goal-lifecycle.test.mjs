@@ -303,6 +303,83 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     );
   });
 
+  // Live-validation finding (test/live-validation.mjs scenario 8): a judge
+  // verdict of {complete:false, missing:[], next_actions:[], feedback:""} —
+  // the EXACT shape isActionlessVerdict exists for — was reported as
+  // "judge did not ask to continue (shouldContinue=false)", never as
+  // "verdict had no actionable content". Cause: analyzeSelfAssessmentWithLLM
+  // substitutes `verdict.feedback || "Judge analysis completed"` into
+  // `analysis.reason`, and the guard was fed `analysis.reason`. The
+  // blank-feedback arm of isActionlessVerdict was therefore unreachable on
+  // this runtime, and the operator-facing stand-down reason was wrong for the
+  // one case it was written to name.
+  test('opencode feeds isActionlessVerdict the RAW judge feedback, not the placeholder', async () => {
+    const raw = await readFile(join(ROOT, 'opencode', 'supervisor-impl.ts'), 'utf-8');
+    const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+
+    assert.ok(
+      /rawFeedback:\s*typeof verdict\.feedback === "string"/.test(src),
+      'the LLM-judge path must carry the verdict feedback through verbatim as rawFeedback'
+    );
+    assert.ok(
+      /feedback:\s*analysis\.rawFeedback \?\? analysis\.reason/.test(src),
+      'isActionlessVerdict must be given analysis.rawFeedback, never the "Judge analysis completed" placeholder'
+    );
+    assert.ok(
+      !/feedback:\s*analysis\.reason,\s*\}\)/.test(src),
+      'analysis.reason must not be passed to isActionlessVerdict — it is never blank'
+    );
+
+    // And the guard itself must still classify that exact shape.
+    assert.equal(
+      isActionlessVerdict({ missing: [], next_actions: [], feedback: '' }),
+      true,
+      'the empty-verdict shape must be classified as actionless'
+    );
+    assert.equal(
+      isActionlessVerdict({ missing: [], next_actions: [], feedback: 'Judge analysis completed' }),
+      false,
+      'the placeholder makes the verdict look non-actionless — which is exactly why it must not be passed in'
+    );
+  });
+
+  // Live-validation finding (test/live-validation.mjs scenario 9): `autopilot_exit`
+  // is registered plugin-wide, so it is in the tool catalog of EVERY session,
+  // including goal-mode ones. It used to call setAutopilot(false)
+  // unconditionally, which routes through setMode('reflection') ->
+  // `delete state.goal` — so one stray tool call destroyed the user's active
+  // goal, silently. Exiting a mode you are not in must be a no-op.
+  test('autopilot_exit is a no-op outside autopilot mode (it must not delete an active goal)', async () => {
+    // 1. The destructive primitive is real: setMode away from 'goal' drops the goal.
+    const cwd = mkdtempSync(join(tmpdir(), 'sup-autopilot-exit-'));
+    try {
+      goalStore.setGoal(cwd, 'ses_autopilot_exit_probe', 'ship the thing');
+      assert.equal(goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition, 'ship the thing');
+      goalStore.setMode(cwd, 'ses_autopilot_exit_probe', 'reflection');
+      assert.equal(
+        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal,
+        undefined,
+        'setMode away from goal drops the goal — this is the primitive autopilot_exit used to call blindly'
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+
+    // 2. …so the tool must check the mode first.
+    const raw = await readFile(join(ROOT, 'opencode', 'supervisor-impl.ts'), 'utf-8');
+    const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+    const exitFn = src.slice(src.indexOf('const executeAutopilotExit'), src.indexOf('let setSupervisorTool'));
+    assert.ok(exitFn.length > 0, 'could not locate executeAutopilotExit');
+    assert.ok(
+      /resolveSupervisorMode\(state\) === "autopilot"/.test(exitFn),
+      'autopilot_exit must only change state when autopilot is actually on'
+    );
+    assert.ok(
+      !/^\s*await supervisorStore\.setAutopilot\(directory, sid, false\)\s*$/m.test(exitFn.replace(/if \([^)]*\) \{[\s\S]*/, '')),
+      'autopilot_exit must not call setAutopilot unconditionally'
+    );
+  });
+
   test('claude-code stop hook stands down before injecting an actionless verdict', async () => {
     const raw = await readFile(join(ROOT, 'bin', 'supervisor-on-stop.mjs'), 'utf-8');
     const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');

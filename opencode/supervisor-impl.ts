@@ -553,6 +553,19 @@ interface SupervisorAnalysis {
   nextActions: string[]
   requiresHumanAction: boolean
   severity: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "BLOCKER"
+  /**
+   * The judge's feedback EXACTLY as it came back, before `reason` substitutes
+   * a placeholder for a blank one.
+   *
+   * isActionlessVerdict's whole job is to notice a verdict with nothing in it
+   * — empty missing, empty next_actions, blank feedback. Feeding it `reason`
+   * fed it "Judge analysis completed" instead of "", so the blank-feedback
+   * arm could never be true and the guard reported the wrong stand-down
+   * reason for the exact verdict shape it was written for (observed live:
+   * an empty verdict stood down as "judge did not ask to continue" rather
+   * than "verdict had no actionable content").
+   */
+  rawFeedback?: string
 }
 
 interface RoutingConfig {
@@ -1221,6 +1234,7 @@ async function analyzeSelfAssessmentWithLLM(
         complete: !!verdict.complete,
         shouldContinue,
         reason: verdict.feedback || "Judge analysis completed",
+        rawFeedback: typeof verdict.feedback === "string" ? verdict.feedback : "",
         missing,
         nextActions: Array.isArray(verdict.next_actions) ? verdict.next_actions : [],
         requiresHumanAction,
@@ -1915,7 +1929,26 @@ Do NOT call this tool:
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (sid) {
       currentSessionId = sid
-      await supervisorStore.setAutopilot(directory, sid, false)
+      // Only touch the mode if autopilot is actually on.
+      //
+      // This tool is registered plugin-wide, so it sits in the tool catalog of
+      // EVERY session, including goal-mode ones. Unconditionally calling
+      // setAutopilot(false) routes through setMode("reflection"), which does
+      // `delete state.goal` (core/goal.mjs) — so a model that calls
+      // autopilot_exit while a goal is active silently destroys the user's
+      // goal, with no warning and no log line. Hit for real while building
+      // test/live-validation.mjs scenario 9. Exiting a mode you are not in is
+      // a no-op, not a state reset.
+      const state = await supervisorStore.load(directory, sid)
+      if (resolveSupervisorMode(state) === "autopilot") {
+        await supervisorStore.setAutopilot(directory, sid, false)
+      } else {
+        debug("autopilot_exit called while not in autopilot mode — no state change for", sid)
+        return {
+          title: "Not in autopilot",
+          output: "Autopilot is not active for this session — nothing to exit. Supervisor state left unchanged.",
+        }
+      }
     }
     return { title: "Exited autopilot", output: "Autopilot completed." }
   }
@@ -2128,14 +2161,17 @@ Do NOT call this tool:
         const explicitAction = detectSupervisorActionInText(lastUserText)
         if (explicitAction === "off") {
           await setSessionDisabled(sessionId, true, sessionDirectory)
-          debug("Supervisor disabled by explicit user command in transcript:", sessionId.slice(0, 8))
+          // Full id: sessions minted seconds apart share an 8-char prefix, so a
+          // truncated id cannot say WHICH session was disabled — the exact
+          // ambiguity the per-session state work exists to remove.
+          debug("Supervisor disabled by explicit user command in transcript:", sessionId)
           return
         } else if (explicitAction === "on") {
           await setSessionDisabled(sessionId, false, sessionDirectory)
         }
 
         if (await isSessionDisabled(sessionId, sessionDirectory)) {
-          debug("Supervisor disabled for session:", sessionId.slice(0, 8))
+          debug("Supervisor disabled for session:", sessionId)
           return
         }
 
@@ -2675,7 +2711,9 @@ Continue now.`
         const actionlessVerdict = isActionlessVerdict({
           missing: analysis.missing,
           next_actions: analysis.nextActions,
-          feedback: analysis.reason,
+          // rawFeedback, not reason: `reason` has already had a placeholder
+          // substituted for a blank verdict (see SupervisorAnalysis).
+          feedback: analysis.rawFeedback ?? analysis.reason,
         })
         if (!analysis.shouldContinue || actionlessVerdict) {
           attempts.delete(attemptKey)
@@ -2878,9 +2916,19 @@ Call the tool now. Do not explain, just execute the tool call.`
     ) => {
       try {
         if (!Array.isArray(output?.system)) return
+        // Unconditional entry trace (SUPERVISOR_DEBUG only). The "injected"
+        // line below fires ONLY when the directive was actually appended, so
+        // without an entry line there is no way to tell "the hook ran N times
+        // and suppressed N-1 duplicates" from "the hook ran once". Counted by
+        // test/live-validation.mjs scenario 7.
+        debug("status-directive hook fired for", input?.sessionID?.slice(0, 8))
         if (!(await shouldInjectStatusDirective(input?.sessionID))) return
         // Idempotent by marker — this hook fires more than once per user turn
-        // on opencode 1.17.9, and system arrays may be reused.
+        // (measured: 3 fires for one turn on opencode 1.18.14), and system
+        // arrays may be reused. NOTE: the reuse half was measured on 1.17.9;
+        // on 1.18.14 every fire got a FRESH array, so the guard currently
+        // suppresses nothing at runtime there. Keep it — it is cheap, and the
+        // cost of being wrong is a duplicated directive in every prompt.
         if (appendStatusDirectiveToSystem(output.system)) {
           debug("status directive injected into system prompt for", input?.sessionID?.slice(0, 8))
         }

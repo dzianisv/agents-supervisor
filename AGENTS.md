@@ -12,11 +12,17 @@ opencode supervisor plugin — reflection, goal-tracking, autopilot for opencode
 ## Commands
 
 ```bash
-# Unit/integration tests
-node --experimental-strip-types --test test/*.test.mjs
+# Unit/integration tests (E2E is deliberately EXCLUDED — see below)
+npm test
 
 # opencode server E2E test (MUST pass before commit)
-node --experimental-strip-types --test test/e2e-opencode.test.mjs
+npm run test:e2e
+
+# Both, sequentially — never concurrently
+npm run test:all
+
+# Live validation against a real `opencode serve` (evidence, not assertions)
+node --experimental-strip-types test/live-validation.mjs
 
 # Claude Code E2E test
 node test/e2e-cc.mjs
@@ -24,6 +30,13 @@ node test/e2e-cc.mjs
 # Eval suite
 node evals/judge-eval.mjs
 ```
+
+**Never run `node --test test/*.test.mjs`.** That glob matches
+`e2e-opencode.test.mjs`, and `node --test` runs files CONCURRENTLY
+(`availableParallelism`, 8 here) — so the documented "unit test" command used to
+start a real `opencode serve` alongside 30+ unit files on the same cores, and
+running the documented E2E command straight afterwards started a second one.
+`npm test` now globs `test/!(e2e-*).test.mjs`; the E2E has its own script.
 
 ## Structure
 
@@ -128,6 +141,52 @@ Layout: `.supervisor/sessions/<full session id>/{state.json,verdicts.jsonl}`. Pr
 **Concurrency.** Atomic write is temp+rename in the same dir, created 0600 so there is no world-readable window. Atomic write alone is NOT sufficient — it prevents a corrupt file, not a lost update — so `mutate()` serialises read-modify-write behind an O_EXCL lockfile with a 10s stale breaker, and degrades to last-writer-wins rather than blocking a turn.
 
 **GC.** `gcSessions()` drops dirs untouched >30 days, then caps at 200 (oldest first); `maybeGcSessions()` runs it from the Stop hook at most once/day per project, best-effort, never blocking, never touching the live session.
+
+### `test/live-validation.mjs` — evidence, not assertions
+
+Nine scenarios, each against its own real `opencode serve` (isolated `$HOME` +
+scratch project under the OS temp dir, `SUPERVISOR_DEBUG=1`), driven over REST.
+It asserts on what the plugin itself produced: its debug log, the files it
+wrote, and the exact bytes it sent to the model. Writes forensic artefacts
+(captured prompts, transcripts, per-request model-call log) next to a
+`report.md`. Latest full-run write-up: `.scratch/live-validation.md` (9/9,
+98 checks). Not a pre-commit gate — a ~9 minute evidence run.
+
+Two things it found that unit tests could not:
+
+- **`isActionlessVerdict` was unreachable on the opencode runtime.**
+  `analyzeSelfAssessmentWithLLM` substitutes
+  `verdict.feedback || "Judge analysis completed"` into `analysis.reason`, and
+  the guard was fed `analysis.reason` — so the blank-feedback arm could never be
+  true, and an empty verdict stood down with the wrong reason. The judge's
+  feedback is now carried through verbatim as `SupervisorAnalysis.rawFeedback`
+  and that is what the guard reads.
+- **`autopilot_exit` silently deleted an active goal.** It is registered
+  plugin-wide, so it is in every session's tool catalog; it called
+  `setAutopilot(false)` unconditionally, which routes through
+  `setMode("reflection")` → `delete state.goal`. It is now a no-op outside
+  autopilot mode.
+
+Both are pinned in `test/goal-lifecycle.test.mjs`.
+
+`test/helpers/live-server.mjs` owns spawn/teardown/health for BOTH this harness
+and the E2E, so they cannot drift on isolation. `waitForHealth` gives every
+attempt its own `AbortSignal` — without one, a single stalled `fetch` blocks
+past the deadline the loop is supposed to enforce (measured: a 302s hang that
+cancelled all 14 E2E tests). `reserveFreePort` holds the port until the moment
+before spawn instead of racing between probe and bind.
+
+### `test/e2e-opencode.test.mjs` — attribute model calls by CONTENT
+
+The status-directive tests used to slice a server-wide list of model calls
+(`getSystemPrompts().slice(before)`) and treat every entry as belonging to the
+session under test. It does not: the supervisor's background status-checkpoint
+correction for an EARLIER session is injected into that other session and
+legitimately carries the directive, so whenever it finished inside the ~500ms
+assertion window the test failed on an unrelated session. Measured 1 failure in
+16 runs; reproduced deterministically by widening the window to 20s (2
+offenders, both the previous session's correction turn). Calls are now matched
+by a per-turn probe string. 20/20 after the fix.
 
 ### `test/e2e-cc.mjs` — Claude Code Stop hook
 

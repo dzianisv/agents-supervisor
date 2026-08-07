@@ -1,0 +1,44 @@
+[
+  {
+    "i": 0,
+    "roles": "system,system,user,user",
+    "lastUser": "Wire up the metrics exporter in src/metrics.ts and test it. LIVEVAL_S8_WORK",
+    "hasStatusMarker": true,
+    "nTools": 0
+  },
+  {
+    "i": 1,
+    "roles": "system,system,user",
+    "lastUser": "Wire up the metrics exporter in src/metrics.ts and test it. LIVEVAL_S8_WORK",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 2,
+    "roles": "system,user,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 3,
+    "roles": "system,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 19
+  },
+  {
+    "i": 4,
+    "roles": "system,user,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 5,
+    "roles": "system,user",
+    "lastUser": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing",
+    "hasStatusMarker": false,
+    "nTools": 19
+  }
+]
