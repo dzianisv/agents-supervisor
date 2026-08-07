@@ -26,6 +26,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 
 const ACTIVE_SESSION_ID = "ses_loopcheck123"
 const EPHEMERAL_PREFIX = "ses_judge_loop_"
@@ -141,7 +142,6 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-autopilot-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -149,8 +149,9 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
     const messages = makeLoopyMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeIncompleteAssessment())
 
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
     writeFileSync(
-      join(tmpDir, ".supervisor", "goals", `${ACTIVE_SESSION_ID}.json`),
+      statePath(tmpDir, ACTIVE_SESSION_ID),
       JSON.stringify({ mode: "autopilot", autopilot: true })
     )
 
@@ -177,7 +178,6 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-reflection-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -200,18 +200,42 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     // The judge's own reason/missing/next_actions drive the text, not a canned script.
     assert.match(feedbackText, /Apply the fix/)
 
-    // Non-binding telemetry MAY have reached the judge's own prompt as
-    // factual context — but that's the judge's input, not the output sent
-    // to the agent, and it must be clearly labeled non-binding.
+    // Tool telemetry no longer reaches the judge AT ALL — its context is the
+    // plain conversation chain (core/task-context.mjs). The old "label it
+    // non-binding" guard is superseded by the stronger invariant: it isn't there.
     const judgePrompt = getEphemeralPrompts()[0]?.body?.parts?.[0]?.text || ""
-    if (judgePrompt.includes("tool call")) {
-      assert.match(judgePrompt, /informational only, not a verdict/)
-    }
+    assert.ok(judgePrompt.includes("## Conversation"), "judge prompt must carry the conversation chain")
+    assert.ok(!judgePrompt.includes("Tool Commands Run"), "tool command section leaked into the judge prompt")
+    assert.ok(!judgePrompt.includes("Tool Signals"), "tool signal section leaked into the judge prompt")
+    assert.doesNotMatch(judgePrompt, /Recent tool activity/, "tool telemetry leaked into the judge prompt")
+    // The fixture's 9x `git status` tool loop must not be visible as context —
+    // only the human ask and the agent's prose. (The agent's own sentence
+    // mentions git status; that is conversation, not telemetry.)
+    const conversationBlock = judgePrompt.split("## Conversation")[1]?.split("## Task Context")[0] || ""
+    assert.ok(
+      conversationBlock.trimEnd().endsWith(
+        "user:\nFix the bug in auth.ts and run tests\n\nassistant:\nStill checking git status before making changes."
+      ),
+      `unexpected conversation block: ${JSON.stringify(conversationBlock.slice(-400))}`
+    )
+    assert.ok(!conversationBlock.includes("[tool]"), "tool calls leaked into the judge's conversation block")
   })
 
   test("loop-like tool activity + judge says complete → task marked complete (judge wins over telemetry)", async () => {
     const messages = makeLoopyMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
+
+    // Isolate the invariant under test. The status-checkpoint correction
+    // (core/status-directive.mjs) is an ORTHOGONAL, one-shot injection on the
+    // complete path — it keys off status.md/roadmap evidence, never off tool
+    // activity. Turning it off here keeps this test about one thing: whether
+    // loop-like TELEMETRY can override a "complete" verdict. It must not.
+    // The status path's own behaviour is covered by the next test.
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
+    writeFileSync(
+      statePath(tmpDir, ACTIVE_SESSION_ID),
+      JSON.stringify({ statusDiagram: false })
+    )
 
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
@@ -221,5 +245,39 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     // nudge just because the tool-call pattern looks loop-like.
     const activePrompts = getActiveSessionPrompts()
     assert.equal(activePrompts.length, 0, "no continuation should be injected when the judge says complete, regardless of tool-activity pattern")
+  })
+
+  test("complete verdict + missing status checkpoint → one status reminder, and it is NOT a loop/STOP script", async () => {
+    // The status-checkpoint correction is the ONE thing allowed to speak after
+    // a "complete" verdict, and only because the agent skipped an explicit
+    // instruction — not because anything was inferred from tool activity. This
+    // pins that: exactly one injection, about status.md, carrying none of the
+    // scripted loop-detector language this whole file exists to forbid.
+    const messages = makeLoopyMessages()
+    const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
+
+    // No status.md in tmpDir and the final assistant text has no roadmap
+    // block => non-compliant. statusDiagram is left absent, i.e. default ON.
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+    await new Promise((r) => setTimeout(r, 5000))
+
+    const activePrompts = getActiveSessionPrompts()
+    assert.equal(activePrompts.length, 1, "exactly one status-checkpoint reminder should be injected")
+
+    const text = activePrompts[0]?.body?.parts?.[0]?.text || ""
+    assert.match(text, /status\.md/, "the reminder must be about the status checkpoint")
+    assert.match(text, /ROADMAP/, "the reminder must carry the directive")
+    // Same forbidden-script assertions as every other case in this file.
+    assert.doesNotMatch(text, /STOP: Planning Loop Detected/)
+    assert.doesNotMatch(text, /STOP: Action Loop Detected/)
+    assert.doesNotMatch(text, /\bSTOP\b/)
+    assert.doesNotMatch(text, /DO NOT:/)
+
+    // One-shot: a second idle on the SAME turn must stay silent, or the
+    // correction would be a loop of its own.
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+    await new Promise((r) => setTimeout(r, 3000))
+    assert.equal(getActiveSessionPrompts().length, 1, "the correction must fire at most once per turn")
   })
 })

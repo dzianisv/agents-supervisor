@@ -1,0 +1,67 @@
+{
+  "info": {
+    "parentID": "msg_fd9c2379f001bNIN8S4N4VWoCM",
+    "role": "assistant",
+    "mode": "build",
+    "agent": "build",
+    "path": {
+      "cwd": "/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10",
+      "root": "/"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "write": 0,
+        "read": 0
+      }
+    },
+    "modelID": "fixture-model",
+    "providerID": "test-fixture",
+    "time": {
+      "created": 1786064811990,
+      "completed": 1786064812007
+    },
+    "finish": "stop",
+    "id": "msg_fd9c237d60010g9H19sWGCts6Z",
+    "sessionID": "ses_0263de4b4ffeCxpWJW9N1INKDb"
+  },
+  "parts": [
+    {
+      "type": "step-start",
+      "id": "prt_fd9c237e2001PMd65pDX94U0Ui",
+      "sessionID": "ses_0263de4b4ffeCxpWJW9N1INKDb",
+      "messageID": "msg_fd9c237d60010g9H19sWGCts6Z"
+    },
+    {
+      "type": "text",
+      "text": "Supervisor disabled for session ses_0263… (added to .supervisor/disabled, verified). Mode also set to reflection.",
+      "time": {
+        "start": 1786064812003,
+        "end": 1786064812004
+      },
+      "id": "prt_fd9c237e3001Pfohfb2dFrNK93",
+      "sessionID": "ses_0263de4b4ffeCxpWJW9N1INKDb",
+      "messageID": "msg_fd9c237d60010g9H19sWGCts6Z"
+    },
+    {
+      "reason": "stop",
+      "type": "step-finish",
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "write": 0,
+          "read": 0
+        }
+      },
+      "cost": 0,
+      "id": "prt_fd9c237e50015rWMjGVH5qEgbR",
+      "sessionID": "ses_0263de4b4ffeCxpWJW9N1INKDb",
+      "messageID": "msg_fd9c237d60010g9H19sWGCts6Z"
+    }
+  ]
+}

@@ -23,6 +23,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
 import {
   readProjectGoalCondition, writeDerivedProjectGoal, writeProjectGoal,
@@ -312,7 +313,6 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sup-derive-test-"))
-    mkdirSync(join(tmpDir, ".supervisor", "goals"), { recursive: true })
     ephemeralCounter = 0
   })
 
@@ -336,15 +336,19 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("All tests in test/ pass and the flaky login test is fixed"), `Expected derived condition in reply, got: ${result}`)
 
     // Session state now has the derived goal active.
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal.condition, "All tests in test/ pass and the flaky login test is fixed")
     assert.equal(state.goal.status, "active")
 
-    // Persisted to the lower-case goal.md (NOT the manual Goal.md).
+    // SESSION-SCOPED ONLY. This test previously asserted the opposite (that
+    // the derived condition was persisted to .agents/supervisor/goal.md) —
+    // that assertion encoded the stale-goal bug: a goal inferred from turn 1
+    // became a MANDATORY completion requirement for turn 50 and for every
+    // future session in the project, with no expiry. Only an explicit
+    // /supervisor:set-goal <condition> may create the durable project file.
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
-    assert.ok(existsSync(goalMdPath), "goal.md should be written by the derivation path")
-    assert.equal(readFileSync(goalMdPath, "utf8"), "All tests in test/ pass and the flaky login test is fixed")
+    assert.ok(!existsSync(goalMdPath), "an auto-derived goal must NOT be persisted to the project file")
+    assert.equal(readProjectGoalCondition(tmpDir), "", "no durable project goal may be created by derivation")
 
     // The derivation prompt actually reached the model.
     const derivationCalls = getPromptCalls().filter((c) => c.body?.parts?.[0]?.text?.includes("DERIVE SUPERVISOR GOAL"))
@@ -362,8 +366,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("Could not derive"), `Expected failure message, got: ${result}`)
     assert.ok(result.includes("/supervisor:set-goal"), `Expected explicit manual-set instruction, got: ${result}`)
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf-8")) : {}
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal, undefined, "no goal should have been persisted to session state")
 
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "goal.md")
@@ -393,8 +396,7 @@ describe("integration: goal-mode LLM derivation via supervisor_goal tool", () =>
     assert.ok(result.includes("Could not derive"), `Malicious/hijacked derivation must be rejected, got: ${result}`)
     assert.ok(!result.includes("API key"), "the rejected/hijacked text must never leak into the reply as an accepted goal")
 
-    const statePath = join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json`)
-    const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf-8")) : {}
+    const state = sessionStore.load(tmpDir, SESSION_ID)
     assert.equal(state.goal, undefined, "hijacked derivation must never be persisted as an active goal")
 
     // The untrusted task text was still sent to the model — but fenced as

@@ -10,7 +10,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
-import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
+import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { resolveSessionId, listSessions, sessionStore } from '../core/session-store.mjs';
 
 const cwd = process.cwd();
 const patterns = loadPatterns({ cwd });
@@ -35,8 +36,27 @@ console.log();
 
 // Recent verdicts
 const stateDir = path.join(cwd, '.supervisor');
-const cur = (() => { try { return readFileSync(path.join(stateDir, 'current_session'), 'utf8').trim(); } catch { return null; } })();
+// `current_session` is a shared, last-writer-wins hint. Resolve through the
+// same precedence the on/off path uses so `status` and `off` never disagree
+// about which session they are talking about.
+const resolution = resolveSessionId(cwd);
+const cur = resolution.sessionId;
 line('current session', cur ?? '(none recorded)');
+if (cur) {
+  const srcLabel = {
+    explicit: 'explicit --session',
+    'explicit-prefix': 'explicit prefix',
+    env: `$${resolution.envVar ?? 'ENV'}`,
+    current_session: '.supervisor/current_session (last session to stop here)',
+    'sole-session': 'the only session known in this project',
+  }[resolution.source] ?? resolution.source;
+  line('session id source', srcLabel);
+}
+
+const allSessions = listSessions(cwd);
+if (allSessions.length > 1) {
+  line('sessions in project', `${allSessions.length} (use --session <id> to target one)`);
+}
 
 // Effective supervisor mode (from goal state for current session)
 if (cur) {
@@ -44,11 +64,15 @@ if (cur) {
     const goalState = goalStore.load(cwd, cur);
     const effectiveMode = resolveSupervisorMode(goalState);
     line('effective mode', effectiveMode);
+    // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
+    line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
   } catch {
     line('effective mode', '(unknown)');
+    line('status directive', 'on (default)');
   }
 } else {
   line('effective mode', 'reflection (default — no session)');
+  line('status directive', 'on (default — no session)');
 }
 
 let disabled = [];
@@ -68,20 +92,25 @@ try {
 console.log();
 
 console.log('## recent verdicts');
+// New layout: .supervisor/sessions/<id>/verdicts.jsonl (append-only, full
+// session id). readVerdicts falls back to the legacy verdict_<sid>.json for a
+// session that has not been migrated yet.
 try {
-  const files = fs.readdirSync(stateDir).filter((f) => f.startsWith('verdict_') && f.endsWith('.json'));
-  const recent = files
-    .map((f) => ({ f, m: fs.statSync(path.join(stateDir, f)).mtimeMs }))
-    .sort((a, b) => b.m - a.m)
-    .slice(0, 5);
-  if (recent.length === 0) console.log('  (none yet)');
-  for (const { f } of recent) {
-    try {
-      const v = JSON.parse(readFileSync(path.join(stateDir, f), 'utf8'));
-      // CC verdicts carry `status` (e.g. 'complete'/'in_progress'); older/
-      // opencode-shaped records may carry neither — falls back to '?'.
-      console.log(`  ${v.timestamp ?? '?'}  ${v.status ?? v.category ?? '?'}  inject=${v.injected}  ${v.reason ?? ''}`.slice(0, 160));
-    } catch { /* skip */ }
+  const rows = [];
+  const sessions = allSessions.length ? allSessions : (cur ? [{ id: cur }] : []);
+  for (const s of sessions) {
+    for (const v of sessionStore.readVerdicts(cwd, s.id, 5)) {
+      rows.push({ sid: s.id, v, ts: Date.parse(v.ts ?? v.timestamp ?? 0) || 0 });
+    }
+  }
+  rows.sort((a, b) => b.ts - a.ts);
+  if (rows.length === 0) console.log('  (none yet)');
+  for (const { sid, v } of rows.slice(0, 5)) {
+    // CC verdicts carry `status` (e.g. 'complete'/'in_progress'); older/
+    // opencode-shaped records may carry neither — falls back to '?'.
+    console.log(
+      `  ${v.ts ?? v.timestamp ?? '?'}  [${sid.slice(0, 8)}]  ${v.status ?? v.category ?? v.kind ?? '?'}  inject=${v.injected}  ${v.reason ?? ''}`.slice(0, 180)
+    );
   }
 } catch {
   console.log('  (.supervisor/ not present — no sessions supervised here yet)');

@@ -10,6 +10,7 @@ import {
   PLAINSPEAK_MARKER,
 } from '../bin/plainspeak-on-stop.mjs';
 import { FEEDBACK_MARKER, SELF_ASSESSMENT_MARKER } from '../core/evaluation.mjs';
+import { statePath, verdictsPath, ensureSessionDir } from '../core/session-store.mjs';
 
 function mkcwd() {
   return fs.mkdtempSync(path.join(tmpdir(), 'plainspeak-test-'));
@@ -140,30 +141,30 @@ test('alreadyFiredThisTurn: an unknown turn key (null) is always treated as alre
 
 test('supervisorGoalActive: true when autopilot is on', () => {
   const d = mkcwd();
-  fs.mkdirSync(path.join(d, '.supervisor', 'goals'), { recursive: true });
-  fs.writeFileSync(path.join(d, '.supervisor', 'goals', 's1.json'), JSON.stringify({ autopilot: true }));
+    ensureSessionDir(d, 's1');
+    fs.writeFileSync(statePath(d, 's1'), JSON.stringify({ autopilot: true }));
   assert.equal(supervisorGoalActive(d, 's1'), true);
 });
 
 test('supervisorGoalActive: true when a goal is active', () => {
   const d = mkcwd();
-  fs.mkdirSync(path.join(d, '.supervisor', 'goals'), { recursive: true });
-  fs.writeFileSync(path.join(d, '.supervisor', 'goals', 's1.json'), JSON.stringify({ goal: { status: 'active' } }));
+    ensureSessionDir(d, 's1');
+    fs.writeFileSync(statePath(d, 's1'), JSON.stringify({ goal: { status: 'active' } }));
   assert.equal(supervisorGoalActive(d, 's1'), true);
 });
 
 test('supervisorGoalActive: false when supervisor state is absent or idle', () => {
   const d = mkcwd();
   assert.equal(supervisorGoalActive(d, 'no-such-session'), false);
-  fs.mkdirSync(path.join(d, '.supervisor', 'goals'), { recursive: true });
-  fs.writeFileSync(path.join(d, '.supervisor', 'goals', 's2.json'), JSON.stringify({ goal: { status: 'achieved' } }));
+    ensureSessionDir(d, 's2');
+    fs.writeFileSync(statePath(d, 's2'), JSON.stringify({ goal: { status: 'achieved' } }));
   assert.equal(supervisorGoalActive(d, 's2'), false);
 });
 
 test('supervisorRecentlyBlocked: true only for a fresh, injected:true verdict written at/after sinceMs', () => {
   const d = mkcwd();
-  fs.mkdirSync(path.join(d, '.supervisor'), { recursive: true });
-  const p = path.join(d, '.supervisor', 'verdict_s1.json');
+  ensureSessionDir(d, 's1');
+  const p = verdictsPath(d, 's1');
   const sinceMs = Date.now();
   fs.writeFileSync(p, JSON.stringify({ injected: true }));
   assert.equal(supervisorRecentlyBlocked(d, 's1', sinceMs), true);
@@ -171,8 +172,8 @@ test('supervisorRecentlyBlocked: true only for a fresh, injected:true verdict wr
 
 test('supervisorRecentlyBlocked: false when the fresh verdict did not block (injected:false)', () => {
   const d = mkcwd();
-  fs.mkdirSync(path.join(d, '.supervisor'), { recursive: true });
-  const p = path.join(d, '.supervisor', 'verdict_s1.json');
+  ensureSessionDir(d, 's1');
+  const p = verdictsPath(d, 's1');
   const sinceMs = Date.now();
   fs.writeFileSync(p, JSON.stringify({ injected: false }));
   assert.equal(supervisorRecentlyBlocked(d, 's1', sinceMs), false);
@@ -180,8 +181,8 @@ test('supervisorRecentlyBlocked: false when the fresh verdict did not block (inj
 
 test('supervisorRecentlyBlocked: false for a stale verdict (written well before sinceMs)', () => {
   const d = mkcwd();
-  fs.mkdirSync(path.join(d, '.supervisor'), { recursive: true });
-  const p = path.join(d, '.supervisor', 'verdict_s1.json');
+  ensureSessionDir(d, 's1');
+  const p = verdictsPath(d, 's1');
   fs.writeFileSync(p, JSON.stringify({ injected: true }));
   const farFuture = Date.now() + 60_000; // simulate "this hook started 60s after that write"
   assert.equal(supervisorRecentlyBlocked(d, 's1', farFuture), false);

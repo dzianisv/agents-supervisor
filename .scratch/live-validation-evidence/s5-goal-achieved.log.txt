@@ -1,0 +1,1 @@
+{"ts":"2026-08-07T01:08:15.725Z","pid":4315,"condition":"the retry backoff is capped at 30s and covered by a unit test","sessionId":"ses_0263cb859ffexlyTtYaGKQGDJR","source":"opencode:session-goal-achieved","reason":"goal met","removed":["/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md"],"skipped":[]}

@@ -10,7 +10,9 @@
     "url": "https://github.com/dzianisv/agents-supervisor"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "test": "node --experimental-strip-types --test --test-force-exit \"test/!(e2e-*).test.mjs\"",
+    "test:e2e": "node --experimental-strip-types --test test/e2e-opencode.test.mjs",
+    "test:all": "npm run test && npm run test:e2e",
     "test:cc": "node test/e2e-cc.mjs",
     "test:smoke": "node test/smoke-cc.mjs",
     "eval": "node evals/judge-eval.mjs",

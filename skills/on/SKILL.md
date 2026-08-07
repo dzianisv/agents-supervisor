@@ -15,11 +15,19 @@ Remove the current session from the disabled list so the supervisor hook fires a
    node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" on
    ```
 
-   The CLI reads the session from `.supervisor/current_session`, falling back to
-   `CLAUDE_SESSION_ID` when the file is absent. It removes the session from
+   The CLI resolves the session in this order: `--session <id>` (a unique
+   prefix is expanded), then `$SUPERVISOR_SESSION_ID` (exported by the Stop
+   hook from its own stdin payload), then `$CLAUDE_SESSION_ID`, and only as a
+   last resort `.supervisor/current_session` — which it announces, because
+   that file is shared by every session in the project and names whichever
+   stopped last. If the id is ambiguous it lists the candidates and acts on
+   NOTHING. It removes the resolved session from
    `.supervisor/disabled` and prints `Supervisor re-enabled for session: <sid>`.
    If no session is found it exits with a message indicating the supervisor is
    already active.
+
+   To target a specific session explicitly:
+   `node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" on --session <session-id>`
 
 2. Confirm to the user: "Supervisor re-enabled for this session."
 

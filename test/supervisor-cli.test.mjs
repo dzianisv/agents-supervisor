@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { statePath } from '../core/session-store.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPERVISOR = path.join(HERE, '..', 'bin', 'supervisor.mjs');
@@ -60,7 +61,7 @@ function mkTranscript(tmp, turns) {
 
 /** Read the goals/<sid>.json state file. */
 function loadGoalState(tmp, sid) {
-  const p = path.join(tmp, '.supervisor', 'goals', `${sid}.json`);
+  const p = statePath(tmp, sid);
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch {

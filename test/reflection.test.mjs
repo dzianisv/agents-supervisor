@@ -65,10 +65,17 @@ describe('interpolateTemplate', () => {
 describe('reflection files exist', () => {
   test('SystemPrompt.md exists with expected markers', () => {
     const content = fs.readFileSync(path.join(SUPERVISOR_DIR, 'SystemPrompt.md'), 'utf-8');
-    assert.ok(content.includes('{{taskSummary}}'), 'missing {{taskSummary}} placeholder');
+    // The judge's context is the plain alternating conversation and nothing
+    // else: {{currentTask}} / {{priorContext}} / {{turnEvidence}} /
+    // {{toolsSummary}} were all replaced by {{conversationChain}}.
+    assert.ok(content.includes('{{conversationChain}}'), 'missing {{conversationChain}} placeholder');
+    assert.ok(content.includes('## Conversation'), 'missing Conversation section');
     assert.ok(content.includes('## Task Context'), 'missing Task Context section');
     assert.ok(content.includes('## Response Format'), 'missing Response Format section');
-    assert.ok(content.includes('{{toolsSummary}}'), 'missing {{toolsSummary}} placeholder');
+    // Tool data must never reach the judge again.
+    assert.ok(!content.includes('{{toolsSummary}}'), 'tool commands must not be judge input');
+    assert.ok(!content.includes('{{turnEvidence}}'), 'turn evidence must not be judge input');
+    assert.ok(!content.includes('{{toolActivityNote}}'), 'tool activity must not be judge input');
   });
 
   test('Patterns.md exists with patterns section', () => {
@@ -98,11 +105,12 @@ describe('prompt assembly', () => {
 
     const vars = {
       taskSummary: sampleContext.taskSummary,
+      currentTask: sampleContext.taskSummary,
+      conversationChain: `user:\n${sampleContext.taskSummary}\n\nassistant:\nI have completed the authentication implementation.`,
       taskType: sampleContext.taskType,
       agentMode: sampleContext.agentMode,
       requirements: requirements.join('; '),
       signals: sampleContext.detectedSignals.join(', '),
-      toolsSummary: sampleContext.toolsSummary,
       lastAssistantText: 'I have completed the authentication implementation.',
       attemptSection: undefined, // first attempt
       attemptNumber: '1',
@@ -117,7 +125,7 @@ describe('prompt assembly', () => {
     // Contains context from vars
     assert.ok(assembled.includes('Implement user authentication with JWT tokens'), 'task summary missing');
     assert.ok(assembled.includes('feature'), 'task type missing');
-    assert.ok(assembled.includes('npm test, git commit'), 'signals missing');
+    assert.ok(!assembled.includes('npm test, git commit'), 'tool-derived signals must not render into the judge prompt');
     assert.ok(assembled.includes('Tests required'), 'requirements missing');
 
     // Contains patterns
@@ -139,12 +147,11 @@ describe('prompt assembly', () => {
       agentMode: 'build',
       requirements: 'none',
       signals: 'none',
-      toolsSummary: 'none',
-      // Deliberately omitting: lastAssistantText, attemptSection, projectInstructions, goalSection
+      conversationChain: 'user:\nfix it\n\nassistant:\ndone',
+      // Deliberately omitting: attemptSection, projectInstructions, goalSection
     };
 
     const result = interpolateTemplate(systemPrompt, vars);
-    assert.ok(!result.includes("Agent's Last Response"), 'lastAssistantText section should be hidden');
     assert.ok(!result.includes('Supervisor History'), 'attempt section should be hidden');
     assert.ok(!result.includes('Project Instructions'), 'project instructions should be hidden');
     assert.ok(!result.includes('Goal (mandatory'), 'goal section should be hidden');
@@ -158,8 +165,7 @@ describe('prompt assembly', () => {
       agentMode: 'build',
       requirements: 'Tests required',
       signals: 'npm test',
-      toolsSummary: 'bash: npm test',
-      lastAssistantText: 'Done with the fix.',
+      conversationChain: 'user:\nfix it\n\nassistant:\nDone with the fix.',
       attemptSection: 'true',
       attemptNumber: '2',
       maxAttempts: '5',
@@ -168,8 +174,7 @@ describe('prompt assembly', () => {
     };
 
     const result = interpolateTemplate(systemPrompt, vars);
-    assert.ok(result.includes("Agent's Last Response"), 'lastAssistantText section should be shown');
-    assert.ok(result.includes('Done with the fix.'), 'last assistant text content missing');
+    assert.ok(result.includes('Done with the fix.'), 'conversation chain content missing');
     assert.ok(result.includes('attempt 2/5'), 'attempt numbers missing');
     assert.ok(result.includes('Always run lint'), 'project instructions missing');
     assert.ok(result.includes('All tests must pass'), 'goal section missing');
@@ -198,14 +203,18 @@ describe('structural equivalence with old buildSelfAssessmentPrompt', () => {
   // The old buildSelfAssessmentPrompt had these required sections:
   const requiredSections = [
     ['Task Context', /## Task Context/],
-    ['Task Summary var', /\{\{taskSummary\}\}/],
+    // Was {{taskSummary}} — the whole "[1]..[n]" session history; then the
+    // currentTask/priorContext/turnEvidence split. Both are gone: the judge's
+    // context is now the plain alternating conversation (core/task-context.mjs).
+    ['Conversation section', /## Conversation/],
+    ['Conversation chain var', /\{\{conversationChain\}\}/],
     ['Task Type var', /\{\{taskType\}\}/],
     ['Agent Mode var', /\{\{agentMode\}\}/],
     ['Requirements var', /\{\{requirements\}\}/],
-    ['Signals var', /\{\{signals\}\}/],
-    ['Tool Commands section', /Tool Commands/],
-    ['Tools summary var', /\{\{toolsSummary\}\}/],
-    ['Last Assistant section (conditional)', /lastAssistantText/],
+    // {{signals}} is GONE: detectSignals() derives test-command / gh-pr-* /
+    // git-push from the tool command log — the exact evidence class PR #61
+    // removed from the judge. Rendering it contradicted this very template's
+    // "You do not see the agent's tool calls or their results".
     ['Attempt section (conditional)', /attemptSection/],
     ['Project Instructions (conditional)', /projectInstructions/],
     ['Goal section (conditional)', /goalSection/],

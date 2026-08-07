@@ -11,6 +11,7 @@ import {
   endsWithTrailingQuestion, computeTurnKey, buildFakeAssessment,
 } from '../bin/supervisor-on-stop.mjs';
 import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
+import { verdictsPath } from '../core/session-store.mjs';
 
 // Project root — used by new tests that must not write to /tmp.
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -127,7 +128,7 @@ test('readAttempts: turnKey passed against a file with no turn_key on disk is tr
 test('writeVerdict writes parseable json under .supervisor/', () => {
   const d = mkcwd();
   writeVerdict('s2', { category: 'summary_drift_stop', injected: true }, d);
-  const v = JSON.parse(fs.readFileSync(path.join(d, '.supervisor', 'verdict_s2.json'), 'utf8'));
+  const v = JSON.parse(fs.readFileSync(verdictsPath(d, 's2'), 'utf8'));
   assert.equal(v.category, 'summary_drift_stop');
   assert.equal(v.injected, true);
 });
@@ -382,7 +383,7 @@ test('buildTaskContextFromTranscript: requiresPR/requiresCI stay true for coding
   assert.equal(ctx.requiresCI, true, 'real code-change task should still require CI');
 });
 
-test('buildTaskContextFromTranscript: multi-message summary uses numbered format', () => {
+test('buildTaskContextFromTranscript: latest turn is currentTask; judge context is the whole chain', () => {
   const msgs = normalizeTranscriptToMessages([
     { type: 'user', message: { role: 'user', content: 'first task' } },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
@@ -390,8 +391,19 @@ test('buildTaskContextFromTranscript: multi-message summary uses numbered format
   ]);
   const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
   assert.ok(ctx);
-  assert.match(ctx.taskSummary, /\[1\].*first task/);
-  assert.match(ctx.taskSummary, /\[2\].*second task/);
+  // Was: taskSummary joined EVERY user message as "[1]..[n]", unweighted, so a
+  // 20-turn session's judge demanded turn 1's deliverables on turn 20. currentTask
+  // is now the latest ask (turn gate input only); the judge reads the full
+  // alternating conversation instead.
+  assert.equal(ctx.currentTask, 'second task');
+  assert.equal(ctx.taskSummary, 'second task');
+  assert.match(ctx.conversationChain, /user:\nfirst task/);
+  assert.match(ctx.conversationChain, /assistant:\nok/);
+  assert.match(ctx.conversationChain, /user:\nsecond task/);
+  assert.ok(
+    ctx.conversationChain.indexOf('first task') < ctx.conversationChain.indexOf('second task'),
+    'chain must read oldest -> newest'
+  );
 });
 
 test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
@@ -401,7 +413,7 @@ test('buildTaskContextFromTranscript: has required TaskContext fields', () => {
   const ctx = buildTaskContextFromTranscript(msgs, PROJECT_ROOT);
   assert.ok(ctx);
   // All required TaskContext fields must be present
-  for (const field of ['taskSummary', 'taskType', 'agentMode', 'humanMessages',
+  for (const field of ['taskSummary', 'currentTask', 'conversationChain', 'taskType', 'agentMode', 'humanMessages',
     'toolsSummary', 'detectedSignals', 'recentCommands', 'pushedToDefaultBranch',
     'requiresTests', 'requiresBuild', 'requiresPR', 'requiresCI',
     'requiresLocalTests', 'requiresLocalTestsEvidence']) {

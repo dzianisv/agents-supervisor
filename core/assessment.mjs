@@ -1,5 +1,33 @@
 import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
 import { loadShipped } from './patterns.mjs'
+import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
+
+/**
+ * The judge's ONLY context block: the plain alternating conversation.
+ *
+ * `context.conversationChain` is built by core/task-context.mjs from the real
+ * transcript. The fallback synthesizes a one-turn chain so legacy callers that
+ * hand over a bare `{taskSummary}` plus the agent's last response still render
+ * the exact same shape — there is one prompt layout, not two.
+ */
+function buildConversationSection(context, lastAssistantText) {
+  const chain =
+    context?.conversationChain ||
+    formatConversationTurns([
+      {
+        user: context?.currentTask || context?.taskSummary || '',
+        assistant: lastAssistantText
+          ? truncateForPrompt(lastAssistantText, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'agent response' })
+          : '',
+      },
+    ])
+  return `## Conversation
+This is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for resolving references — they were already handled or superseded, and must NEVER be re-opened as missing work. Any \`[…truncated by supervisor: …]\` or \`[…conversation trimmed by supervisor: …]\` marker is the SUPERVISOR's own length cut, never the agent stopping mid-sentence.
+
+${chain}
+`
+}
+
 
 /**
  * Pull the "background subagents/tasks still in flight" exemption straight from
@@ -25,25 +53,27 @@ export function buildSubagentExemptionRule(patterns) {
 
 // Fallback only — canonical source is .agents/supervisor/Patterns.md; keep in sync.
 const STATIC_RUBRIC = `## Patterns
-- HEURISTICS, NOT REQUIREMENTS: the "Required checks"/detected-signals list in Task Context and the rules below are heuristics that inform your judgment — they never override what the transcript actually shows the user asked for or agreed to.
+- REPORT REVIEW, NOT AUDIT: you see only what the user and the agent wrote. No tool log, no terminal, no files. Read the agent's report the way an engineering manager reads an engineer's update — did it say it did the thing, and did it state the result? A concrete, checkable claim is accepted at face value; a vague one is not.
+- SPECIFICITY TEST: evidence is a checkable specific, not a reassurance. "tests pass" is not evidence — "\`npm test\` → 12/12 passing" is. "Opened a PR" is not — "PR #88, CI green" is. "Fixed the bug" is not — "fixed the missing null check in src/parse.ts" is. Accept a claim that names a file path, a PR/issue number, a command AND what it returned, a count, or another concrete identifier. Treat a completion claim carrying none of those as unverified.
+- DO NOT INVENT EVIDENCE: never assume a step happened because it is standard practice, and never assume it did NOT happen because an EARLIER turn did not mention it — only the current turn's report answers the current ask. Do not demand proof you were not given. These rules are heuristics that inform your judgment; they never override what the conversation shows the user asked for or agreed to.
 - DECLINED WORK ISN'T REMAINING WORK: if the user explicitly declined an action or said the task is fine as-is ("no", "don't bother", "skip that", "that's fine", "not now"), do not list that action in remaining_work, next_steps, or needs_user_action.
-- If coding work is complete, confirm tests ran after the latest changes and passed.
-- If local tests are required, provide the exact commands run in this session.
-- If PR exists, verify CI checks and report status.
+- If coding work is claimed complete, the reply must state that tests ran after the latest changes and give the result. Silence about tests, or "tests should pass", is not a result.
+- If local tests are required, the reply must quote the command it ran AND what that command returned.
+- If a PR exists, the reply must give its number or URL and the CI status it observed.
 - Tests cannot be skipped or marked as flaky/not important.
 - Direct pushes to main/master are not allowed; require a PR instead.
 - If stuck, propose an alternate approach.
 - If you need user action (auth, 2FA, credentials, access requests, uploads, approvals), list it in needs_user_action.
-- PLANNING LOOP CHECK: If the task requires code changes (fix, implement, add, create, build, refactor, update) but the tool commands show ONLY read operations (read, glob, grep, git log, git status, git diff, webfetch, task/explore) and NO write operations (edit, write, bash with build/test/commit, github_create_pull_request, etc.), then the task is NOT complete. Set status to "in_progress", set stuck to true, and list "Implement the actual code changes" in remaining_work. Analyzing and recommending changes is not the same as making them.
+- PLANNING LOOP CHECK: If the task requires code changes (fix, implement, add, create, build, refactor, update) but the reply only describes what SHOULD be done — "the fix is to…", "we should…", "I recommend…", "here's what I would change", "the likely cause is…" — and never states in the past tense that it did it, then the task is NOT complete. Set status to "in_progress", set stuck to true, and list "Implement the actual code changes" in remaining_work. Analyzing and recommending changes is not the same as making them.
 - If you are repeating the same actions (deploy, test, build) without making progress, set "stuck": true.
 - Do not retry the same failing approach more than twice — try something different or report stuck.
 
 ## Antipatterns
 PREMATURE-STOP ANTIPATTERNS (mined from 284 real agent stops where the user replied; 78% were premature — the user said "go"/"continue"/"yes do it" or corrected the agent). If the agent's last response matches one of these AND executable work remains, the task is NOT complete — set status "in_progress", and put the concrete next action in remaining_work and next_steps:
 - PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — "Want me to...?", "Would you like me to...?", "Should I...?", "Shall I proceed?", "Let me know if you want...", or "Try running it now"/"Please run X and confirm" (deferring a check it could run itself). DECISIVE TEST: if the final turn is a yes/no or "want me to X?" question AND X is in-scope and something the agent can do with its own tools AND X carries no irreversible risk, the stop is premature — it should have just done X. In that case status is "in_progress" (NOT "complete" and NOT "waiting_for_user"): put the deferred work in remaining_work AND next_steps, and instruct the agent to do it WITHOUT asking. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message).
-- STOPPED-WITH-TODOS (~30%): the response lists "Remaining Tasks"/"Next steps"/"Still TODO"/"What I did NOT do"/"Outstanding Work" or names a verify/run/check/create-PR step as "next" — then stops without doing it. FIRST-OCCURRENCE IS SUFFICIENT: do NOT wait for a second signal; 98% of these are premature. TERMINAL-POSITION TEST: the list appears in the LAST ~40% of the response with NO subsequent tool calls or execution. A mid-response progress report followed by actual execution is complete, not drift. Set status "in_progress" with that work in remaining_work.
-- VERIFICATION-DEFERRAL: agent wrote/edited code (write/edit tool calls in tool commands) but the response ends without running tests, build, or lint — and the task requires verification. Run verification before stopping. Set status "in_progress" with "run tests/build" in remaining_work.
-- FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response, or a response with no write/tool evidence on an action task, is NEVER complete. For an "add a feature/system" task, writing files is necessary but NOT sufficient — the new code must be WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run); "ready to use" with no integration is incomplete (status "in_progress").
+- STOPPED-WITH-TODOS (~30%): the response lists "Remaining Tasks"/"Next steps"/"Still TODO"/"What I did NOT do"/"Outstanding Work" or names a verify/run/check/create-PR step as "next" — then stops without doing it. FIRST-OCCURRENCE IS SUFFICIENT: do NOT wait for a second signal; 98% of these are premature. TERMINAL-POSITION TEST: the list appears in the LAST ~40% of the response and the reply never goes on to report having done those items. A mid-response progress report followed by a stated result is complete, not drift. Set status "in_progress" with that work in remaining_work.
+- VERIFICATION-DEFERRAL: the reply claims a code change (edited/wrote/fixed/added a file) but says nothing about the result of tests, build, or lint — and the task requires verification. Naming a test file it created is not a test result. Run verification before stopping. Set status "in_progress" with "run tests/build and report the result" in remaining_work.
+- FALSE-COMPLETE: claims "done"/"complete"/"ready"/"all tasks complete" but names no concrete artifact — no file path, no PR/issue number, no command with what it returned, no counts — or the CORE requested action is never stated as done. An empty/no-text response, or a completion claim with no checkable specific on an action task, is NEVER complete. For an "add a feature/system" task, stating that files were written is necessary but NOT sufficient — the reply must also state the new code is WIRED IN (imported/registered/routed, not orphaned modules) AND verified (test/build/run result); "ready to use" with no stated integration is incomplete (status "in_progress").
 - SINGLE-BLOCKER TOTAL-STOP: one human/founder-gated blocker (auth, credential, approval, spending/billing change) does NOT justify stopping all work. If ANY agent-actionable work remains, status is "in_progress" — list the gated item in needs_user_action AND the autonomous work in remaining_work/next_steps so the agent continues on the autonomous items in parallel while the gated one is surfaced. Only stop (status "waiting_for_user") when EVERY remaining item is human-only.
 - LEGITIMATE STOP (do NOT flag): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) with NO agent-actionable work left -> status "waiting_for_user" with the item in needs_user_action. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) AND no in-scope agent-actionable work deferred -> status "complete"; do not invent missing work.
 - TRAILING QUESTION: distinguish two cases. (1) The agent asks permission to do IN-SCOPE, agent-actionable work it can do itself ("Want me to run the tests?", "Should I deploy?") — this is PERMISSION-SEEKING above: status "in_progress", put the work in remaining_work/next_steps, do it without asking. (2) The agent asks a question that genuinely requires a human decision or a human-only input (which of two irreversible strategies, approve a billing change, provide a secret) — status "waiting_for_user". An in-scope "want me to X?" is remaining work to push through, not a legitimate stop.
@@ -79,7 +109,7 @@ export function parseRubric(md) {
 
 function buildToolSupervisorGuidanceSection(toolSupervisorPrompt) {
   if (!toolSupervisorPrompt) return ''
-  return `\n## Tool Supervisor Guidance\n${toolSupervisorPrompt.slice(0, 4000)}\n`
+  return `\n## Tool Supervisor Guidance\n${truncateForPrompt(toolSupervisorPrompt, PROMPT_TEXT_LIMIT, { keep: 'head', label: 'tool guidance' })}\n`
 }
 
 export function buildSelfAssessmentPrompt(
@@ -103,33 +133,24 @@ export function buildSelfAssessmentPrompt(
   if (safeContext.pushedToDefaultBranch) requirements.push('Detected direct push to default branch (must be avoided)')
   if (requirements.length === 0) requirements.push('No explicit workflow gates detected')
 
-  const signalSummary = safeContext.detectedSignals.length ? safeContext.detectedSignals.join(', ') : 'none'
-
-  const assistantSection = lastAssistantText
-    ? `\n## Agent's Last Response\n${lastAssistantText.slice(0, 4000)}\n`
-    : ''
-
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
   const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const currentAttempt = attemptCount || 0
   const attemptSection = currentAttempt > 0
     ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
     : ''
+
   return `SELF-ASSESS SUPERVISOR
 
 You are evaluating an agent's work against workflow requirements.
-Analyze the task context, the agent's last response, and the tool signals to determine whether the task is complete.
+Read the conversation below and determine whether the task is complete.
 
+${buildConversationSection(safeContext, lastAssistantText)}
 ## Task Context
-- Summary: ${safeContext.taskSummary}
 - Type: ${safeContext.taskType}
 - Mode: ${safeContext.agentMode}
 - Heuristic signals (repo checks; informative, not binding): ${requirements.join('; ')}
-- Detected signals: ${signalSummary}
-${safeContext.toolActivityNote ? `- ${safeContext.toolActivityNote}\n` : ''}
-## Tool Commands Run
-${safeContext.toolsSummary}
-${assistantSection}${attemptSection}
+${attemptSection}
 ${agents ? `## Project Instructions\n${agents.slice(0, 800)}\n\n` : ''}Return JSON only:
 {
   "task_summary": "brief description of what was done",
@@ -178,9 +199,7 @@ export function buildJudgePrompt(
 
 You are validating an agent's self-assessment against workflow requirements.
 
-## Task Summary
-${context.taskSummary}
-
+${buildConversationSection(context, '')}
 ## Task Type
 ${context.taskType}
 
@@ -191,11 +210,8 @@ ${context.taskType}
 - CI checks required: ${context.requiresCI}
 - Local test commands required: ${context.requiresLocalTests}
 
-## Tool Signals
-${context.toolsSummary}
-
 ## Agent Self-Assessment
-${selfAssessment.slice(0, 4000)}
+${truncateForPrompt(selfAssessment, PROMPT_TEXT_LIMIT, { keep: 'tail', label: 'self-assessment' })}
 ${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
 
 Rules:

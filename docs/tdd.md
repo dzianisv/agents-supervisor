@@ -62,7 +62,7 @@ bin/supervisor-on-stop.mjs
   └─ stdout: { decision: "block", reason: "..." } to block stop, or empty to allow
         │
         ▼
-writes: .supervisor/verdict_<sid>.json
+writes: .supervisor/sessions/<sessionId>/verdicts.jsonl
 ```
 
 ### OpenCode Runtime
@@ -82,7 +82,8 @@ opencode/supervisor.ts
         skip judge, inject generic "keep working" nudge
               │
               ▼
-reads/writes: .supervisor/goals/<sessionId>.json
+reads/writes: .supervisor/sessions/<sessionId>/state.json
+              .supervisor/sessions/<sessionId>/verdicts.jsonl
               .supervisor/disabled
 ```
 
@@ -120,17 +121,58 @@ Six categories govern inject/no-inject decisions:
 
 ## State Model
 
-All state lives under `.supervisor/` in the project working directory, plus one user-global location:
+Per-session MACHINE state has ONE home. Project CONFIG stays where it is and is
+NOT sharded per session.
 
-| File | Contents | Mode |
+```
+.agents/supervisor/          human-written, git-committed, ONE per project
+  SystemPrompt.md  Patterns.md  User.md  Goal.md  goal-history.jsonl
+
+.supervisor/                 machine-written, gitignored
+  sessions/<session_id>/     everything per-session
+    state.json                 mode, goal, attempts, flags
+    verdicts.jsonl             append-only
+  disabled                   set of session ids
+  current_session            last session to stop here — a HINT, not authority
+  debug.log  health.json  goal-achieved.log  rubric.md  patterns.json
+```
+
+| Path | Contents | Mode |
 |---|---|---|
-| `.supervisor/goals/<sessionId>.json` | `{ goal, maxAttempts, attempts, autopilot }` | 0600 |
-| `.supervisor/verdict_<sid>.json` | Last classification verdict (CC runtime) | — |
-| `.supervisor/disabled` | Per-session disable flag (OpenCode runtime) | — |
+| `.supervisor/sessions/<sessionId>/state.json` | `{ mode, goal, attempts, maxAttempts, autopilot, autoreview, statusDiagram, projectDir }` | 0600 |
+| `.supervisor/sessions/<sessionId>/verdicts.jsonl` | Append-only verdict log (both runtimes) | 0600 |
+| `.supervisor/disabled` | Per-session disable flag (both runtimes) | — |
 | `~/.config/agents-supervisor/patterns.json` | User-local learned pattern weights (written by trainer) | — |
 | `.dataset/` | Training data (gitignored; CI guard enforced) | — |
 
-Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in the same goals file. Autopilot exits when the agent calls the `autopilot_exit` tool or the attempt budget exhausts.
+Precedence is unchanged: **session overrides project overrides shipped default**
+(e.g. `.supervisor/rubric.md` still beats `.agents/supervisor/Patterns.md`).
+There are deliberately NO per-session rubric/prompt overrides.
+
+`core/session-store.mjs` is the SINGLE accessor. `goalStore` (core/goal.mjs) and
+`supervisorStore` (opencode/supervisor-impl.ts) are thin facades over it — a
+behavioural facade and an async-signature adapter respectively, not second
+implementations.
+
+**Legacy layout, read-only.** Four naming conventions preceded this
+(`goals/<sid>.json`, `<sid>_attempts.json`, `verdict_<sid8>.json`,
+`<sid8>_<ts>.json` — the last two TRUNCATED the session id to 8 chars, a
+collision risk). They are read and migrated forward on first load and are never
+written again. The old files are left in place so a downgrade cannot silently
+drop an active goal; GC reclaims them.
+
+**Retention.** `gcSessions()` drops session dirs untouched for >30 days, then
+caps the total at 200 (oldest first). `maybeGcSessions()` runs it from the Stop
+hook at most once per day per project, best-effort, never blocking a turn, and
+never touching the live session.
+
+**Concurrency.** Every write is temp-file + `rename(2)` in the same directory
+(0600 from creation, no wide-open window). Read-modify-write goes through
+`sessionStore.mutate()`, serialised by an O_EXCL lockfile with a 10s stale
+breaker; failing to take the lock degrades to last-writer-wins rather than
+blocking a turn.
+
+Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent calls the `autopilot_exit` tool or the attempt budget exhausts.
 
 ---
 
@@ -146,7 +188,7 @@ Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in 
 
 5. **Pattern merge order.** Shipped patterns are always the base. User-local overrides are applied next. Project-local overrides have highest precedence. Deep merge — individual rules can be overridden without replacing the full taxonomy.
 
-6. **Attempt budget.** There is ONE per-human-turn attempt counter per runtime, checked against ONE effective cap. On Claude Code that counter is the turn-scoped file counter (`.supervisor/<sid>_attempts.json`), and the cap is `resolveMaxAttempts(...)` clamped to `resolveClaudeCodeHardCap()` (7, one under CC's own Stop-hook block ceiling); `goal.attempts` is mirrored from it for status reporting, not tracked separately. On OpenCode the persisted `goal.attempts` is checked first, with the per-message map as the fallback cap for goal-less sessions. Exhausted budget → no inject, no block; with an active goal it also writes a `turn_budget_spent` verdict and leaves the goal active (only the deadline is terminal).
+6. **Attempt budget.** There is ONE per-human-turn attempt counter per runtime, checked against ONE effective cap. On Claude Code that counter is the turn-scoped counter in `.supervisor/sessions/<sid>/state.json` (`state.attempts`), and the cap is `resolveMaxAttempts(...)` clamped to `resolveClaudeCodeHardCap()` (7, one under CC's own Stop-hook block ceiling); `goal.attempts` is mirrored from it for status reporting, not tracked separately. On OpenCode the persisted `goal.attempts` is checked first, with the per-message map as the fallback cap for goal-less sessions. Exhausted budget → no inject, no block; with an active goal it also writes a `turn_budget_spent` verdict and leaves the goal active (only the deadline is terminal).
 
 ---
 

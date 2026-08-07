@@ -8,8 +8,9 @@
  * callAnthropic → parseSelfAssessmentJson → evaluateSelfAssessment), and
  * injects a continuation prompt when the agent stopped prematurely.
  *
- * Artifacts under <cwd>/.supervisor/: verdict_<sid>.json, <sid>_attempts.json,
- * current_session, disabled, debug.log.
+ * Artifacts under <cwd>/.supervisor/: sessions/<session_id>/{state.json,
+ * verdicts.jsonl}, current_session, disabled, debug.log, health.json.
+ * See core/session-store.mjs — the single accessor for per-session state.
  *
  * Public API (re-exported for unit tests):
  *   readTranscriptTail, buildStopContext, loopGuard, readAttempts,
@@ -31,9 +32,15 @@ import {
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { buildEscalatingFeedback } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition } from '../core/goal.mjs';
+import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
+import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
+import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
+import {
+  extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
+} from '../core/task-context.mjs';
+import { shouldSkipReflection } from '../core/turn-classifier.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -157,56 +164,33 @@ export function computeTurnKey(normalizedMessages) {
 }
 
 export function readAttempts(session_id, cwd, turnKey) {
-  const file = path.join(cwd, STATE_DIR, `${session_id}_attempts.json`);
-  let raw;
+  // Backed by .supervisor/sessions/<session_id>/state.json (core/session-store.mjs),
+  // which transparently migrates the legacy `.supervisor/<sid>_attempts.json`
+  // forward on first read. Same per-turn semantics as before: the count reads
+  // as 0 the moment turnKey moves, because a new real user message means a new
+  // turn and the persisted count belongs to a prior turn's escalation.
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    return sessionStore.readAttempts(cwd, session_id, turnKey);
   } catch {
-    return 0;
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (turnKey != null && parsed.turn_key != null && parsed.turn_key !== turnKey) {
-      // A new real user message means a new turn — the persisted count
-      // belongs to a prior turn's escalation and does not carry over.
-      return 0;
-    }
-    return typeof parsed.count === 'number' ? parsed.count : 0;
-  } catch {
-    debug({ msg: 'attempts_file_corrupt', file }, cwd);
+    debug({ msg: 'attempts_read_failed', session_id }, cwd);
     return 0;
   }
 }
 
 export function writeAttemptCounter(session_id, n, cwd, turnKey) {
-  const dir = path.join(cwd, STATE_DIR);
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${session_id}_attempts.json`);
-  let existingCount = 0;
-  let existingTurnKey;
+  // Monotonic within a turn; a new turn resets the comparison. Serialised
+  // read-modify-write + atomic temp+rename live in core/session-store.mjs.
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (typeof parsed.count === 'number') existingCount = parsed.count;
-    existingTurnKey = parsed.turn_key;
+    sessionStore.writeAttempts(cwd, session_id, n, turnKey);
   } catch {
-    /* missing or corrupt — treat as 0 */
+    debug({ msg: 'attempts_write_failed', session_id }, cwd);
   }
-  // A new turn means the previous count doesn't apply — the monotonic dedup
-  // guard below must not compare against a stale count from an earlier human
-  // turn, or the new turn's first write would be silently dropped.
-  const turnChanged = turnKey != null && existingTurnKey != null && existingTurnKey !== turnKey;
-  if (!turnChanged && n <= existingCount) return;
-  const tmp = path.join(dir, `${session_id}_attempts.${process.pid}.tmp`);
-  const record = { count: n, last_iso: new Date().toISOString() };
-  if (turnKey != null) record.turn_key = turnKey;
-  fs.writeFileSync(tmp, JSON.stringify(record), 'utf8');
-  fs.renameSync(tmp, file);
 }
 
 export function writeVerdict(session_id, verdictObj, cwd) {
-  const dir = path.join(cwd, STATE_DIR);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `verdict_${session_id}.json`), JSON.stringify(verdictObj, null, 2), 'utf8');
+  // Append-only .supervisor/sessions/<session_id>/verdicts.jsonl, replacing
+  // the overwrite-in-place `.supervisor/verdict_<sid>.json`.
+  sessionStore.appendVerdict(cwd, session_id, verdictObj);
 }
 
 /**
@@ -570,31 +554,26 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
       ? normalizedMessages
       : normalizeTranscriptToMessages(normalizedMessages ?? []);
   const humanMessages = [];
-  let lastAssistantText = '';
 
   for (const msg of messages) {
     if (msg.info?.role === 'user') {
-      for (const part of msg.parts ?? []) {
-        if (part.type === 'text' && part.text) {
-          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
-          if (part.text.trim().startsWith('<task-notification>')) continue; // async notification metadata, not user task instructions
-          humanMessages.push(part.text);
-          break;
-        }
-      }
-    }
-    if (msg.info?.role === 'assistant') {
-      for (const part of msg.parts ?? []) {
-        if (part.type === 'text' && part.text) lastAssistantText = part.text;
-      }
+      const text = userMessageText(msg);
+      if (text != null) humanMessages.push(text);
     }
   }
+  // ONE shared extractor (core/task-context.mjs) — joins every text part of the
+  // last assistant message instead of arbitrarily keeping the first or the last.
+  const lastAssistantText = extractLastAssistantText(messages);
 
   if (humanMessages.length === 0) return null;
 
-  const taskSummary = humanMessages.length === 1
-    ? humanMessages[0]
-    : humanMessages.map((m, i) => `[${i + 1}] ${m}`).join('\n\n');
+  // `currentTask` is NOT judge context — it feeds the non-actionable turn gate
+  // and `taskSummary`. The judge reads `conversationChain` only: the plain
+  // alternating conversation, no tool calls / inputs / results. Must stay
+  // identical to buildTaskContext in opencode/supervisor-impl.ts.
+  const currentTask = currentUserTask(humanMessages);
+  const taskSummary = currentTask;
+  const conversationChain = buildConversationChain(messages);
 
   const combinedText = `${humanMessages.join(' ')} ${lastAssistantText}`;
   const taskType = inferTaskType(combinedText);
@@ -621,7 +600,9 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
   const toolsSummary = commands.slice(-6).join('\n') || '(none)';
 
   return {
-    taskSummary, taskType, agentMode, humanMessages,
+    taskSummary, currentTask,
+    conversationChain: conversationChain || undefined,
+    taskType, agentMode, humanMessages,
     toolsSummary, detectedSignals, recentCommands,
     pushedToDefaultBranch: pushedDefault,
     requiresTests, requiresBuild, requiresPR, requiresCI,
@@ -748,9 +729,22 @@ async function main() {
   const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
 
   // 1.5. Session-scoped disable check + record current session.
+  //
+  // `current_session` is still written, but it is now only a LAST-RESORT hint
+  // for interactive CLI use. It is a single shared file every session in the
+  // project overwrites, so with two concurrent sessions it names whichever
+  // stopped last — `/supervisor off` used to disable the wrong one. The
+  // authority is the `session_id` on this hook's stdin payload, which is
+  // exported below so any child process (including bin/supervisor.mjs) reads
+  // the CALLER's session, not the last writer's.
   const stateDir = path.join(cwd, STATE_DIR);
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(stateDir, 'current_session'), session_id, 'utf8');
+  process.env.SUPERVISOR_SESSION_ID = session_id;
+  // Retention sweep for per-session dirs. Throttled to once a day per project
+  // and fully best-effort — it must never block or fail a turn, and it never
+  // touches the live session.
+  try { maybeGcSessions(cwd, { protect: session_id }); } catch { /* best effort */ }
   const disabledFlag = path.join(stateDir, 'disabled');
   try {
     const disabledIds = fs.readFileSync(disabledFlag, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -803,7 +797,11 @@ async function main() {
       if (turnKey != null && (goal.lastTurnKey !== turnKey || goal.attempts !== attempts)) {
         goal = { ...goal, lastTurnKey: turnKey, attempts };
         goalState = { ...goalState, goal };
-        try { goalStore.save(cwd, session_id, goalState); } catch { /* best effort */ }
+        // mutate(), never save(): `goalState` was read before the attempt
+        // counter was touched, and attempts now live in the SAME state.json.
+        // A blind overwrite here would silently clobber the counter written
+        // by writeAttemptCounter — a lost update inside one process.
+        try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = goal; }); } catch { /* best effort */ }
       }
     } else if (mode === 'autopilot') {
       // Autopilot gets the higher budget (default 16), not the bare 3.
@@ -831,10 +829,17 @@ async function main() {
   // OpenCode-side LLM auto-derivation feature — see core/goal.mjs's
   // readProjectGoalCondition for the shared precedence rule).
   let projectGoalSection = '';
+  // The exact project condition injected into THIS judgement. Load-bearing
+  // for goal retirement: only a file that still holds the condition we
+  // actually judged may be deleted (see retireProjectGoal in core/goal.mjs).
+  let injectedProjectGoalCondition = '';
   const effectiveMode = resolveSupervisorMode(goalState);
   if (effectiveMode !== 'goal' && !goal) {
     const cond = readProjectGoalCondition(cwd);
-    if (cond) projectGoalSection = buildGoalRequirementSection(cond);
+    if (cond) {
+      injectedProjectGoalCondition = cond;
+      projectGoalSection = buildGoalRequirementSection(cond);
+    }
   }
 
   // The judge must actually SEE the goal condition + evidence rule as a
@@ -861,7 +866,7 @@ async function main() {
   function finishExhaustedGoal(t, baseRecord) {
     const deadlineHit = t.reason === 'deadline';
     if (deadlineHit) {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
     }
     writeVerdict(session_id, { ...baseRecord, goal: deadlineHit ? 'exhausted' : 'turn_budget_spent' }, cwd);
     debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
@@ -915,7 +920,12 @@ async function main() {
     }
     const nextAttempt = attempts + 1;
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-    const nudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    // Parity with the OpenCode autopilot nudge (opencode/supervisor-impl.ts):
+    // the status/roadmap directive rides along with EVERY continuation, on
+    // both runtimes. Gated by the same default-on `statusDiagram` flag, so
+    // `/supervisor:status off` silences it here too.
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
     debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt }, cwd);
@@ -937,6 +947,20 @@ async function main() {
   const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
   if (!taskContext) {
     debug({ msg: 'no_task_context', session_id }, cwd);
+    process.exit(0);
+  }
+
+  // 5.5. Non-actionable turn gate — a completion judge only makes sense when
+  // the human asked for work. "Stop. Reflect.", "tldr", "thanks", "why did you
+  // stop" previously all ran the full judge as work orders (see
+  // core/turn-classifier.mjs). Bypassed entirely while a goal is active.
+  const turnGate = shouldSkipReflection({
+    text: taskContext.currentTask,
+    hasActiveGoal: !!goal,
+    mode: effectiveMode,
+  });
+  if (turnGate.skip) {
+    debug({ msg: 'non_actionable_turn', session_id, reason: turnGate.reason }, cwd);
     process.exit(0);
   }
 
@@ -1055,9 +1079,49 @@ async function main() {
     return buildEscalatingFeedback(
       nextAttempt,
       analysis.severity,
-      { missing: analysis.missing, next_actions: analysis.nextActions, feedback: analysis.reason, confidence: assessment?.confidence },
+      {
+        missing: analysis.missing,
+        next_actions: analysis.nextActions,
+        feedback: analysis.reason,
+        confidence: assessment?.confidence,
+        // Standing goal renders in its own labelled section, never merged
+        // into `### Missing` alongside real per-turn gaps.
+        goal_condition: goal?.condition || injectedProjectGoalCondition || '',
+      },
       effectiveMax,
+      // Same default-on flag the autopilot nudge above honours, so
+      // `/supervisor:status off` silences BOTH continuation paths, not just
+      // one of them.
+      { statusDirective: isStatusDiagramEnabled(goalState) },
     );
+  }
+
+  // A verdict with nothing actionable (empty missing, empty next_actions,
+  // blank feedback) must never be injected: the agent has nothing to act on,
+  // stops again immediately, and receives the identical empty message until
+  // the retry cap burns out.
+  const actionlessVerdict = isActionlessVerdict({
+    missing: analysis.missing,
+    next_actions: analysis.nextActions,
+    feedback: analysis.reason,
+  });
+
+  // Project-level goal judged met (reflection mode: no session goal object,
+  // so the goal loop below never runs for it). The condition WAS injected as
+  // a MANDATORY completion requirement, so `complete` means it was met —
+  // retire it, or it re-fires on every future turn and every future session.
+  if (analysis.complete && injectedProjectGoalCondition) {
+    try {
+      const retired = retireProjectGoal(cwd, {
+        condition: injectedProjectGoalCondition,
+        sessionId: session_id,
+        source: 'claude-code:project-goal-achieved',
+        reason: analysis.reason || '',
+      });
+      debug({ msg: 'project_goal_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+    } catch (e) {
+      debug({ msg: 'project_goal_retire_failed', err: String(e?.message ?? e) }, cwd);
+    }
   }
 
   // 6a. Goal loop: when a goal is active, keep pushing until the goal is met
@@ -1071,7 +1135,22 @@ async function main() {
       reason: analysis.reason,
     });
     if (t.action === 'achieved') {
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
+      // An achieved goal must DIE: persisting status:'achieved' alone left
+      // .agents/supervisor/Goal.md (or goal.md) on disk, so the next session
+      // re-read it and the goal resurrected forever.
+      try {
+        const retired = retireProjectGoal(cwd, {
+          condition: goal.condition,
+          sessionId: session_id,
+          source: 'claude-code:session-goal-achieved',
+          reason: analysis.reason || '',
+        });
+        debug({ msg: 'goal_project_file_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+      } catch (e) {
+        debug({ msg: 'goal_project_file_retire_failed', err: String(e?.message ?? e) }, cwd);
+      }
+      try { goalStore.clearGoal(cwd, session_id); } catch { /* */ }
       verdictRecord.goal = 'achieved';
       verdictRecord.message = `Goal condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
       writeVerdict(session_id, verdictRecord, cwd);
@@ -1086,11 +1165,19 @@ async function main() {
       finishExhaustedGoal(t, verdictRecord);
       process.exit(0);
     }
-    // continue — but never override a genuine human-only block.
+    // continue — but never override a genuine human-only block, and never
+    // push on a content-free verdict (that is the loop, not progress).
+    if (actionlessVerdict) {
+      verdictRecord.goal = 'paused';
+      verdictRecord.feedback_reason = 'actionless_verdict';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'no_inject_actionless_verdict', session_id, goal: true }, cwd);
+      process.exit(0);
+    }
     if (!analysis.requiresHumanAction) {
       const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-      try { goalStore.save(cwd, session_id, { ...goalState, goal: t.goal }); } catch { /* */ }
+      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
       verdictRecord.feedback_reason = 'goal_continue';
@@ -1107,8 +1194,15 @@ async function main() {
   }
 
   // 6b. Normal (no goal) inject decision.
-  if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction) {
+  if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction && !actionlessVerdict) {
     const feedbackMsg = buildAnalysisFeedback();
+    // Last-resort guard: never inject an empty-bodied message.
+    if (!hasFeedbackBody(feedbackMsg)) {
+      verdictRecord.feedback_reason = 'empty_feedback_body';
+      writeVerdict(session_id, verdictRecord, cwd);
+      debug({ msg: 'no_inject_empty_body', session_id }, cwd);
+      process.exit(0);
+    }
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     verdictRecord.injected = true;
     verdictRecord.feedback_reason = 'assessment_continue';
@@ -1119,7 +1213,7 @@ async function main() {
   }
 
   writeVerdict(session_id, verdictRecord, cwd);
-  debug({ msg: 'no_inject', complete: analysis.complete, attempt: nextAttempt }, cwd);
+  debug({ msg: 'no_inject', complete: analysis.complete, attempt: nextAttempt, actionless: actionlessVerdict, reason: actionlessVerdict ? 'verdict had no actionable content' : analysis.reason }, cwd);
   process.exit(0);
 }
 
