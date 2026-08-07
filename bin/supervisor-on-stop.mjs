@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
   FEEDBACK_MARKER,
-  isNonHumanUserMessage, isNonHumanUserText,
+  isNonHumanUserMessage, isNonHumanUserText, hashReply, isNoProgressRepeat,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
@@ -925,6 +925,46 @@ async function main() {
   if (!ctx.final_assistant_text) {
     debug({ msg: 'no_assistant_text_after_poll', session_id, tail_len: tail.length }, cwd);
     process.exit(0);
+  }
+
+  // 4a-pre. NO-PROGRESS GATE (deterministic, no LLM).
+  //
+  // Observed degenerate steady state: the agent replied `Same. Standing by.`
+  // eight times in a row, each in answer to a fresh injection. If the agent's
+  // final text is unchanged (modulo whitespace/case) from the last Stop we
+  // saw in this session, another push is provably pointless — stand down.
+  //
+  // Placement: AFTER the cheap eligibility gates (loop guard, disabled,
+  // attempt cap) and AFTER the transcript flush poll, but BEFORE the autopilot
+  // fast-path (4a), the trailing-question guard (4b) and the judge. It
+  // therefore covers the reflection, goal AND autopilot paths — the observed
+  // loop was on the goal/autopilot path, which never reaches the judge.
+  //
+  // BUDGET: this gate does NOT call writeAttemptCounter — it is an
+  // ELIGIBILITY gate, not a spent attempt. Saturating the counter here would
+  // make "the agent repeated itself" indistinguishable from "the budget is
+  // spent", and a later Stop in the same turn would then take the
+  // budget-exhausted branch and fire its side effects (disable autopilot,
+  // write a goal-exhaust verdict) for the wrong reason. The gate re-derives
+  // the same answer for free on every Stop, so it needs no persistence of its
+  // own beyond the reply hash.
+  const replyHash = hashReply(ctx.final_assistant_text);
+  // AUTOPILOT_EXIT must always reach 4a: it is the only thing that turns
+  // autopilot off, and standing down on a repeat of it would strand the
+  // session in autopilot forever.
+  const autopilotExiting = /(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text);
+  let priorReplyHash = null;
+  try { priorReplyHash = goalStore.load(cwd, session_id).lastReplyHash ?? null; } catch { /* best effort */ }
+  if (!autopilotExiting && isNoProgressRepeat(ctx.final_assistant_text, priorReplyHash)) {
+    debug({ msg: 'no_progress_gate', session_id, mode, goal: !!goal, attempts, hash: replyHash, action: 'stand_down' }, cwd);
+    process.exit(0);
+  }
+  // Locked-ish read-modify-write: never save() a whole state object read
+  // earlier in this turn, or the goal/attempts keys written above are lost.
+  try {
+    goalStore.mutate(cwd, session_id, (s) => { s.lastReplyHash = replyHash; });
+  } catch (e) {
+    debug({ msg: 'no_progress_gate_persist_failed', session_id, err: String(e?.message ?? e) }, cwd);
   }
 
   // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge

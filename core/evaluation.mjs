@@ -2,6 +2,8 @@
  * Pure evaluation helpers shared by supervisor runtimes.
  */
 
+import { createHash } from 'node:crypto'
+
 export const SELF_ASSESSMENT_MARKER = '## Supervisor Self-Assessment'
 export const FEEDBACK_MARKER = '## Supervisor:'
 
@@ -62,6 +64,51 @@ export function isNonHumanUserText(text) {
   // Tolerate leading whitespace; the prefix itself is matched case-sensitively
   // because CC emits it verbatim.
   return text.trimStart().startsWith(FOREIGN_STOP_HOOK_PREFIX)
+}
+
+/**
+ * Normalize an assistant reply for the no-progress gate: trim, collapse ALL
+ * internal whitespace runs to one space, lowercase. Deliberately NOT a fuzzy
+ * similarity metric — exact match on this normalized form is deterministic,
+ * cheap, and testable. See NO-PROGRESS GATE in bin/supervisor-on-stop.mjs.
+ * @param {string} text
+ * @returns {string}
+ */
+export function normalizeReplyText(text) {
+  if (typeof text !== 'string') return ''
+  return text.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/**
+ * Stable fingerprint of an assistant reply, for the no-progress gate.
+ * Returns null for blank/absent text so "nothing to compare" is explicit and
+ * can never collide with a real hash.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function hashReply(text) {
+  const norm = normalizeReplyText(text)
+  if (!norm) return null
+  return createHash('sha256').update(norm).digest('hex').slice(0, 32)
+}
+
+/**
+ * The no-progress decision. Deterministic, no LLM.
+ * True (= stand down) only when we have a previous reply hash for THIS session
+ * and the current reply hashes to exactly the same normalized form: the agent
+ * answered the last injection with a byte-identical (modulo whitespace/case)
+ * reply, so pushing again is provably pointless.
+ *
+ * No prior hash (first turn of a session) → false, always proceed.
+ * @param {string} currentText
+ * @param {string|null|undefined} previousHash
+ * @returns {boolean}
+ */
+export function isNoProgressRepeat(currentText, previousHash) {
+  if (!previousHash) return false
+  const current = hashReply(currentText)
+  if (!current) return false
+  return current === previousHash
 }
 
 export const HUMAN_ONLY_ACTION_PATTERNS = [
