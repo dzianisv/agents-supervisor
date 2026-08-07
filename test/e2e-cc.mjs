@@ -252,10 +252,22 @@ check('goal raises retry budget past the default 3 (injects a 4th time)', () => 
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-goal-budget';
   goalStore.setGoal(dir, sid, 'keep going');
-  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
-    last_assistant_message: driftTurns[1].message.content[1].text };
   let blocks = 0;
   for (let i = 0; i < 4; i++) {
+    // The agent must MOVE between pushes. One human message → one turn key, so
+    // varying only the assistant text keeps this inside a single turn (what the
+    // budget is scoped to) while modelling an agent that answers each
+    // injection. Replaying one frozen reply is the stuck-agent scenario the
+    // no-progress gate exists to stop — covered by its own case above.
+    const text = `I added the route to server.js. Next step ${i + 1}: run the tests to verify it.`;
+    fs.writeFileSync(tp, [
+      driftTurns[0],
+      { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'tool_use', name: 'Edit', input: {} },
+        { type: 'text', text },
+      ] } },
+    ].map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
     const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
     if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
   }

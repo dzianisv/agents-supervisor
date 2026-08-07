@@ -276,16 +276,19 @@ export const goalStore = {
    * load()+save() around a mutation: a whole-state save() built from a state
    * object read earlier in the turn silently clobbers every key written in
    * between (that is exactly how the attempts counter was lost in #57).
+   *
+   * Delegates to `sessionStore.mutate`, which serialises the read-modify-write
+   * behind an O_EXCL lockfile. An unlocked load()+save() here would be a
+   * SECOND, weaker implementation of the same contract: atomic temp+rename
+   * prevents a corrupt file, not a lost update, and the no-progress gate that
+   * calls this runs on the same hot path as writeAttemptCounter.
    * @param {string} cwd
    * @param {string} sessionId
    * @param {(state: object) => object|void} fn  mutates in place or returns new state
    * @returns {object} the persisted state
    */
   mutate(cwd, sessionId, fn) {
-    const state = goalStore.load(cwd, sessionId);
-    const next = fn(state) ?? state;
-    goalStore.save(cwd, sessionId, next);
-    return next;
+    return sessionStore.mutate(cwd, sessionId, fn);
   },
 };
 

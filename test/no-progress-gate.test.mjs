@@ -18,6 +18,7 @@ import path from 'node:path';
 
 import { normalizeReplyText, hashReply, evaluateNoProgress, NO_PROGRESS_REPEAT_THRESHOLD } from '../core/evaluation.mjs';
 import { goalStore } from '../core/goal.mjs';
+import { statePath } from '../core/session-store.mjs';
 
 describe('normalizeReplyText', () => {
   test('trims, collapses internal whitespace, lowercases', () => {
@@ -124,7 +125,11 @@ describe('goalStore.mutate — reply-hash persistence', () => {
     assert.equal(loaded.lastReplyHash, hashReply('Same. Standing by.'));
     assert.equal(loaded.replyRepeatCount, 1);
     // Same on-disk layout as every other per-session key — no new file.
-    assert.ok(fs.existsSync(path.join(cwd, '.supervisor', 'goals', `${sid}.json`)));
+    // The layout moved to .supervisor/sessions/<full id>/state.json when
+    // core/session-store.mjs landed (PR #61); assert against THE accessor, not
+    // a hand-built path, so this can never drift from the store again.
+    assert.ok(fs.existsSync(statePath(cwd, sid)));
+    assert.equal(JSON.parse(fs.readFileSync(statePath(cwd, sid), 'utf8')).replyRepeatCount, 1);
   });
 
   test('does not collide with attempts/goal keys', () => {
@@ -151,6 +156,22 @@ describe('goalStore.mutate — reply-hash persistence', () => {
 
   test('teardown', () => {
     fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  // The gate persists on the SAME hot path as writeAttemptCounter, so an
+  // unlocked load()+save() here is the lost-update shape AGENTS.md forbids
+  // (atomic temp+rename prevents a corrupt file, NOT a lost update). This
+  // branch originally shipped its own unlocked goalStore.mutate because
+  // core/session-store.mjs did not exist on its base; pin the delegation so a
+  // future edit cannot quietly reintroduce a second implementation.
+  test('goalStore.mutate delegates to the LOCKED sessionStore.mutate', () => {
+    const src = fs.readFileSync(new URL('../core/goal.mjs', import.meta.url), 'utf8');
+    const body = src.slice(src.indexOf('  mutate(cwd, sessionId, fn) {'));
+    assert.match(body.slice(0, 200), /return sessionStore\.mutate\(cwd, sessionId, fn\)/);
+    assert.ok(
+      !/mutate\(cwd, sessionId, fn\) \{[\s\S]{0,200}?goalStore\.save\(/.test(body),
+      'goalStore.mutate must not hand-roll load()+save() — that skips the session lock'
+    );
   });
 });
 
