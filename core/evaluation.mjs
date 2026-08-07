@@ -5,6 +5,65 @@
 export const SELF_ASSESSMENT_MARKER = '## Supervisor Self-Assessment'
 export const FEEDBACK_MARKER = '## Supervisor:'
 
+/**
+ * Literal prefix Claude Code puts on EVERY Stop hook's `reason` output before
+ * writing it back into the transcript. Verified against a real transcript
+ * (~/.claude/projects/-Users-engineer-workspace-OpenClawBot/98473024-*.jsonl,
+ * 125 occurrences): the record is `{"type":"user","message":{"role":"user",
+ * "content":"Stop hook feedback:\n<reason>"},"isMeta":true,...}`.
+ *
+ * A project may register SEVERAL Stop hooks (OpenClawBot registers 3 of its
+ * own, plus CC's native /goal sentinel). Their injections are NOT human turns,
+ * but they land in the transcript as `role: user` all the same.
+ */
+export const FOREIGN_STOP_HOOK_PREFIX = 'Stop hook feedback:'
+
+/**
+ * True when a `role: user` message was injected by machinery rather than typed
+ * by the human. THE single predicate for "this is not a human turn" — before
+ * this existed, computeTurnKey and buildTaskContextFromTranscript each carried
+ * their own narrower copy that only knew about THIS supervisor's own markers.
+ *
+ * Any foreign Stop hook's injection therefore looked like a fresh human
+ * message, which flipped the turn key on every Stop event, which made
+ * readAttempts return 0 forever — the documented per-turn cap was unreachable
+ * and the supervisor could loop unbounded in any project with a second hook.
+ *
+ * Returns true when ANY of:
+ *   a) the record is flagged `isMeta` (CC's own marker for a non-human insert)
+ *   b) the text starts with `Stop hook feedback:` (a foreign Stop hook)
+ *   c) the text carries this supervisor's own markers (pre-existing behaviour)
+ *
+ * @param {{ info?: { role?: string, isMeta?: boolean }, isMeta?: boolean, parts?: Array }} msg
+ *   A normalized message. `isMeta` is read from either `msg.info.isMeta`
+ *   (set by normalizeTranscriptToMessages) or a top-level `msg.isMeta`, so a
+ *   raw-ish record still works.
+ * @returns {boolean}
+ */
+export function isNonHumanUserMessage(msg) {
+  if (msg?.isMeta === true || msg?.info?.isMeta === true) return true
+  for (const part of msg?.parts ?? []) {
+    if (part?.type !== 'text' || typeof part.text !== 'string') continue
+    if (isNonHumanUserText(part.text)) return true
+  }
+  return false
+}
+
+/**
+ * Text-level half of isNonHumanUserMessage — used where the caller iterates
+ * parts itself and needs a per-part decision (buildTaskContextFromTranscript
+ * skips individual parts, not whole messages).
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isNonHumanUserText(text) {
+  if (typeof text !== 'string') return false
+  if (text.includes(SELF_ASSESSMENT_MARKER) || text.includes(FEEDBACK_MARKER)) return true
+  // Tolerate leading whitespace; the prefix itself is matched case-sensitively
+  // because CC emits it verbatim.
+  return text.trimStart().startsWith(FOREIGN_STOP_HOOK_PREFIX)
+}
+
 export const HUMAN_ONLY_ACTION_PATTERNS = [
   /\b(auth|authentication|oauth|2fa|mfa|captcha|otp|one[- ]time)\b/i,
   /\b(log ?in|sign ?in|verification code|passcode)\b/i,

@@ -26,7 +26,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
-  SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER,
+  FEEDBACK_MARKER,
+  isNonHumanUserMessage, isNonHumanUserText,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
@@ -153,9 +154,14 @@ export function computeTurnKey(normalizedMessages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.info?.role !== 'user') continue;
+    // Machine-injected user records are not human turns. This covers BOTH
+    // this supervisor's own markers AND foreign Stop hooks (`isMeta:true` /
+    // `Stop hook feedback:`) — the latter used to flip the turn key on every
+    // Stop event, resetting readAttempts to 0 forever.
+    if (isNonHumanUserMessage(msg)) continue;
     for (const part of msg.parts ?? []) {
       if (part?.type !== 'text' || typeof part.text !== 'string') continue;
-      if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) continue;
+      if (isNonHumanUserText(part.text)) continue;
       const trimmed = part.text.trim();
       if (trimmed) return trimmed.slice(0, 300);
     }
@@ -265,12 +271,18 @@ export function buildStopContext(stopPayload, transcriptTail) {
   const user_messages = [];
   for (const entry of transcriptTail) {
     if (entry.type !== 'user') continue;
+    // Machine-injected records (this supervisor's own feedback, a foreign
+    // Stop hook, CC's isMeta inserts) are not things the human asked for —
+    // feeding them back as "user messages" lets the judge treat a hook's
+    // demand as a human demand.
+    if (entry?.isMeta === true) continue;
     const content = entry?.message?.content;
     if (typeof content === 'string' && content.trim()) {
-      user_messages.push(content.trim());
+      if (!isNonHumanUserText(content)) user_messages.push(content.trim());
     } else if (Array.isArray(content)) {
       for (const block of content) {
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          if (isNonHumanUserText(block.text)) continue;
           user_messages.push(block.text.trim());
         }
       }
@@ -332,7 +344,10 @@ export function normalizeTranscriptToMessages(transcriptTail) {
         }
       }
     }
-    messages.push({ info: { role }, parts });
+    // `isMeta` MUST survive normalization or isNonHumanUserMessage's condition
+    // (a) is dead code. CC sets it at the TOP level of the jsonl record (not
+    // inside `message`) — verified against a real transcript.
+    messages.push({ info: { role, isMeta: entry?.isMeta === true }, parts });
   }
   return messages;
 }
@@ -557,6 +572,10 @@ export function buildTaskContextFromTranscript(normalizedMessages, cwd) {
 
   for (const msg of messages) {
     if (msg.info?.role === 'user') {
+      // ONE predicate. `userMessageText` (core/task-context.mjs) now routes
+      // through isNonHumanUserMessage/isNonHumanUserText, so a foreign Stop
+      // hook's injection is excluded here exactly as it is in computeTurnKey —
+      // no second copy of the filter lives in this function.
       const text = userMessageText(msg);
       if (text != null) humanMessages.push(text);
     }
