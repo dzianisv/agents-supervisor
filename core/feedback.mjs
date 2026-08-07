@@ -1,5 +1,5 @@
 import { FEEDBACK_MARKER } from './evaluation.mjs'
-import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+
 import { appendStatusDirective, stripStatusDirective } from './status-directive.mjs'
 
 // Items matching any of these must never be presented as ordinary
@@ -88,6 +88,24 @@ export function hasFeedbackBody(text) {
  * via TaskContext.toolActivityNote) — it just never bypasses this function's
  * output.
  *
+ * NO ATTEMPT-COUNT ESCALATION. This function used to take `attemptCount` and
+ * `maxAttempts`; both were dead (`attemptCount` was never read, and the
+ * `maxAttempts`-derived `effectiveCap` was computed and then never used). They
+ * are gone rather than "wired up", deliberately:
+ *   - "One calm template, always" is a standing decision here. Escalating tone
+ *     ("FINAL ATTEMPT", "attempt 3 of 3") is pressure to declare victory, which
+ *     is the exact failure this supervisor exists to catch.
+ *   - A parameter a function ignores is worse than no parameter: every reader
+ *     assumes the escalation exists, and the "(n/N)" it implies was a number
+ *     the code could not honour.
+ * The judge's own prompt still receives the attempt number
+ * (core/reflection-prompt.mjs, core/assessment.mjs render
+ * `{{attemptNumber}}/{{maxAttempts}}`) — that is where it is genuinely used.
+ * The autopilot nudge still shows "(n/N)" because that counter is now real
+ * and persisted; this message never showed one.
+ *
+ * @param {string} severity
+ * @param {object} verdict judge verdict fields
  * @param {object} [opts]
  * @param {boolean} [opts.statusDirective=true] append the status/roadmap
  *   directive. Defaults ON (the directive is default-on); callers pass
@@ -95,10 +113,8 @@ export function hasFeedbackBody(text) {
  *   reflection path too, not just the autopilot nudge.
  */
 export function buildEscalatingFeedback(
-  attemptCount,
   severity,
   verdict,
-  maxAttempts,
   opts = {}
 ) {
   const safeVerdict = verdict ?? {}
@@ -118,7 +134,6 @@ export function buildEscalatingFeedback(
     .map(rewriteIfDestructive)
   const feedbackStr = safeVerdict.feedback || ''
   const confidence = typeof safeVerdict.confidence === 'number' ? safeVerdict.confidence : undefined
-  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
 
   // One calm template, always — no attempt-count escalation tiers. Nothing
   // here ever claims this is a "final" or "last" chance; only the reason

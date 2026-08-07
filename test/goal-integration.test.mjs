@@ -22,12 +22,18 @@ import { statePath, ensureSessionDir, sessionStore } from "../core/session-store
 
 const SESSION_ID = "ses_goaltest123"
 // The turn key of makeMessages()'s last real user message — what
-// getLastRelevantUserMessageId() returns for it. The fixture carries no
-// top-level `id`, so getMessageSignature falls back to
-// `${role}:${info.time.start ?? 0}:${first 20 chars of text}`. Goal state
-// written by a test that wants the per-turn attempt reset NOT to fire must
-// stamp this as goal.lastTurnKey.
-const LAST_USER_MSG_ID = "user:0:Fix the bug in auth."
+// getLastRelevantUserMessageId() returns for it: `info.id`.
+//
+// This used to be the string `user:0:Fix the bug in auth.`, because
+// getMessageSignature only checked a TOP-LEVEL `msg.id` — which opencode's
+// REST transcript never has — and fell through to a lossy
+// `${role}:${time}:${first 20 chars}` composite for every message. That made
+// two human turns sharing a 20-character prefix share one turn key, and
+// therefore one attempt budget. See test/goal-per-turn.test.mjs.
+//
+// Goal state written by a test that wants the per-turn attempt reset NOT to
+// fire must stamp this as goal.lastTurnKey (and as attempts.turnKey).
+const LAST_USER_MSG_ID = "msg_user_1"
 const EPHEMERAL_PREFIX = "ses_judge_goal_"
 let ephemeralCounter = 0
 
@@ -267,15 +273,22 @@ describe("integration: supervisor goal loop", () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
-    // Write goal state with attempts already at the default max (16) and a
-    // lastTurnKey that matches the current turn, so the per-turn reset does
-    // not fire and the cap is genuinely reached.
+    // Write goal state with the per-turn attempt counter already at the goal
+    // budget (16) for the CURRENT turn, so the cap is genuinely reached.
+    //
+    // `state.attempts` is THE counter — `goal.attempts` is only a mirror of it
+    // (see the mirroring block in opencode/supervisor-impl.ts and the identical
+    // one in bin/supervisor-on-stop.mjs). Seeding `goal.attempts` alone would
+    // no longer spend anything: two independently-incremented counts for one
+    // budget was bug #57, and the file counter always tripped first, so
+    // decideGoalTransition's `reason:'attempts'` branch could never fire.
     ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
       statePath(tmpDir, SESSION_ID),
       JSON.stringify({
         mode: "goal",
         autopilot: false,
+        attempts: { count: 16, turnKey: LAST_USER_MSG_ID, lastIso: new Date().toISOString() },
         goal: {
           condition: "all tests pass",
           status: "active",

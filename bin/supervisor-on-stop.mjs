@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -49,7 +49,6 @@ import { shouldSkipReflection } from '../core/turn-classifier.mjs';
 const defaultsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.agents', 'supervisor');
 
 const STATE_DIR = '.supervisor';
-const MAX_ATTEMPTS = parseInt(process.env.SUPERVISOR_MAX_ATTEMPTS ?? process.env.REFLECTION_CC_MAX_ATTEMPTS ?? '3', 10);
 const DEBUG_ENABLED = (process.env.SUPERVISOR_DEBUG ?? process.env.REFLECTION_CC_DEBUG) === '1';
 const TRANSCRIPT_MAX_BYTES = 200_000;
 const TRANSCRIPT_MAX_ENTRIES = 50;
@@ -794,14 +793,12 @@ async function main() {
   // All goal logic is best-effort — any failure falls back to default.
   let goal = null;
   let goalState = {};
-  let effectiveMax = MAX_ATTEMPTS;
   let mode = 'reflection';
   try {
     goalState = goalStore.load(cwd, session_id);
     mode = resolveSupervisorMode(goalState);
     if (goalState.goal && goalState.goal.status === 'active') {
       goal = goalState.goal;
-      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
       // A goal's attempt budget is per-human-turn, not cumulative for the
       // whole session, and it is not tracked separately: goal.attempts is
       // mirrored from the single turn-scoped file counter read above, which
@@ -822,11 +819,6 @@ async function main() {
         // by writeAttemptCounter — a lost update inside one process.
         try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = goal; }); } catch { /* best effort */ }
       }
-    } else if (mode === 'autopilot') {
-      // Autopilot gets the higher budget (default 16), not the bare 3.
-      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
-    } else if (typeof goalState.maxAttempts === 'number') {
-      effectiveMax = resolveMaxAttempts({ sessionOverride: goalState.maxAttempts });
     }
   } catch (e) {
     debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
@@ -835,13 +827,21 @@ async function main() {
     try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
-  // Universal per-turn ceiling — see HARD_CAP's definition for the full
-  // rationale. This intentionally tightens autopilot/goal's higher session
+  // ONE budget rule, shared with the OpenCode plugin (core/goal.mjs):
+  // `/supervisor retry N` > config > (16 for goal/autopilot | 3 for plain
+  // reflection), then clamped to CC's platform ceiling.
+  //
+  // HARD_CAP is a universal per-turn ceiling — see its definition for the full
+  // rationale. It intentionally tightens autopilot/goal's higher session
   // budget (default 16) during any single unbroken turn: by design, since
   // CC's own override already made anything beyond ~8 unreachable in
   // practice, so this just makes our own exhaustion bookkeeping fire
   // deterministically instead of being silently pre-empted by CC.
-  effectiveMax = Math.min(effectiveMax, HARD_CAP);
+  const effectiveMax = resolveTurnMaxAttempts({
+    mode,
+    sessionOverride: goalState?.maxAttempts,
+    hardCap: HARD_CAP,
+  });
 
   // Project-level goal: in reflection mode, read the project goal
   // (.agents/supervisor/Goal.md, or the lower-case goal.md written by the
@@ -1151,7 +1151,6 @@ async function main() {
   // planning/action-loop override.
   function buildAnalysisFeedback() {
     return buildEscalatingFeedback(
-      nextAttempt,
       analysis.severity,
       {
         missing: analysis.missing,
@@ -1162,7 +1161,6 @@ async function main() {
         // into `### Missing` alongside real per-turn gaps.
         goal_condition: goal?.condition || injectedProjectGoalCondition || '',
       },
-      effectiveMax,
       // Same default-on flag the autopilot nudge above honours, so
       // `/supervisor:status off` silences BOTH continuation paths, not just
       // one of them.
