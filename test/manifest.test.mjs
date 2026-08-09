@@ -45,6 +45,11 @@ test('OpenCode command files mirror the Claude Code skill names', () => {
     'supervisor:autopilot.md',
     'supervisor:off.md',
     'supervisor:on.md',
+    // OpenCode-ONLY, deliberately with no skills/plain counterpart: plainspeak
+    // on Claude Code is a separate Stop hook toggled by `.plainspeak/disabled`
+    // / PLAINSPEAK_DISABLED, not by a /supervisor:* command. Adding a Claude
+    // Code skill here would advertise a toggle that runtime does not read.
+    'supervisor:plain.md',
     'supervisor:reflection.md',
     'supervisor:retry.md',
     'supervisor:set-goal.md',

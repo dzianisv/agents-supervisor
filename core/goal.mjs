@@ -331,6 +331,18 @@ export const goalStore = {
       return state;
     });
   },
+  /**
+   * Plainspeak (deterministic style rewrite nudge). Same default-ON, off-only
+   * contract as setStatusDiagram: ABSENT MEANS ON, only an explicit `false`
+   * disables it. Read it through isPlainspeakEnabled(), never as a bare
+   * truthiness test.
+   */
+  setPlainspeak(cwd, sessionId, enabled) {
+    return sessionStore.mutate(cwd, sessionId, (state) => {
+      state.plainspeak = enabled;
+      return state;
+    });
+  },
   setAutoreview(cwd, sessionId, enabled) {
     return sessionStore.mutate(cwd, sessionId, (state) => {
       state.autoreview = enabled;
@@ -364,6 +376,16 @@ export const goalStore = {
  */
 export function isStatusDiagramEnabled(state) {
   return state?.statusDiagram !== false;
+}
+
+/**
+ * Default-on gate for the plainspeak style rewrite nudge. `undefined` (never
+ * toggled) and `true` both mean on; only an explicit `false` disables it.
+ * Shared by both runtimes so a session cannot read ON in one and OFF in the
+ * other.
+ */
+export function isPlainspeakEnabled(state) {
+  return state?.plainspeak !== false;
 }
 
 // --- project-level goal (.agents/supervisor/Goal.md) -----------------------
