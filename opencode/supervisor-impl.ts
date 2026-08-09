@@ -21,8 +21,16 @@ import {
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
   readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
-  isStatusDiagramEnabled, goalStore,
+  isStatusDiagramEnabled, isPlainspeakEnabled, goalStore,
 } from "../core/goal.mjs"
+// Plainspeak style detector. DELIBERATELY deterministic-only on this runtime:
+// only `scoreVerbosity(...).verdict === "verbose"` fires, `"suspect"` is
+// treated as terse, and `buildStylePrompt` is INTENTIONALLY UNUSED here. The
+// Claude Code hook (bin/plainspeak-on-stop.mjs) may escalate an ambiguous
+// reply to an LLM tiebreak; the plugin must not, because that would add a
+// model call, a network dependency, and a source of flake to the idle path
+// for what is only a style nudge.
+import { scoreVerbosity, buildRewriteDirective } from "../core/verbosity.mjs"
 import {
   sessionStore, listSessions, maybeGcSessions,
 } from "../core/session-store.mjs"
@@ -290,6 +298,12 @@ export interface SupervisorState {
    */
   statusDiagram?: boolean
   /**
+   * Plainspeak style-rewrite nudge. ABSENT MEANS ON — identical contract to
+   * `statusDiagram` above. Read it through isPlainspeakEnabled(), never as a
+   * bare truthiness test.
+   */
+  plainspeak?: boolean
+  /**
    * The project directory this session works in, as resolved from its own
    * transcript (`info.path.cwd` — see core/session-context.mjs).
    *
@@ -299,7 +313,21 @@ export interface SupervisorState {
    * the wrong project's disabled file for every pre-existing session.
    */
   projectDir?: string
+  /**
+   * The turn key (last HUMAN user-message id — see
+   * getLastRelevantUserMessageId) of the turn a plainspeak rewrite directive
+   * was last injected on.
+   *
+   * This is the TERMINATION PROOF for plainspeak: one rewrite per turn, ever.
+   * The agent's reply to the directive raises a fresh session.idle with the
+   * SAME turn key, so the guard matches and the second pass returns silently.
+   * Persisted (not in-memory) so a server restart mid-turn cannot re-fire it.
+   */
+  lastPlainTurnKey?: string
 }
+
+/** Provenance/idempotency marker on every injected plainspeak directive. */
+export const PLAINSPEAK_MARKER = "<!-- supervisor:plainspeak -->"
 
 /**
  * Default-on gate for the status directive. `undefined` (never toggled) and
@@ -309,7 +337,7 @@ export interface SupervisorState {
  * hook reads the same on-disk key through the core copy, and two independent
  * implementations of a default-ON flag drift into a default-OFF one silently.
  */
-export { isStatusDiagramEnabled }
+export { isStatusDiagramEnabled, isPlainspeakEnabled }
 
 /**
  * `supervisorStore` is an ASYNC ADAPTER, not a second implementation.
@@ -367,6 +395,10 @@ export const supervisorStore = {
 
   async setStatusDiagram(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
     return goalStore.setStatusDiagram(directory, sessionId, enabled) as SupervisorState
+  },
+
+  async setPlainspeak(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    return goalStore.setPlainspeak(directory, sessionId, enabled) as SupervisorState
   },
 
   /**
@@ -1561,6 +1593,102 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
+   * ── Plainspeak: one deterministic style-rewrite nudge per turn ──────────
+   *
+   * Asks the agent to rewrite its own last reply when that reply reads
+   * verbose. This is a CHORE, in the same family as the status-checkpoint
+   * correction — never a continuation attempt — so it deliberately does not
+   * read or write the attempt budget.
+   *
+   * DETERMINISTIC ONLY, ON PURPOSE. It fires exclusively on
+   * `scoreVerbosity(text).verdict === "verbose"`; `"suspect"` is treated as
+   * terse and dropped. `buildStylePrompt` (core/verbosity.mjs) is
+   * INTENTIONALLY UNUSED by this runtime — escalating an ambiguous reply to
+   * an LLM tiebreak, as bin/plainspeak-on-stop.mjs may, would put a model
+   * call, a network dependency, and a source of flake on the idle path for a
+   * style nudge. If you are here to "improve" this by adding the tiebreak:
+   * don't.
+   *
+   * IT NEVER FIGHTS THE SUPERVISOR. Call this ONLY from a path where the
+   * supervisor itself already decided to stand down (task complete with no
+   * status correction, human action required, actionless verdict, empty
+   * rendered feedback). If the supervisor injected feedback, an autopilot
+   * nudge, or a status correction on this turn, plainspeak stays silent —
+   * at most ONE chore injection per turn.
+   *
+   * TERMINATION: `lastPlainTurnKey` is persisted and compared against the same
+   * turn key the attempt budget uses. The agent's reply to the directive
+   * raises a fresh session.idle for the SAME key, the guard matches, and this
+   * returns silently. There is no path to a second injection on one turn.
+   *
+   * The subagent gate, `.supervisor/disabled`, the judge/ephemeral-session
+   * gate and the supervisor-control-turn gate are all satisfied structurally:
+   * every one of them plain-returns from runSupervisor long before any call
+   * site below is reached.
+   *
+   * @returns true if a directive was injected.
+   */
+  async function maybeInjectPlainspeak(args: {
+    sessionId: string
+    turnKey: string
+    sup: SupervisorState
+    mode: SupervisorMode
+    goal: SupervisorGoal | null
+    lastAssistantText: string
+    projectGoalCondition?: string
+  }): Promise<boolean> {
+    const { sessionId, turnKey, sup, mode, goal, lastAssistantText } = args
+    try {
+      if (!isPlainspeakEnabled(sup)) return false
+      // Autopilot is mid-work by definition — never nag about style while the
+      // agent is being pushed to keep going.
+      if (mode === "autopilot" || sup.autopilot === true) return false
+      // An active goal (session-scoped or project-scoped) means the turn is
+      // still under a standing objective. Style is not the priority.
+      if (goal || mode === "goal") return false
+      if (args.projectGoalCondition) return false
+      // One rewrite per turn, ever.
+      if (sup.lastPlainTurnKey === turnKey) return false
+      if (!lastAssistantText || typeof lastAssistantText !== "string") return false
+
+      const scored = scoreVerbosity(lastAssistantText)
+      // 'suspect' is treated as terse — see the deterministic-only note above.
+      if (scored?.verdict !== "verbose") return false
+
+      const directive = buildRewriteDirective(scored)
+      // Nothing concrete to name = nothing to inject. Never send an empty body.
+      if (!directive || !directive.trim()) return false
+
+      // Marker FIRST, on its own line — provenance + a stable grep for tests,
+      // mirroring STATUS_DIRECTIVE_MARKER. The status directive is
+      // deliberately NOT appended: this is a rewrite of the reply just given,
+      // not a new work instruction.
+      const text = `${PLAINSPEAK_MARKER}\n${directive}`
+
+      // Claim the turn BEFORE prompting. A failed promptAsync still burns the
+      // turn's single rewrite — failing toward silence, never toward a loop.
+      try {
+        await supervisorStore.mutate(directory, sessionId, (s) => { s.lastPlainTurnKey = turnKey })
+      } catch (e: any) {
+        debug("plainspeak: could not persist lastPlainTurnKey, skipping:", e?.message || e)
+        return false
+      }
+
+      await client.session.promptAsync({
+        path: { id: sessionId },
+        body: { parts: [{ type: "text", text }] },
+      })
+      debug("plainspeak: injected rewrite directive for", sessionId.slice(0, 8), "turn", turnKey)
+      await showToast(client, directory, "Reply read verbose — asked for a rewrite", "info")
+      return true
+    } catch (e: any) {
+      // Never let a style nudge change whether the supervisor stops.
+      debug("plainspeak check failed (non-fatal):", e?.message || e)
+      return false
+    }
+  }
+
+  /**
    * Persist the session -> project-directory mapping so it survives a server
    * restart. Best-effort and write-avoiding: only touches disk when the value
    * actually changed, so this costs nothing on the steady-state path.
@@ -1702,7 +1830,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   // Primary supervisor tool: status, session on/off, and mode selection.
-  const supervisorToggleDescription = "Inspect or change supervisor state for the current session. action=off/on disables/enables the supervisor and is INDEPENDENT of mode — when the user asks to turn the supervisor off, send action=\"off\" and leave mode empty. Use mode=autopilot or mode=reflection only to switch modes. Omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
+  const supervisorToggleDescription = "Inspect or change supervisor state for the current session. action=off/on disables/enables the supervisor and is INDEPENDENT of mode — when the user asks to turn the supervisor off, send action=\"off\" and leave mode empty. Use mode=autopilot or mode=reflection only to switch modes. Use action=\"status on\"/\"status off\" for the status-checkpoint directive and action=\"plain on\"/\"plain off\" for the plainspeak style nudge. Omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
   const executeSupervisorToggle = async (
     args: { action?: string; mode?: string; condition?: string; clear?: boolean; n?: number } = {},
     context?: any
@@ -1784,6 +1912,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.setStatusDiagram(directory, sid, false)
       return `Status checkpoint directive DISABLED for session ${sid.slice(0, 8)}…. No status.md/roadmap instruction will be injected, and completion will not be gated on it.`
     }
+    if (action === "plain on" || action === "plain-on" || action === "plainspeak on" || action === "plainspeak-on") {
+      await supervisorStore.setPlainspeak(directory, sid, true)
+      return `Plainspeak ENABLED for session ${sid.slice(0, 8)}…. When a turn ends with nothing left to do and the reply reads verbose, the supervisor asks for one rewrite (deterministic detector, at most once per turn).`
+    }
+    if (action === "plain off" || action === "plain-off" || action === "plainspeak off" || action === "plainspeak-off") {
+      await supervisorStore.setPlainspeak(directory, sid, false)
+      return `Plainspeak DISABLED for session ${sid.slice(0, 8)}…. No style rewrite directives will be injected.`
+    }
     if (action === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
       return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
@@ -1810,7 +1946,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
     const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
-    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}${goalText}`
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
   }
 
   // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
@@ -2850,6 +2986,9 @@ Continue now.`
           standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
           debug("Supervisor complete")
+          // The supervisor is standing down and the status correction did NOT
+          // fire, so this turn's single chore slot is free.
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, mode, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
           return
         }
 
@@ -2858,6 +2997,7 @@ Continue now.`
           const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
           await showToast(client, directory, `Action needed: ${hint}`, "warning")
           debug("Supervisor requires human action (no agent-actionable work remaining)")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, mode, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
           return
         }
 
@@ -2884,6 +3024,7 @@ Continue now.`
             : "judge did not ask to continue (shouldContinue=false)"
           debug("Supervisor standing down, no injection:", standDownReason)
           await showToast(client, directory, `Supervisor stood down — ${standDownReason}`, "info")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, mode, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
           return
         }
 
@@ -2956,6 +3097,7 @@ Continue now.`
         if (!hasFeedbackBody(feedbackText)) {
           standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
           debug("Supervisor standing down, no injection: rendered feedback had an empty body")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, mode, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
           return
         }
 
@@ -3017,7 +3159,7 @@ Continue now.`
       cfg.command = {
         ...(cfg.command || {}),
         supervisor: {
-          description: "Control the supervisor: status | status on|off | on | off | reflection | autopilot | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
+          description: "Control the supervisor: status | status on|off | plain on|off | on | off | reflection | autopilot | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
           template: `Execute this supervisor command by calling the supervisor tool with the appropriate arguments.
 
 Command: "{{input}}"
@@ -3026,6 +3168,8 @@ Routing rules:
 - empty or "status" → supervisor({ action: "status" })
 - "status on" → supervisor({ action: "status on" })
 - "status off" → supervisor({ action: "status off" })
+- "plain on" (or "plainspeak on") → supervisor({ action: "plain on" })
+- "plain off" (or "plainspeak off") → supervisor({ action: "plain off" })
 - "on" → supervisor({ action: "on" })
 - "off" → supervisor({ action: "off" })
 - "reflection" → supervisor({ mode: "reflection" })

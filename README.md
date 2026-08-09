@@ -338,12 +338,23 @@ First `--push-hf` run needs `hf auth login` and `pip install -U huggingface_hub`
 2. `~/.config/agents-supervisor/patterns.json` (user, written by train)
 3. `<project>/.supervisor/patterns.json` (project, `--scope=project`)
 
-## Plainspeak (Claude Code only)
+## Plainspeak (both runtimes)
 
-A second Stop hook. It catches a fluffy final reply and blocks with a rewrite
-directive instead of letting it stand.
+Catches a fluffy final reply and asks for a rewrite instead of letting it stand.
+Same detector (`core/verbosity.mjs`) on both runtimes; different amounts of it.
 
-Detection is two-stage:
+| | Claude Code | OpenCode |
+|---|---|---|
+| Entry point | second Stop hook (`bin/plainspeak-on-stop.mjs`) | the `session.idle` handler, after the supervisor stands down |
+| Detection | deterministic + LLM tiebreak on `suspect` | **deterministic only** — fires on `verdict === 'verbose'`, treats `suspect` as terse |
+| Extra model call | yes, on ambiguous replies | **never** |
+| Toggle | `.plainspeak/disabled`, `PLAINSPEAK_DISABLED=1` | `/supervisor:plain off` (default ON) |
+
+The opencode path is deterministic on purpose: `buildStylePrompt` is
+intentionally unused there, because a network round-trip and a flaky model call
+do not belong on the idle path for what is only a style nudge.
+
+Detection is two-stage (Claude Code):
 1. `scoreVerbosity` (deterministic, free) scores the reply against
    `core/style-rules.json` — filler openers, hedges, praise, apology,
    self-narration — plus a structural check (long, low-bullet, long-sentence
@@ -374,13 +385,37 @@ on any `terse` verdict, not just below-floor ones) — gold recall drops to
 12.5%. Default trades LLM-call volume for catching real complaints, because on
 this corpus the cheap mode misses seven of every eight.
 
+### `/supervisor:plain` (OpenCode)
+
+```
+/supervisor:plain          # read-only status (alias of /supervisor)
+/supervisor:plain off      # stop injecting rewrite directives
+/supervisor:plain on       # re-enable
+```
+
+ON by default; `off` is the only thing that disables it — absent/undefined both
+mean on, so sessions predating the flag keep the feature. State lives next to
+the other per-session flags in `.supervisor/sessions/<id>/state.json`, and
+`plainspeak: on|off` is reported by `/supervisor`.
+
+On OpenCode it only ever fires on a turn where **the supervisor itself decided
+to stand down** (task complete, human action required, actionless verdict,
+empty rendered feedback) — and never if the status-checkpoint correction fired,
+so a turn gets at most one chore injection. It is suppressed entirely in
+subagent sessions, judge sessions, autopilot mode, while a goal is active, on
+`/supervisor …` control turns, and when the supervisor is disabled. It never
+touches the attempt budget. Injected messages lead with
+`<!-- supervisor:plainspeak -->`.
+
 Safety rails:
 - **Never fights supervisor.** Defers if a supervisor goal/autopilot is
   active, and again if `.supervisor/sessions/<session_id>/verdicts.jsonl` shows
   supervisor just blocked this same turn. Finishing the work beats polishing
   the prose.
-- **One rewrite per turn.** Hard cap, persisted under `.plainspeak/`. A second
-  Stop for the same turn is always silent.
+- **One rewrite per turn.** Hard cap, persisted — under `.plainspeak/` on
+  Claude Code, as `lastPlainTurnKey` in the session state on OpenCode (keyed by
+  the same turn key the attempt budget uses). A second pass on the same turn is
+  always silent. That is the whole termination proof.
 - **Never mid-work.** A trailing question to the user exits silently — style
   is judged only on a final delivered reply.
 - **Fails open.** Any error, timeout, or missing auth exits silently. A broken
@@ -391,6 +426,7 @@ Safety rails:
 
 ```
 npm test                 # unit tests (core + hook + train derivation), node:test
+npm run test:e2e         # OpenCode plugin end-to-end (real `opencode serve`) — must pass before commit
 npm run test:cc          # Claude Code end-to-end (real claude -p, no mocks)
 npm run eval             # OpenCode judge eval (promptfoo)
 npm run eval:plainspeak  # plainspeak detector eval (default: verbosity-cases.example.jsonl; --cases for the private corpus)
