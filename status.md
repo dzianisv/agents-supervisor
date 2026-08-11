@@ -1,142 +1,70 @@
 # status
 
-## Track C — OpenClawBot "runaway supervisor" investigation (2026-08-07)
-
-**Ask:** review recent Claude sessions on ~/workspace/OpenClawBot; supervisor
-allegedly kept pushing a session that was mid-conversation with the user.
+## Track C — OpenClawBot "runaway supervisor" (2026-08-07) — CLOSED
 
 ```
 ROADMAP  ████████████████████  12/12 done
- [x] 1. Grep CC transcripts (session 98473024, 105 Stop-hook msgs)
- [x] 2. Map stand-down conditions + session-id resolution (file:line)
- [x] 3. Verify H1 (own injection resets turn budget) — REFUTED as the cause
- [x] 4. Verify H2 (/supervisor off ignored)         — REFUTED, disable honoured
- [x] 5. Report findings + ranked fix list
- [x] 6. Fix #1 foreign-Stop-hook turn-key leak      -> #63 merged
- [x] 7. Fix #3 no-progress gate (threshold 2)       -> #63 merged
- [x] 8. Drain the 5-branch unmerged stack           -> #61, #65 merged
- [x] 9. Root-cause "fixes never land": manifest version never bumped
- [x] 10. Release 0.3.1 + `claude plugin update`     -> #66 merged, cache d4013b4
- [x] 11. OpenClawBot CI-guard hook refire cap       -> OpenClawBot#3653 (open)
- [x] 12. Delete 6 merged branches + worktrees; PR backlog now empty
+ [x] 1-5.  Investigated; disproved both theories. Loop was Claude Code's own
+           /goal (49x) + OpenClawBot's own CI-guard hook (54x). Supervisor: 0.
+ [x] 6-7.  Fix #1 foreign-Stop-hook turn-key leak; Fix #3 no-progress gate -> #63
+ [x] 8.    Drained the 5-branch unmerged stack -> #61, #65
+ [x] 9-10. Found why fixes never landed (manifest version never bumped);
+           released 0.3.1, plugin cache now d4013b4 -> #66
+ [x] 11.   OpenClawBot CI-guard refire cap -> OpenClawBot#3653 (open, not mine to merge)
+ [x] 12.   Deleted 6 merged branches + worktrees; PR backlog empty
 
 WHY SLOW
- - Misattribution cost a full round. The 105 injections were NOT
-   agents-supervisor: 49 = Claude Code NATIVE /goal sentinel, 54 = OpenClawBot's
-   own claude-post-merge-ci-guard-hook.sh. agents-supervisor injected 0 times.
- - First no-progress gate was a boolean (stand down on 1st repeat) and silently
-   collapsed every per-turn budget to 1 injection. CI caught it, not local runs.
- - #61 squash-merge orphaned the stacked PR #64; had to reopen as #65 and
-   hand-rebase #63 through a semantic conflict (goalStore -> sessionStore).
+ - nothing changed this turn; work finished last turn, this is the checkpoint only
+ - earlier cost: misattribution round, plus my first no-progress gate was a
+   boolean and collapsed every per-turn budget to 1 inject (CI caught it)
 
 NEXT
- - Merge OpenClawBot#3653. Claude Code restart required for 0.3.1 to take effect.
- - Not done: fix #4 (opencode has no pre-judge human-block guard),
-   fix #6 (184 orphan goal files in OpenClawBot/.supervisor/goals/),
-   `npm test` glob on main still matches the E2E (flaky, pre-existing).
+ - Owner action only: merge OpenClawBot#3653, restart Claude Code for 0.3.1
 ```
 
-Final state: `main` = `d4013b4`, installed plugin `0.3.1` = `d4013b4`, 0 open PRs,
-0 stale branches. Verified the shipped cache actually contains both fixes
-(`FOREIGN_STOP_HOOK_PREFIX`, `NO_PROGRESS_REPEAT_THRESHOLD`, `core/session-store.mjs`).
+Not done on purpose: fix #4 (opencode lacks a pre-judge human-block guard),
+fix #6 (184 orphan goal files in OpenClawBot/.supervisor/goals/), and the
+`npm test` glob on main still matching the E2E.
 
-Two tracks below. Earlier session worked track B, which is not code in this repo.
-
-## Track B — demo video registry (2026-07-29, current session)
-
-**Goal:** one list of all our demo videos, so agents stop uploading duplicates.
+Task: inject humanize/terse style correction when a reply is long — port the
+existing `core/verbosity.mjs` detector into the opencode runtime and add a toggle.
 
 ```
-ROADMAP  ████████████████████  9/9 done
- [x] 1. Audit real YouTube channel via Studio (18 Shorts, 0 long-form)
- [x] 2. oEmbed-check all 15 IDs — all 200, zero dead
- [x] 3. Merge partial registry from OpenCode Mobile Notion page
- [x] 4. Create Demo Video Registry page + RULES (single source of truth)
- [x] 5. Unlist 4 duplicates (13 -> 9 public); nothing deleted
- [x] 6. Close opencode-mobile#158 — "broken upload" was a video-ID typo
- [x] 7. Archive evidence off ephemeral /tmp
- [x] 8. Revert global AGENTS.md (0 occurrences); rule now in
-        ~/.agents/skills/upload-youtube-video/SKILL.md instead
- [x] 9. Append QZsi71RTfUM + record NOT-duplicate verdict vs the 3 VibeBrowser
-        Shorts (32.5s vs 9-20.6s, only full install->answer arc, only captioned;
-        21/21 frame MD5s distinct)
+ROADMAP  ████████████████████  5/6 done
+ [x] 1. detector core/verbosity.mjs (pre-existing)
+ [x] 2. Claude Code Stop hook bin/plainspeak-on-stop.mjs (pre-existing)
+ [x] 3. opencode port: maybeInjectPlainspeak on 4 stand-down sites
+ [x] 4. /supervisor:plain on|off toggle + isPlainspeakEnabled (default ON)
+ [x] 5. PR #67 merged to main (e89bbea), branch + worktree cleaned
+ [~] 6. E2E gap: no live-server verbose-reply test   <-- YOU ARE HERE
 
 WHY SLOW
- - I wrongly accused a parallel session of uploading a duplicate. It was not one.
-   Checked properly only after being challenged.
- - First registry edit silently no-opped: other sessions converted the table to
-   HTML, so my markdown old_str never matched. API returned success anyway.
-   Had to re-read the page and redo the insert.
+ - not slow; one delegated pass, both suites green first run, CI green
 
 NEXT
- - Nothing pending in this track. Registry is live and self-serve.
+ - decide whether to close the E2E gap or accept the source-level pins
 ```
 
-Not done, and deliberately so: no tests / build / PR. Nothing in this repo's
-code changed — all work was Notion, YouTube and a skill file under ~/.agents.
-Running `npm test` here would prove nothing about it.
+## Verified (re-run independently, not subagent-reported)
 
-Registry: https://app.notion.com/p/Demo-Video-Registry-3acac25eb49f8102b36efccf3a3f93e7
+| suite | command | result |
+|---|---|---|
+| unit/integration | `npm test` | 683 pass / 0 fail, 82 suites |
+| opencode E2E | `npm run test:e2e` | 20 pass / 0 fail, 6 suites |
 
-## Track A — fix/per-turn-budget (this repo, earlier)
+## Design decisions locked
 
-One stop mechanism for the opencode supervisor: a persisted per-turn attempt
-counter replaces the boolean "already reflected this turn" gate that capped
-every human turn at ONE injection.
+- Deterministic only in opencode — fires on `verdict === 'verbose'`; `'suspect'`
+  is treated as terse. No LLM tiebreak, no new model wiring.
+- Never fights the supervisor: only injects on stand-down turns.
+- Runs after the status-checkpoint correction; max one chore injection per turn.
+- One rewrite per turn, pinned by `lastPlainTurnKey`.
+- Suppressed by: subagent, `.supervisor/disabled`, judge sessions, autopilot,
+  active session goal, active project goal, control turns, explicit `plain off`.
+- Default ON, off-only flag — mirrors `statusDiagram`.
 
-```
-ROADMAP  ████████████████████  9/9 done
- [x] 1. Classify all 22 `lastReflectedMsgId.set` sites (inject vs stand-down)
- [x] 2. Replace the boolean gate with a pre-increment counter budget
- [x] 3. Persist the counter via sessionStore.mutate() (locked RMW)
- [x] 4. Autopilot on the same persisted budget; "(n/N)" now truthful
- [x] 5. Escalation decided: dead params deleted from buildEscalatingFeedback
- [x] 6. One budget rule for both runtimes (resolveTurnMaxAttempts)
- [x] 7. E2E: N injections/turn, termination, retry 1 vs 5, complete, actionless,
-        autopilot cap, server-restart persistence
- [x] 8. Control test: re-adding the deleted line turns 3 injections into 1
- [x] 9. npm test / test:e2e / e2e-cc all green; 10x E2E flake run
+## Known gap
 
-WHY SLOW
- - Two real defects surfaced mid-work and had to be fixed, not worked around:
-   eligibility gates saturating the counter disarmed autopilot on its own
-   command turn; and the turn key was a 20-char text prefix, not the message id.
-
-NEXT
- - Push branch. Do NOT merge (owner review).
-```
-
-## Mechanism
-
-```
-session.idle
-    |
-    v
-[subagent gate] [.supervisor/disabled]        -> plain return (eligibility)
-    |
-    v
-turnKey = last NON-supervisor user message id   (stable across injections)
-count   = max(memory, .supervisor/sessions/<id>/state.json)
-    |
-    +-- count >= budget ? --yes--> disarm autopilot / goal bookkeeping -> STOP
-    |
-   no
-    |
-    v
-[non-actionable / control-command gate]      -> plain return (eligibility)
-    |
-    v
-autopilot?  --yes--> write count+1 -> nudge "(n/N)" -> return
-    |
-   no
-    v
-judge -> complete | actionless | human-block | error  -> saturate count -> STOP
-      -> continue -> write count+1 -> inject -> return   (NO stand-down here)
-```
-
-## Budgets
-
-| mode | default | `/supervisor retry N` | opencode | Claude Code |
-|---|---|---|---|---|
-| reflection | 3 | N | N | min(N, 7) |
-| goal / autopilot | 16 | N | N | min(N, 7) |
+No E2E test drives a real verbose reply through a live server to the injected
+directive. Source-level pins cover the deletable guard lines; the wire path is
+untested.
