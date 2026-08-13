@@ -9,7 +9,7 @@ import { statePath } from '../core/session-store.mjs';
 import {
   goalStore, resolveMaxAttempts, resolveTurnMaxAttempts,
   resolveReflectionMaxAttempts, DEFAULT_REFLECTION_MAX_ATTEMPTS,
-  resolveClaudeCodeHardCap, decideGoalTransition,
+  resolveClaudeCodeHardCap, decideGoalTransition, RUNAWAY_CEILING,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
   DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode,
   extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
@@ -236,13 +236,15 @@ test('concurrent real processes: 0 conditions lost across N racing goal-set call
 // 16 unattended pushes per human message.
 // ---------------------------------------------------------------------------
 
-test('resolveTurnMaxAttempts: plain reflection defaults to 3, goal/autopilot to 16', () => {
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: {} }), DEFAULT_REFLECTION_MAX_ATTEMPTS);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: {} }), 3);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), DEFAULT_MAX_ATTEMPTS);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'autopilot', env: {} }), DEFAULT_MAX_ATTEMPTS);
-  // An unknown/absent mode is treated as plain reflection — the cautious side.
-  assert.equal(resolveTurnMaxAttempts({ env: {} }), 3);
+// The counter is a RUNAWAY CIRCUIT BREAKER now, not the intended stop — that
+// is `supervisor_loop_exit`. So every mode shares one high default; the old
+// per-mode defaults (3 for reflection, 16 for goal/autopilot) made the counter
+// decide completion, which it cannot observe, and it stood down mid-task.
+test('resolveTurnMaxAttempts: every mode defaults to the runaway ceiling', () => {
+  assert.equal(RUNAWAY_CEILING, 50);
+  for (const mode of ['reflection', 'goal', 'autopilot', undefined]) {
+    assert.equal(resolveTurnMaxAttempts({ mode, env: {} }), RUNAWAY_CEILING);
+  }
 });
 
 test('resolveTurnMaxAttempts: /supervisor retry N wins for EVERY N, in every mode', () => {
@@ -276,7 +278,7 @@ test('resolveTurnMaxAttempts: hardCap applies last and only where a runtime has 
   assert.equal(cc, 7);
   // Claude Code clamps; OpenCode (no hardCap) does not.
   assert.equal(resolveTurnMaxAttempts({ mode: 'goal', hardCap: cc, env: {} }), 7);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), 16);
+  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), RUNAWAY_CEILING);
   // A hardCap must never raise a smaller budget.
   assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', sessionOverride: 2, hardCap: cc, env: {} }), 2);
   // ...and never drop below 1.
@@ -288,5 +290,7 @@ test('resolveReflectionMaxAttempts honours the env knobs BOTH runtimes have alwa
   assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: '6' }), 6);
   assert.equal(resolveReflectionMaxAttempts({ REFLECTION_CC_MAX_ATTEMPTS: '5' }), 5);
   assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: 'garbage' }), 3);
+  // An explicit env knob still overrides the runaway ceiling — it is an
+  // operator choice, like `/supervisor retry N`.
   assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: { SUPERVISOR_MAX_ATTEMPTS: '6' } }), 6);
 });

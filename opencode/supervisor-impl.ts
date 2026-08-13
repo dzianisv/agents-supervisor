@@ -324,6 +324,18 @@ export interface SupervisorState {
    * Persisted (not in-memory) so a server restart mid-turn cannot re-fire it.
    */
   lastPlainTurnKey?: string
+  /**
+   * The agent's explicit "end the supervision loop" declaration, written by
+   * the `supervisor_loop_exit` tool. `turnKey` is the human turn it was
+   * declared on (same key the attempt counter uses), so a record from an
+   * EARLIER turn can never suppress supervision of a NEW human message.
+   */
+  loopExit?: {
+    turnKey: string
+    reason: "completed" | "stuck"
+    detail: string
+    at: number
+  }
 }
 
 /** Provenance/idempotency marker on every injected plainspeak directive. */
@@ -623,7 +635,7 @@ const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "superviso
 // Last-resort fallback when no model is configured. Uses a free opencode model
 // to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
 const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
-const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "set_supervisor"])
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "supervisor_loop_exit", "set_supervisor"])
 
 export function trackSessionScopedToolSession(
   currentSessionId: string | null,
@@ -2149,6 +2161,108 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     return `Autoreview disabled for session ${sid.slice(0, 8)}….`
   }
 
+  // supervisor_loop_exit tool — THE stop condition for the supervision loop.
+  //
+  // The per-turn attempt counter is now only a runaway circuit breaker
+  // (core/goal.mjs RUNAWAY_CEILING): a counter cannot observe whether the
+  // human's task is finished, and a low default made the supervisor stand
+  // down mid-task. The agent declares the loop over instead, here.
+  const supervisorLoopExitDescription = `End the supervisor's continuation loop for the current turn. This is the ONLY way to end the supervision loop — the attempt counter is now just a runaway circuit breaker, not the intended stop.
+Call with reason="completed" when the task the human asked for is genuinely finished (all of it, not one step).
+Call with reason="stuck" when the supervisor is repeating the same feedback, demanding something impossible or already done, or you cannot make further progress.
+Pass a short "detail" saying why. Both args are optional; reason defaults to "completed".`
+
+  /**
+   * Resolve THE turn key from the tool's own session, the same way the idle
+   * handler does (getLastRelevantUserMessageId over the transcript, which
+   * skips supervisor-injected messages). Doing it here — rather than storing a
+   * bare timestamp and having the idle handler guess which turn it belongs to
+   * — keeps a single, exact definition of "this turn" shared by the counter
+   * and the loop-exit gate. If the transcript is unreadable we return null and
+   * the caller records nothing: silently attributing the exit to an unknown
+   * turn could suppress supervision of a FUTURE human message.
+   */
+  const resolveCurrentTurnKey = async (sid: string): Promise<string | null> => {
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      const messages = Array.isArray(data) ? data : []
+      return getLastRelevantUserMessageId(messages) || null
+    } catch (e: any) {
+      debug("loop-exit: could not resolve turn key:", e?.message || e)
+      return null
+    }
+  }
+
+  const executeSupervisorLoopExit = async (
+    args?: { reason?: string; detail?: string },
+    context?: any
+  ) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) {
+      return { title: "No session", output: "No active session yet — nothing to exit." }
+    }
+    currentSessionId = sid
+    const reason: "completed" | "stuck" = args?.reason === "stuck" ? "stuck" : "completed"
+    const detail = typeof args?.detail === "string" ? args.detail.trim().slice(0, 2000) : ""
+    const at = Date.now()
+    const turnKey = await resolveCurrentTurnKey(sid)
+
+    if (!turnKey) {
+      debug("loop-exit: no turn key resolved — not recording for", sid)
+      return {
+        title: "Loop exit not recorded",
+        output: "Could not identify the current turn, so no loop-exit was recorded. Supervisor state left unchanged.",
+      }
+    }
+
+    const state = await supervisorStore.load(directory, sid)
+    const mode = resolveSupervisorMode(state)
+
+    // Forensic evidence for a doom loop, written BEFORE returning so it
+    // survives even if the state write races or the process dies next.
+    if (reason === "stuck") {
+      try {
+        await mkdir(join(directory, ".supervisor"), { recursive: true })
+        await appendFile(
+          join(directory, ".supervisor", "loop-exit.log"),
+          JSON.stringify({ session: sid, turnKey, reason, detail, at }) + "\n"
+        )
+      } catch (e: any) {
+        debug("loop-exit: log append failed (non-fatal):", e?.message || e)
+      }
+    }
+
+    await supervisorStore.mutate(directory, sid, (s) => {
+      s.loopExit = { turnKey, reason, detail, at }
+      // NEVER `delete s.goal` here. setAutopilot(false) routes through
+      // setMode("reflection"), which drops the goal — the exact footgun
+      // documented on autopilot_exit below. A goal is a long-lived user
+      // intent; "this turn's loop is over" says nothing about it. Only an
+      // explicit "stuck" pauses it, and even then the condition is kept so
+      // the user can see and resume it.
+      if (reason === "stuck" && s.goal && s.goal.status === "active") {
+        s.goal = { ...s.goal, status: "paused", lastReason: detail || "agent reported stuck" }
+      }
+    })
+
+    if (mode === "autopilot") {
+      // Disarm the unattended loop — but via the state we just wrote, not by
+      // reaching for setMode, so the goal survives.
+      try { await supervisorStore.setAutopilot(directory, sid, false) } catch { /* best effort */ }
+    }
+
+    debug("loop-exit recorded:", sid, "turn:", turnKey, "reason:", reason, "detail:", detail)
+    return reason === "stuck"
+      ? {
+          title: "Supervision loop ended (stuck)",
+          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.`,
+        }
+      : {
+          title: "Supervision loop ended",
+          output: "Supervision loop ended for this turn: task reported complete. The supervisor will not push again until the human sends a new message.",
+        }
+  }
+
   // autopilot_exit tool — signal that autopilot work is complete
   const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
 Call this tool:
@@ -2173,7 +2287,9 @@ Do NOT call this tool:
       // a no-op, not a state reset.
       const state = await supervisorStore.load(directory, sid)
       if (resolveSupervisorMode(state) === "autopilot") {
-        await supervisorStore.setAutopilot(directory, sid, false)
+        // Thin wrapper over the loop-exit logic (which also disarms
+        // autopilot), so the two tools cannot diverge.
+        await executeSupervisorLoopExit({ reason: "completed", detail: "autopilot_exit" }, context)
       } else {
         debug("autopilot_exit called while not in autopilot mode — no state change for", sid)
         return {
@@ -2193,6 +2309,7 @@ Do NOT call this tool:
   let supervisorAutopilotTool: any = null
   let supervisorAutoreviewTool: any = null
   let autopilotExitTool: any = null
+  let supervisorLoopExitTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
     supervisorGoalTool = tool({
@@ -2256,6 +2373,14 @@ Do NOT call this tool:
       description: autopilotExitDescription,
       args: {},
       execute: executeAutopilotExit as any
+    })
+    supervisorLoopExitTool = tool({
+      description: supervisorLoopExitDescription,
+      args: {
+        reason: tool.schema.string().optional().describe("\"completed\" (task genuinely finished) or \"stuck\" (supervisor looping / no further progress possible). Default \"completed\"."),
+        detail: tool.schema.string().optional().describe("Short free-text reason. Default empty.")
+      },
+      execute: executeSupervisorLoopExit as any
     })
   } catch {
     try {
@@ -2330,6 +2455,17 @@ Do NOT call this tool:
         args: {},
         execute: executeAutopilotExit
       }
+      supervisorLoopExitTool = {
+        description: supervisorLoopExitDescription,
+        args: {
+          // Plain z.string(), not z.enum(): this runtime marks every param
+          // required in the manifest, so filler must be able to reach the
+          // executor (which normalises it) instead of failing validation.
+          reason: z.string().optional().describe("\"completed\" or \"stuck\". Default \"completed\"."),
+          detail: z.string().optional().describe("Short free-text reason. Default empty.")
+        },
+        execute: executeSupervisorLoopExit
+      }
     } catch {
       // Neither @opencode-ai/plugin/tool nor zod are available (e.g. CI without
       // npm install, or a bare Node.js environment). Create minimal plain objects
@@ -2343,6 +2479,7 @@ Do NOT call this tool:
       supervisorAutopilotTool = { description: supervisorAutopilotDescription, args: {}, execute: executeSupervisorAutopilot }
       supervisorAutoreviewTool = { description: supervisorAutoreviewDescription, args: {}, execute: executeSupervisorAutoreview }
       autopilotExitTool = { description: autopilotExitDescription, args: {}, execute: executeAutopilotExit }
+      supervisorLoopExitTool = { description: supervisorLoopExitDescription, args: {}, execute: executeSupervisorLoopExit }
     }
   }
 
@@ -2443,9 +2580,55 @@ Do NOT call this tool:
           // Code's Stop-hook block cap) — see resolveClaudeCodeHardCap.
         })
 
-        // ── THE per-turn stop condition ──────────────────────────────────
+        // ── Agent-declared loop exit ─────────────────────────────────────
         //
-        // Exactly one mechanism ends a turn: this counter reaching the budget.
+        // THE intended stop condition. The agent called supervisor_loop_exit
+        // for THIS turn, so there is nothing left to push for. Checked BEFORE
+        // the attempt budget: the counter is only a runaway circuit breaker
+        // now, and an explicit declaration outranks it.
+        //
+        // Plain `return`, NOT standDownForTurn. Per AGENTS.md ("Eligibility
+        // gates must NOT saturate the counter") saturation is reserved for
+        // paths that already committed to supervising this turn. This is a
+        // cheap, idempotent eligibility gate over persisted state: it
+        // re-derives the same answer for free on every idle of this turn, so
+        // it needs no counter to terminate — and saturating would make it
+        // indistinguishable from a genuinely spent budget, firing that
+        // branch's side effects (setAutopilot(false), goal transitions) on a
+        // later idle.
+        //
+        // Records from an earlier turn are simply ignored (turnKey mismatch),
+        // so a new human message always starts clean. They are also cleared
+        // so state.json does not accumulate stale exits.
+        if (sup.loopExit) {
+          if (sup.loopExit.turnKey === turnKey) {
+            const { reason, detail } = sup.loopExit
+            debug("loop-exit gate: standing down for", sessionId, "turn:", turnKey, "reason:", reason, "detail:", detail || "(none)")
+            await showToast(
+              client,
+              directory,
+              reason === "stuck"
+                ? `Supervision loop ended: stuck${detail ? ` — ${detail}` : ""}`
+                : "Supervision loop ended: completed",
+              reason === "stuck" ? "warning" : "info"
+            )
+            return
+          }
+          debug("loop-exit gate: discarding stale record from turn", sup.loopExit.turnKey, "current turn:", turnKey)
+          delete sup.loopExit
+          try { await supervisorStore.mutate(directory, sessionId, (s) => { delete s.loopExit }) } catch { /* best effort */ }
+        }
+
+        // ── THE per-turn runaway circuit breaker ─────────────────────────
+        //
+        // NOT the intended stop condition — supervisor_loop_exit above is.
+        // This counter exists only to bound a pathological loop (a judge
+        // repeating identical feedback, a model that never calls the tool).
+        // Its default is therefore RUNAWAY_CEILING (core/goal.mjs), high
+        // enough that hitting it means something is wrong, not that the task
+        // is done. An explicit `/supervisor retry N` or a config value still
+        // wins, because those are deliberate user choices.
+        //
         // Pre-increment check, mirroring bin/supervisor-on-stop.mjs — so
         // `/supervisor retry N` yields exactly N injections (the old
         // post-increment check yielded N-1, and `retry 1` yielded ZERO).
@@ -2549,8 +2732,8 @@ Do NOT call this tool:
         // ── Autopilot fast-path ──────────────────────────────────────────
         // Binding contract: autopilot is a STATIC nudge loop only. It never
         // decides progress/completion and never emits a deterministic STOP
-        // verdict — only the agent's own autopilot_exit tool call and this
-        // budget check may stop the loop. Neutral, bounded tool-activity
+        // verdict — only the agent's own supervisor_loop_exit tool call and
+        // this budget check may stop the loop. Neutral, bounded tool-activity
         // telemetry (context.toolActivityNote) may enrich the nudge as factual
         // context, but it is never branched on to change what the nudge says
         // or to author a judgment.
@@ -2571,7 +2754,7 @@ Do NOT call this tool:
 
 You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
 ${activityLine}
-When you have genuinely completed ALL work (not just one step), call the autopilot_exit tool to hand control back.
+When you have genuinely completed ALL work (not just one step), call the supervisor_loop_exit tool (reason: completed) to hand control back. If this nudge is looping without progress, call it with reason: stuck.
 
 Continue now.`
           // Gated by the same default-on `statusDiagram` flag the Claude Code
@@ -3247,6 +3430,7 @@ Call the tool now. Do not explain, just execute the tool call.`
       ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
       ...(supervisorAutoreviewTool ? { supervisor_autoreview: supervisorAutoreviewTool } : {}),
       ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
+      ...(supervisorLoopExitTool ? { supervisor_loop_exit: supervisorLoopExitTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
       debug("event received:", event.type)

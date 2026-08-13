@@ -192,7 +192,55 @@ by a per-turn probe string. 20/20 after the fix.
 
 Real hook entry point: Stop payload on stdin, real transcript jsonl, stdout decision contract. `SUPERVISOR_FAKE_JUDGE` makes it deterministic; `SUPERVISOR_CC_LIVE=1` uses the real judge. The goal-achieved case asserts the session goal is CLEARED (not left as `status:'achieved'`) and that `.supervisor/goal-achieved.log` carries the record — clearing must never be silent.
 
-### `test/e2e-opencode.test.mjs` → `describe("per-turn attempt budget")` — ONE stop mechanism
+### `test/loop-exit.test.mjs` + `test/loop-exit-parser.test.mjs` — THE stop mechanism
+
+**The agent ends the loop, not the counter.** A fixed per-turn budget (3 for
+reflection, 16 for goal/autopilot) stood the supervisor down mid-task: the cap
+was reached while the work was still half-finished, and the human saw an
+abandoned turn with no explanation. A number chosen in advance cannot know
+whether a task is done.
+
+The stop is now an explicit declaration by the agent, with a reason:
+
+| runtime | signal | why it differs |
+|---|---|---|
+| opencode | `supervisor_loop_exit` tool, `{reason, detail}` | plugin registers tools |
+| Claude Code | `SUPERVISOR_LOOP_EXIT: completed` / `: stuck — why`, alone on its own line | Stop hook has NO tool registry — text sentinel is the only channel |
+
+`reason` is `completed` (task genuinely finished) or `stuck` (the supervisor is
+looping, demanding the impossible, or asking for something already done).
+`stuck` is deliberately available to the agent: the model is the only party
+that can see the loop from inside it.
+
+**One parser, both runtimes** — `parseLoopExitSentinel` (`core/loop-exit.mjs`).
+Line-anchored and fence-stripped, so the sentinel quoted inside the nudge that
+teaches it does not trigger it. `AUTOPILOT_EXIT` remains an alias for
+`completed`. Two regexes for one sentinel is the drift shape this repo keeps
+reproducing; there is exactly one.
+
+**The hint must be runtime-correct or it is dead text.** `buildEscalatingFeedback`
+is shared, so telling a Claude Code agent to "call the supervisor_loop_exit
+tool" names a tool absent from its catalog — the loop then has no reachable
+stop at all. `opts.loopExitStyle` (`'tool'` default | `'sentinel'`) picks the
+wording; CC passes `'sentinel'`. Both variants are filtered out of
+`hasFeedbackBody`'s body check, or appending a line to every message silently
+kills the empty-injection guard — the exact status-directive footgun documented
+above. Arity is unchanged (AGENTS.md pins it; `test/feedback.test.mjs` asserts).
+
+**Side effects are asymmetric on purpose.** `completed` leaves an active goal
+untouched. `stuck` pauses it (status `paused`, condition retained) and appends
+to `.supervisor/loop-exit.log` so a doom loop leaves forensic evidence. Neither
+ever `delete state.goal` — that footgun is documented at the `autopilot_exit`
+call site and was hit for real in live validation.
+
+**The gate is a plain `return`,** not a counter saturation: it is a cheap
+idempotent read of persisted state, so saturating would make it
+indistinguishable from a spent budget and fire the cap branch's side effects
+(`setAutopilot(false)`, goal transitions) on a later idle. See "Eligibility
+gates must NOT saturate the counter" below. A `loopExit` record is keyed to its
+turn, so a stale one from a previous turn never suppresses a new human turn.
+
+### `test/e2e-opencode.test.mjs` → `describe("per-turn attempt budget")` — the runaway circuit breaker
 
 The opencode runtime could inject **at most once per human turn**. Claude Code
 could not — the two had silently diverged, and there was no opencode-path test
@@ -205,19 +253,22 @@ messages, so the turn key stays pinned to the last HUMAN message — that is wha
 makes a per-turn counter possible, and it stays. What changed is the STOP
 condition. `if (lastUserMsgId === lastReflectedId) return` (a boolean set at 22
 sites, deleted at none, including immediately after a *successful* injection)
-is gone. The single stop is `attempts >= effectiveMaxAttempts`, checked
-**pre-increment** exactly as `bin/supervisor-on-stop.mjs:875` does — the old
-opencode check was post-increment, so the real budget was N−1 and
-`/supervisor retry 1` yielded ZERO injections.
+is gone. The remaining counter check is `attempts >= effectiveMaxAttempts`,
+checked **pre-increment** exactly as `bin/supervisor-on-stop.mjs:875` does —
+the old opencode check was post-increment, so the real budget was N−1 and
+`/supervisor retry 1` yielded ZERO injections. It is no longer the INTENDED
+stop (see `supervisor_loop_exit` above); it is the runaway circuit breaker that
+bounds the loop when the agent never declares an exit.
 
 **Termination** is proved, not asserted: `settleInjections` always burns a full
 15s quiet window after the last change, i.e. it is a bounded wait for an
 injection N+1 that must never arrive. The counter is monotonic within a turn,
 every injection path writes count+1 *before* prompting (a failed `promptAsync`
 still costs an attempt — fail toward termination), and the turn ends after at
-most `effectiveMaxAttempts` injections. The suite is also proven SENSITIVE:
-re-adding the one deleted stand-down line after a successful injection turns
-"3 injections" into 1.
+most `effectiveMaxAttempts` injections. That bound still holds with the breaker
+set to `RUNAWAY_CEILING`; `supervisor_loop_exit` terminates far earlier in
+practice. The suite is also proven SENSITIVE: re-adding the one deleted
+stand-down line after a successful injection turns "3 injections" into 1.
 
 **Two tiers, one counter.** `attempts` is persisted via `sessionStore`
 (`.supervisor/sessions/<id>/state.json`, locked `mutate()` — the lost-update
@@ -245,10 +296,13 @@ turn gate by design, so with a real budget it burned the whole thing on its own
 command turn.
 
 **Budgets are now ONE rule** (`resolveTurnMaxAttempts`, core/goal.mjs), applied
-by both runtimes: `/supervisor retry N` > config > 16 for goal/autopilot > 3 for
-plain reflection, then clamped to the runtime's platform ceiling (Claude Code
-has one, opencode does not). opencode previously used 16 for everything, which
-was invisible only because its boolean gate made the budget unreachable.
+by both runtimes: `/supervisor retry N` > config > env
+(`SUPERVISOR_MAX_ATTEMPTS` / `REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING`
+(50) for every mode, then clamped to the runtime's platform ceiling (Claude
+Code has one, opencode does not). The old per-mode defaults (16 goal/autopilot,
+3 reflection) are gone — a low default IS the premature-stand-down bug. An
+explicit override at any of the first three tiers is a deliberate operator
+choice and still wins.
 
 ### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
 

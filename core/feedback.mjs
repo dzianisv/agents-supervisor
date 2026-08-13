@@ -31,6 +31,33 @@ function nonBlankStrings(value) {
 }
 
 /**
+ * The one line that tells the agent how to END the supervision loop. Appended
+ * to EVERY continuation message: the model can only call a tool it has been
+ * told about, and this tool — not the attempt counter — is now the intended
+ * stop condition.
+ *
+ * It is boilerplate, so hasFeedbackBody() filters it out of the body check —
+ * otherwise the empty-injection guard becomes dead code, exactly as the status
+ * directive once made it.
+ */
+export const LOOP_EXIT_HINT =
+  'If this task is genuinely complete, or if this feedback is looping without progress, call the supervisor_loop_exit tool (reason: completed | stuck) to end supervision.'
+
+/**
+ * The Claude Code variant. The CC runtime is a Stop hook with NO tool
+ * registry, so the tool wording above is a dead instruction there — the agent
+ * is told to call something that is not in its catalog and the loop never
+ * ends. CC signals with a text sentinel instead (core/loop-exit.mjs).
+ *
+ * Both variants must stay out of hasFeedbackBody()'s body check below.
+ */
+export const LOOP_EXIT_HINT_SENTINEL =
+  'If this task is genuinely complete, or if this feedback is looping without progress, output `SUPERVISOR_LOOP_EXIT: completed` (or `SUPERVISOR_LOOP_EXIT: stuck \u2014 why`) ALONE on its own line to end supervision.'
+
+/** All boilerplate loop-exit hints, by `opts.loopExitStyle`. */
+const LOOP_EXIT_HINTS = { tool: LOOP_EXIT_HINT, sentinel: LOOP_EXIT_HINT_SENTINEL }
+
+/**
  * True when the judge's verdict carries NOTHING actionable: no missing items,
  * no next actions, and no feedback text once whitespace is stripped.
  *
@@ -72,6 +99,8 @@ export function hasFeedbackBody(text) {
     .slice(1) // line 0 is the headline
     .filter((l) => l.trim() !== '')
     .filter((l) => !/^(Please address these issues and continue\.|This assessment was not fully confident)/.test(l.trim()))
+    // The loop-exit hint is boilerplate appended to every message — never body.
+    .filter((l) => l.trim() !== LOOP_EXIT_HINT && l.trim() !== LOOP_EXIT_HINT_SENTINEL)
   return body.length > 0
 }
 
@@ -111,6 +140,10 @@ export function hasFeedbackBody(text) {
  *   directive. Defaults ON (the directive is default-on); callers pass
  *   `isStatusDiagramEnabled(state)` so `/supervisor:status off` silences the
  *   reflection path too, not just the autopilot nudge.
+ * @param {'tool'|'sentinel'} [opts.loopExitStyle='tool'] which loop-exit
+ *   instruction to render. OpenCode has the real `supervisor_loop_exit` tool
+ *   ('tool', the default); the Claude Code Stop hook has no tool registry and
+ *   must be told the text sentinel ('sentinel') or the loop can never end.
  */
 export function buildEscalatingFeedback(
   severity,
@@ -169,6 +202,7 @@ ${missing}
 ${nextActions}
 ${goalSection}
 
-${closing}`
+${closing}
+${LOOP_EXIT_HINTS[opts?.loopExitStyle] ?? LOOP_EXIT_HINT}`
   return opts?.statusDirective === false ? rendered : appendStatusDirective(rendered)
 }

@@ -1,5 +1,48 @@
 # status
 
+## Track E — agent-declared loop exit (replaces static retry counter)
+
+Task: static per-turn retry budget (3 reflection / 16 goal) stood the
+supervisor down before the task was finished. Replace "counter decides" with
+"agent declares", keep the counter only as a runaway breaker.
+
+```
+ROADMAP  ████████████████████  6/6 done
+ [x] 1. supervisor_loop_exit tool (opencode) + loopExit state + idle gate
+ [x] 2. counter demoted -> RUNAWAY_CEILING=50, all modes
+ [x] 3. CC parity: SUPERVISOR_LOOP_EXIT sentinel, shared core/loop-exit.mjs
+ [x] 4. runtime-correct exit hint in every injected message
+ [x] 5. all 3 suites green, re-run independently by me
+ [x] 6. AGENTS.md stop-mechanism section rewritten
+
+WHY SLOW
+ - first subagent reported "E2E pass" but never ran e2e-cc.mjs; its ceiling
+   change had already broken a CC test. Caught on the parity pass.
+ - E2E is ~4.5 min; ran full suite 3x to verify independently
+
+NEXT
+ - commit
+```
+
+### Verified (re-run by me, not subagent-reported)
+
+| suite | command | result |
+|---|---|---|
+| unit/integration | `npm test` | 708 pass / 0 fail, 87 suites |
+| opencode E2E | `npm run test:e2e` | 20 pass / 0 fail, 6 suites |
+| Claude Code E2E | `node test/e2e-cc.mjs` | 18 pass / 0 fail (was 12) |
+
+### Design locked
+
+- Two runtimes, one parser (`core/loop-exit.mjs`). opencode = tool, CC = text
+  sentinel (Stop hook has no tool registry).
+- `completed` leaves an active goal untouched; `stuck` pauses it and writes
+  `.supervisor/loop-exit.log`. Neither ever deletes the goal.
+- Idle gate is a plain `return`, never a counter saturation.
+- `AUTOPILOT_EXIT` kept as alias for `completed`.
+
+---
+
 ## Track C — OpenClawBot "runaway supervisor" (2026-08-07) — CLOSED
 
 ```

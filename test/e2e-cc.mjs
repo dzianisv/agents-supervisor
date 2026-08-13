@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { verdictsPath } from '../core/session-store.mjs';
+import { goalStore, readGoalAchievedLog } from '../core/goal.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
@@ -175,9 +176,14 @@ function driftTurnsWithText(text) {
   ];
 }
 
+// The counter is now a RUNAWAY CIRCUIT BREAKER (core/goal.mjs RUNAWAY_CEILING
+// = 50), not the intended stop — the agent ends the loop with the loop-exit
+// sentinel (covered below). So this case pins the breaker with an EXPLICIT
+// budget instead of relying on the old default of 3.
 check('attempt cap → stops injecting after max attempts', () => {
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-cap';
+  goalStore.setRetry(dir, sid, 3);
   let blocks = 0;
   for (let i = 0; i < 5; i++) {
     const text = `I added the route to server.js (pass ${i}). Next step: run the tests to verify it.`;
@@ -210,7 +216,6 @@ check('no-progress gate → 8 identical replies stand down on the 3rd', () => {
 });
 
 // ── Goal loop (Claude Code side) ──────────────────────────────────────────
-import { goalStore, readGoalAchievedLog } from '../core/goal.mjs';
 
 check('goal active + judge complete → goal achieved, no inject', () => {
   const { dir, tp } = mkSession(completeTurns);
@@ -272,6 +277,99 @@ check('goal raises retry budget past the default 3 (injects a 4th time)', () => 
     if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
   }
   assert.equal(blocks, 4, `goal budget should allow >3 injects, got ${blocks}`);
+});
+
+// ── Loop exit sentinel (the CC mirror of the supervisor_loop_exit tool) ────
+
+/** driftTurns with a custom assistant text — the sentinel rides in the reply. */
+function sentinelSession(text) {
+  const { dir, tp } = mkSession(driftTurns);
+  fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+  return { dir, tp, text };
+}
+
+check('loop-exit sentinel (completed) → stands down, no block, verdict records loop_exit', () => {
+  const { dir, tp, text } = sentinelSession('Done.\nSUPERVISOR_LOOP_EXIT: completed');
+  const sid = 'e2e-loopexit-done';
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'the sentinel must stand the supervisor down, not block');
+  assert.equal(verdict?.loop_exit, 'completed');
+  assert.equal(fs.existsSync(path.join(dir, '.supervisor', 'loop-exit.log')), false,
+    'completed must NOT write the doom-loop log');
+});
+
+check('loop-exit sentinel works in plain reflection mode (not just autopilot)', () => {
+  const { dir, tp, text } = sentinelSession('All set.\nSUPERVISOR_LOOP_EXIT: completed');
+  const { code, stdout } = runHook(
+    { session_id: 'e2e-loopexit-reflect', cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'reflection mode must honour the sentinel too');
+});
+
+check('loop-exit sentinel disarms autopilot', () => {
+  const { dir, tp, text } = sentinelSession('Finished.\nSUPERVISOR_LOOP_EXIT: completed');
+  const sid = 'e2e-loopexit-autopilot';
+  goalStore.setAutopilot(dir, sid, true);
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict?.autopilot, 'exited');
+  assert.notEqual(goalStore.load(dir, sid).mode, 'autopilot', 'autopilot must be disarmed');
+});
+
+check('loop-exit sentinel (stuck) → pauses the goal, KEEPS it, writes .supervisor/loop-exit.log', () => {
+  const { dir, tp, text } = sentinelSession('Blocked.\nSUPERVISOR_LOOP_EXIT: stuck — the supervisor keeps demanding a merged PR');
+  const sid = 'e2e-loopexit-stuck';
+  goalStore.setGoal(dir, sid, 'all tests pass');
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict?.loop_exit, 'stuck');
+  const goal = goalStore.load(dir, sid).goal;
+  assert.ok(goal, 'the goal must NOT be deleted by a loop exit');
+  assert.equal(goal.condition, 'all tests pass', 'the condition must be retained');
+  assert.equal(goal.status, 'paused');
+  const logPath = path.join(dir, '.supervisor', 'loop-exit.log');
+  assert.ok(fs.existsSync(logPath), 'stuck must leave forensic evidence');
+  const rec = JSON.parse(fs.readFileSync(logPath, 'utf8').trim().split('\n').pop());
+  assert.equal(rec.session, sid);
+  assert.equal(rec.reason, 'stuck');
+  assert.match(rec.detail, /merged PR/);
+});
+
+check('loop-exit sentinel mentioned mid-sentence does NOT stand the supervisor down', () => {
+  const text = 'I will output SUPERVISOR_LOOP_EXIT: completed once the tests pass. Next step: run them.';
+  const { dir, tp } = sentinelSession(text);
+  const { stdout } = runHook(
+    { session_id: 'e2e-loopexit-inline', cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(JSON.parse(stdout).decision, 'block', 'a passing mention must not end the loop');
+});
+
+check('CC-rendered feedback names the SENTINEL, never the tool', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const { stdout } = runHook(
+    { session_id: 'e2e-hint', cwd: dir, transcript_path: tp,
+      last_assistant_message: driftTurns[1].message.content[1].text },
+    fakeEnv('summary_drift_stop'),
+  );
+  const reason = JSON.parse(stdout).reason;
+  assert.match(reason, /SUPERVISOR_LOOP_EXIT: completed/);
+  assert.doesNotMatch(reason, /supervisor_loop_exit tool/,
+    'Claude Code has no tool registry — naming the tool is a dead instruction');
 });
 
 console.log(`\n${pass} passed, ${fail} failed${LIVE ? ' (LIVE judge)' : ' (fake judge)'}`);

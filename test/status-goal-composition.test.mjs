@@ -241,7 +241,7 @@ describe("autopilot nudge honours /supervisor:status off (opencode runtime)", ()
     await new Promise((r) => setTimeout(r, 400))
     const nudge = activePrompts()[0]?.text || ""
     assert.match(nudge, /Autopilot/, "the nudge itself must still be sent — only the directive is suppressed")
-    assert.match(nudge, /autopilot_exit/)
+    assert.match(nudge, /supervisor_loop_exit/)
     assert.ok(!nudge.includes(STATUS_DIRECTIVE_MARKER), "toggle off must suppress the directive")
   })
 })

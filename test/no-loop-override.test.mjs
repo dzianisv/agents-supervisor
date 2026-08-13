@@ -8,7 +8,7 @@
  *
  *   - autopilot: a STATIC nudge loop only — it never decides there is a
  *     "loop", never emits a scripted STOP verdict; only the agent's own
- *     autopilot_exit tool call and the attempt-budget check may stop it.
+ *     supervisor_loop_exit tool call and the attempt-budget check may stop it.
  *   - reflection: the judge's own verdict (severity/reason/missing/
  *     next_actions) is the ONLY completion/progress authority. Deterministic
  *     tool-call telemetry may appear in the judge's PROMPT as non-binding
@@ -169,7 +169,7 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
     assert.doesNotMatch(nudgeText, /DO NOT:/)
     assert.doesNotMatch(nudgeText, /Start coding NOW/)
     assert.match(nudgeText, /Autopilot/)
-    assert.match(nudgeText, /autopilot_exit/)
+    assert.match(nudgeText, /supervisor_loop_exit/)
   })
 })
 

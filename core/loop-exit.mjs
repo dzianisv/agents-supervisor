@@ -1,0 +1,53 @@
+/**
+ * loop-exit.mjs — THE shared parser for the agent-declared end of the
+ * supervision loop.
+ *
+ * The OpenCode runtime gets a real tool (`supervisor_loop_exit`). The Claude
+ * Code runtime is a Stop hook: it has no tool registry, so the same signal
+ * arrives as a TEXT SENTINEL the agent prints on its own line:
+ *
+ *     SUPERVISOR_LOOP_EXIT: completed
+ *     SUPERVISOR_LOOP_EXIT: stuck — the supervisor keeps demanding a merged PR
+ *
+ * ONE parser, shared, so the two runtimes cannot drift on what counts as an
+ * exit. Strictness matches the existing AUTOPILOT_EXIT regex: the sentinel must
+ * own its line, so a passing mention inside prose ("I'll print
+ * SUPERVISOR_LOOP_EXIT when done") never ends the loop. Fenced code blocks are
+ * stripped first — the nudge that TELLS the agent about the sentinel quotes it,
+ * and a quoted example must not fire.
+ */
+
+/** Canonical sentinel keyword. */
+export const LOOP_EXIT_SENTINEL = 'SUPERVISOR_LOOP_EXIT';
+
+/**
+ * Backwards-compatible alias. `AUTOPILOT_EXIT` alone on a line predates the
+ * sentinel and existing tests/sessions depend on it; it means
+ * `reason: 'completed'`.
+ */
+const AUTOPILOT_EXIT_RE = /(^|\n)[ \t]*AUTOPILOT_EXIT[ \t]*(\n|$)/;
+
+const SENTINEL_RE = /(^|\n)[ \t]*SUPERVISOR_LOOP_EXIT[ \t]*:[ \t]*([^\n]*)(\n|$)/i;
+
+const FENCE_RE = /```[\s\S]*?(?:```|$)/g;
+
+/**
+ * @param {string} text final assistant text
+ * @returns {{reason:'completed'|'stuck', detail:string}|null}
+ */
+export function parseLoopExitSentinel(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  const scanned = text.replace(FENCE_RE, '\n');
+  const m = SENTINEL_RE.exec(scanned);
+  if (m) {
+    const rest = (m[2] || '').trim();
+    // First whitespace-delimited token is the reason; everything after it (with
+    // a leading dash/em-dash separator dropped) is free-text detail.
+    const [word = '', ...tail] = rest.split(/\s+/);
+    const reason = word.toLowerCase().replace(/[.,;:]+$/, '') === 'stuck' ? 'stuck' : 'completed';
+    const detail = tail.join(' ').replace(/^[\s—–-]+/, '').trim();
+    return { reason, detail };
+  }
+  if (AUTOPILOT_EXIT_RE.test(scanned)) return { reason: 'completed', detail: 'AUTOPILOT_EXIT' };
+  return null;
+}

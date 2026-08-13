@@ -88,24 +88,28 @@ export function resolveMaxAttempts(opts = {}) {
  * The plain-reflection per-turn budget: how many times the supervisor may push
  * an agent that never asked for an autonomous loop.
  *
- * 3, not DEFAULT_MAX_ATTEMPTS (16). Reflection is armed for EVERY session by
- * default, and each attempt costs a judge round-trip plus a full agent turn.
- * If three verdicts have not moved the agent, a fourth identical nudge is not
- * the fix — that is precisely the "15 consecutive identical injections"
- * pathology this repo already carries a guard for. 16 is reserved for the
- * modes the user explicitly opted into (goal, autopilot) and for an explicit
- * `/supervisor retry N`.
- *
- * Env names are the ones the Claude Code hook has always honoured, so the two
- * runtimes read the SAME knob.
+ * NO LONGER THE DEFAULT PATH. `resolveTurnMaxAttempts` used to fall back to 3
+ * here for plain reflection, which made the counter — not the agent — decide
+ * the task was over, and it stood down mid-task. The default is now
+ * RUNAWAY_CEILING for every mode; this function survives only to read the two
+ * env knobs BOTH runtimes have always honoured (an explicit operator choice,
+ * like `/supervisor retry N`). `opts.fallback` lets the caller supply the
+ * default used when neither env var is set.
  */
 export const DEFAULT_REFLECTION_MAX_ATTEMPTS = 3;
-export function resolveReflectionMaxAttempts(env = process.env) {
+/**
+ * The runaway circuit breaker. Not a completion signal: the intended stop is
+ * the agent's own `supervisor_loop_exit` tool call. This number only bounds a
+ * pathological loop (e.g. a judge repeating identical feedback forever).
+ */
+export const RUNAWAY_CEILING = 50;
+export function resolveReflectionMaxAttempts(env = process.env, opts = {}) {
+  const dflt = Number.isFinite(opts.fallback) ? opts.fallback : DEFAULT_REFLECTION_MAX_ATTEMPTS;
   const raw = parseInt(
-    env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS ?? String(DEFAULT_REFLECTION_MAX_ATTEMPTS),
+    env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS ?? String(dflt),
     10,
   );
-  return Number.isFinite(raw) ? Math.min(100, Math.max(1, raw)) : DEFAULT_REFLECTION_MAX_ATTEMPTS;
+  return Number.isFinite(raw) ? Math.min(100, Math.max(1, raw)) : dflt;
 }
 
 /**
@@ -118,11 +122,19 @@ export function resolveReflectionMaxAttempts(env = process.env) {
  * budget unreachable — the moment the counter became the real stop condition,
  * OpenCode would have started running 16 unattended pushes per human message.
  *
+ * THE COUNTER IS NO LONGER THE INTENDED STOP. It is a RUNAWAY CIRCUIT
+ * BREAKER. The intended stop is the agent explicitly calling the
+ * `supervisor_loop_exit` tool (reason: completed | stuck), which the idle
+ * handler honours before this budget is even consulted. A low default (3)
+ * made the supervisor stand down while the task was still unfinished — the
+ * counter was deciding completion, which it cannot observe. So every mode now
+ * falls back to RUNAWAY_CEILING; the number only exists to bound a pathology.
+ *
  * Rules (identical on both runtimes):
  *   - explicit `/supervisor retry N`   → N            (always wins)
  *   - config `maxAttempts:` in yaml    → that value
- *   - goal active or autopilot         → 16           (user opted into a loop)
- *   - plain reflection                 → 3
+ *   - anything else (goal/autopilot/
+ *     plain reflection alike)          → RUNAWAY_CEILING
  *   - then clamp to `hardCap` if the runtime has a platform ceiling
  *     (Claude Code does — see resolveClaudeCodeHardCap; OpenCode does not).
  *
@@ -134,11 +146,14 @@ export function resolveReflectionMaxAttempts(env = process.env) {
  * @param {object} [opts.env] for tests
  */
 export function resolveTurnMaxAttempts(opts = {}) {
-  const loopMode = opts.mode === 'goal' || opts.mode === 'autopilot';
+  // Env knobs stay honoured (both runtimes have always read them) — they are
+  // an explicit operator choice, exactly like `/supervisor retry N`. Only the
+  // implicit default changes: RUNAWAY_CEILING, never 3 and never 16.
+  const envBudget = resolveReflectionMaxAttempts(opts.env ?? process.env, { fallback: RUNAWAY_CEILING });
   const budget = resolveMaxAttempts({
     sessionOverride: opts.sessionOverride,
     config: opts.config,
-    fallback: loopMode ? DEFAULT_MAX_ATTEMPTS : resolveReflectionMaxAttempts(opts.env ?? process.env),
+    fallback: envBudget,
   });
   return Number.isFinite(opts.hardCap) ? Math.max(1, Math.min(budget, opts.hardCap)) : budget;
 }

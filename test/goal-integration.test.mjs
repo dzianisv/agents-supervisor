@@ -13,7 +13,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "nod
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
-import { readProjectGoalHistory } from "../core/goal.mjs"
+import { readProjectGoalHistory, RUNAWAY_CEILING } from "../core/goal.mjs"
 import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 
 // ---------------------------------------------------------------------------
@@ -273,8 +273,9 @@ describe("integration: supervisor goal loop", () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
-    // Write goal state with the per-turn attempt counter already at the goal
-    // budget (16) for the CURRENT turn, so the cap is genuinely reached.
+    // Write goal state with the per-turn attempt counter already at the
+    // runaway ceiling (RUNAWAY_CEILING) for the CURRENT turn, so the breaker
+    // is genuinely tripped.
     //
     // `state.attempts` is THE counter — `goal.attempts` is only a mirror of it
     // (see the mirroring block in opencode/supervisor-impl.ts and the identical
@@ -288,11 +289,11 @@ describe("integration: supervisor goal loop", () => {
       JSON.stringify({
         mode: "goal",
         autopilot: false,
-        attempts: { count: 16, turnKey: LAST_USER_MSG_ID, lastIso: new Date().toISOString() },
+        attempts: { count: RUNAWAY_CEILING, turnKey: LAST_USER_MSG_ID, lastIso: new Date().toISOString() },
         goal: {
           condition: "all tests pass",
           status: "active",
-          attempts: 16,
+          attempts: RUNAWAY_CEILING,
           tokenBaseline: 0,
           startedAt: Date.now() - 10000,
           deadline: Date.now() + 3600000,
@@ -341,7 +342,7 @@ describe("integration: supervisor goal loop", () => {
         goal: {
           condition: "all tests pass",
           status: "active",
-          attempts: 16,
+          attempts: RUNAWAY_CEILING,
           tokenBaseline: 0,
           startedAt: Date.now() - 10000,
           deadline: Date.now() + 3600000,

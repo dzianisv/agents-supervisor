@@ -42,6 +42,7 @@ import {
   extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
 } from '../core/task-context.mjs';
 import { shouldSkipReflection } from '../core/turn-classifier.mjs';
+import { parseLoopExitSentinel } from '../core/loop-exit.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -955,10 +956,18 @@ async function main() {
   // second or third push. We tolerate NO_PROGRESS_REPEAT_THRESHOLD - 1
   // consecutive repeats and stand down on the next one.
   const replyHash = hashReply(ctx.final_assistant_text);
-  // AUTOPILOT_EXIT must always reach 4a: it is the only thing that turns
-  // autopilot off, and standing down on a repeat of it would strand the
-  // session in autopilot forever.
-  const autopilotExiting = /(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text);
+  // The agent-declared end of the supervision loop. On OpenCode this is the
+  // `supervisor_loop_exit` TOOL; a Stop hook has no tool registry, so the same
+  // signal arrives as a text sentinel parsed by the SHARED parser
+  // (core/loop-exit.mjs) — one definition, two runtimes, no drift.
+  //
+  // It must always reach its handler below: it is the only agent-driven stop
+  // (the attempt counter is now just a runaway circuit breaker at
+  // RUNAWAY_CEILING=50), and standing down on a repeat of it would strand the
+  // session in autopilot — or in an endless loop — forever. `AUTOPILOT_EXIT`
+  // is still honoured, as an alias for `reason: 'completed'`.
+  const loopExit = parseLoopExitSentinel(ctx.final_assistant_text);
+  const autopilotExiting = !!loopExit;
   let priorReplyHash = null;
   let priorRepeatCount = 0;
   try {
@@ -982,23 +991,61 @@ async function main() {
     debug({ msg: 'no_progress_gate_persist_failed', session_id, err: String(e?.message ?? e) }, cwd);
   }
 
+  // 4a-0. LOOP EXIT (all modes). The old AUTOPILOT_EXIT was autopilot-only, so
+  // a goal-mode or plain-reflection agent had no way to end the loop at all.
+  // This handler is mode-agnostic and mirrors the OpenCode tool's semantics.
+  if (loopExit) {
+    const { reason, detail } = loopExit;
+    const at = Date.now();
+    // Forensic evidence for a doom loop, in the SAME format the OpenCode tool
+    // writes (opencode/supervisor-impl.ts). Best-effort, never throws.
+    if (reason === 'stuck') {
+      try {
+        fs.mkdirSync(path.join(cwd, '.supervisor'), { recursive: true });
+        fs.appendFileSync(
+          path.join(cwd, '.supervisor', 'loop-exit.log'),
+          JSON.stringify({ session: session_id, turnKey, reason, detail, at }) + '\n',
+        );
+      } catch { /* best effort */ }
+    }
+    // NEVER `delete state.goal`. A goal is long-lived user intent; "this
+    // turn's loop is over" says nothing about it. `stuck` pauses it and KEEPS
+    // the condition so the user can see and resume it. `completed` leaves it
+    // untouched — same as the OpenCode tool.
+    if (reason === 'stuck') {
+      try {
+        goalStore.mutate(cwd, session_id, (st) => {
+          if (st.goal && st.goal.status === 'active') {
+            st.goal = { ...st.goal, status: 'paused', lastReason: detail || 'agent reported stuck' };
+          }
+        });
+      } catch { /* best effort */ }
+    }
+    if (mode === 'autopilot') {
+      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* best effort */ }
+    }
+    writeVerdict(session_id, {
+      session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION,
+      loop_exit: reason, detail,
+      ...(mode === 'autopilot' ? { autopilot: 'exited' } : {}),
+    }, cwd);
+    debug({ msg: 'loop_exit', session_id, reason, detail, mode }, cwd);
+    process.exit(0);
+  }
+
   // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
   // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
   if (mode === 'autopilot' && !goal) {
+    // NOTE: the exit signal (AUTOPILOT_EXIT / SUPERVISOR_LOOP_EXIT) is handled
+    // in 4a-0 above, for ALL modes, via the single shared parser.
     const baseVerdict = { session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION };
-    if (/(^|\n)\s*AUTOPILOT_EXIT\s*(\n|$)/.test(ctx.final_assistant_text)) {
-      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
-      writeVerdict(session_id, { ...baseVerdict, autopilot: 'exited' }, cwd);
-      debug({ msg: 'autopilot_exit', session_id }, cwd);
-      process.exit(0);
-    }
     const nextAttempt = attempts + 1;
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     // Parity with the OpenCode autopilot nudge (opencode/supervisor-impl.ts):
     // the status/roadmap directive rides along with EVERY continuation, on
     // both runtimes. Gated by the same default-on `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
-    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`AUTOPILOT_EXIT\` ALONE on its own line (nothing else on that line) to hand control back.\n\nContinue now.`;
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead. The legacy \`AUTOPILOT_EXIT\` is still accepted.\n\nContinue now.`;
     const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
@@ -1164,7 +1211,9 @@ async function main() {
       // Same default-on flag the autopilot nudge above honours, so
       // `/supervisor:status off` silences BOTH continuation paths, not just
       // one of them.
-      { statusDirective: isStatusDiagramEnabled(goalState) },
+      // Claude Code has no tool registry: it must be told the TEXT SENTINEL,
+      // not the `supervisor_loop_exit` tool (which is OpenCode-only).
+      { statusDirective: isStatusDiagramEnabled(goalState), loopExitStyle: 'sentinel' },
     );
   }
 
