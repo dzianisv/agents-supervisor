@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
-import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled, goalResumeHintSuffix } from '../core/goal.mjs';
 import { resolveSessionId, listSessions, sessionStore } from '../core/session-store.mjs';
 
 const cwd = process.cwd();
@@ -66,6 +66,23 @@ if (cur) {
     line('effective mode', effectiveMode);
     // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
     line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
+    // Goal detail — reported HONESTLY, not just as "effective mode: goal".
+    // resolveSupervisorMode() reads state.mode regardless of goal.status, so
+    // a paused or exhausted goal used to be invisible here: 'effective mode'
+    // alone reads 'goal' either way, which looks exactly like an actively
+    // pushing goal. A goal that stopped and left no visible trace is a dead
+    // end nobody is told about — see AGENTS.md's goal-resume section.
+    if (goalState.goal) {
+      const g = goalState.goal;
+      line('goal status', g.status);
+      line('goal condition', g.condition);
+      line('goal attempts', String(g.attempts));
+      if (g.lastReason) line('goal last reason', g.lastReason);
+      const hint = goalResumeHintSuffix(g);
+      if (hint) console.log(hint.trim());
+    } else {
+      line('goal status', '(none)');
+    }
   } catch {
     line('effective mode', '(unknown)');
     line('status directive', 'on (default)');

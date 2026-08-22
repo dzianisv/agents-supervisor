@@ -203,16 +203,25 @@ describe("supervisor_loop_exit", () => {
     assert.equal(state.goal?.status, "paused")
   })
 
-  test("autopilot_exit stays a no-op outside autopilot mode", async () => {
+  test("supervisor_loop_exit does not touch autopilot state outside autopilot mode", async () => {
+    // The predecessor `autopilot_exit` tool is gone (it was a second tool for
+    // the same job and unconditionally called setAutopilot(false), which is
+    // the footgun documented above). This pins that `supervisor_loop_exit`
+    // itself only disarms autopilot when the session is actually in it.
+    // setGoal() puts the session in 'goal' mode (autopilot: false) — NOT
+    // autopilot mode — which is exactly the scenario the deleted tool got
+    // wrong.
     const msgs = makeMessages(TURN_ONE)
     const { client } = createMockClient(() => msgs)
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     goalStore.setGoal(tmpDir, SESSION_ID, "ship the thing")
-    goalStore.setMode(tmpDir, SESSION_ID, "reflection")
+    assert.equal(plugin.tool.autopilot_exit, undefined, "the predecessor autopilot_exit tool must not be registered")
 
-    const res = await plugin.tool.autopilot_exit.execute({}, { sessionID: SESSION_ID })
-    assert.equal(res.title, "Not in autopilot")
-    assert.equal(sessionStore.load(tmpDir, SESSION_ID).loopExit, undefined)
+    const res = await plugin.tool.supervisor_loop_exit.execute({ reason: "completed" }, { sessionID: SESSION_ID })
+    assert.match(String(res.title), /Supervision loop ended/)
+    const state = sessionStore.load(tmpDir, SESSION_ID)
+    assert.equal(state.autopilot, false, "goal mode must never flip autopilot true from a loop-exit call")
+    assert.equal(state.goal?.condition, "ship the thing", "the active goal must survive a loop-exit call outside autopilot")
   })
 })
 

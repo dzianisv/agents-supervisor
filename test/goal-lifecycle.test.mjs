@@ -27,7 +27,10 @@ import { dirname } from 'node:path';
 import {
   goalStore, writeProjectGoal, writeDerivedProjectGoal, readProjectGoalCondition,
   retireProjectGoal, readGoalAchievedLog, decideGoalTransition,
+  resumeGoal, goalResumeHintSuffix, withResumeHint, GOAL_RESUME_HINT,
+  parseSupervisorCommand, DEFAULT_MAX_GOAL_DURATION_MS,
 } from '../core/goal.mjs';
+import { sessionStore } from '../core/session-store.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -343,13 +346,17 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     );
   });
 
-  // Live-validation finding (test/live-validation.mjs scenario 9): `autopilot_exit`
-  // is registered plugin-wide, so it is in the tool catalog of EVERY session,
-  // including goal-mode ones. It used to call setAutopilot(false)
-  // unconditionally, which routes through setMode('reflection') ->
-  // `delete state.goal` — so one stray tool call destroyed the user's active
-  // goal, silently. Exiting a mode you are not in must be a no-op.
-  test('autopilot_exit is a no-op outside autopilot mode (it must not delete an active goal)', async () => {
+  // Live-validation finding (test/live-validation.mjs scenario 9): the
+  // predecessor `autopilot_exit` tool was registered plugin-wide, so it was
+  // in the tool catalog of EVERY session, including goal-mode ones. It used
+  // to call setAutopilot(false) unconditionally, which routes through
+  // setMode('reflection') -> `delete state.goal` — so one stray tool call
+  // destroyed the user's active goal, silently. That tool is now DELETED
+  // (opencode/supervisor-impl.ts) — `supervisor_loop_exit` is the one
+  // remaining exit signal, and this pins that it inherited the same
+  // protection: exiting a mode you are not in must be a no-op with respect
+  // to autopilot/goal state.
+  test('supervisor_loop_exit is a no-op on autopilot state outside autopilot mode (it must not delete an active goal)', async () => {
     // 1. The destructive primitive is real: setMode away from 'goal' drops the goal.
     const cwd = mkdtempSync(join(tmpdir(), 'sup-autopilot-exit-'));
     try {
@@ -359,24 +366,33 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
       assert.equal(
         goalStore.load(cwd, 'ses_autopilot_exit_probe').goal,
         undefined,
-        'setMode away from goal drops the goal — this is the primitive autopilot_exit used to call blindly'
+        'setMode away from goal drops the goal — this is the primitive the deleted autopilot_exit tool used to call blindly'
       );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
 
-    // 2. …so the tool must check the mode first.
+    // 2. The predecessor tool must be gone entirely — one signal, not two.
     const raw = await readFile(join(ROOT, 'opencode', 'supervisor-impl.ts'), 'utf-8');
     const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
-    const exitFn = src.slice(src.indexOf('const executeAutopilotExit'), src.indexOf('let setSupervisorTool'));
-    assert.ok(exitFn.length > 0, 'could not locate executeAutopilotExit');
     assert.ok(
-      /resolveSupervisorMode\(state\) === "autopilot"/.test(exitFn),
-      'autopilot_exit must only change state when autopilot is actually on'
+      !/\bexecuteAutopilotExit\b/.test(src) && !/\bautopilot_exit\b/.test(src),
+      'the predecessor autopilot_exit tool must be fully removed, not left dead alongside supervisor_loop_exit'
+    );
+
+    // 3. …so the surviving `supervisor_loop_exit` tool must check the mode
+    // before touching autopilot state, and must never delete the goal.
+    const exitFn = src.slice(src.indexOf('const executeSupervisorLoopExit'), src.indexOf('let setSupervisorTool'));
+    assert.ok(exitFn.length > 0, 'could not locate executeSupervisorLoopExit');
+    const setAutopilotCalls = exitFn.match(/setAutopilot\(directory, sid, false\)/g) || [];
+    assert.equal(setAutopilotCalls.length, 1, 'expected exactly one setAutopilot(false) call in supervisor_loop_exit');
+    assert.ok(
+      /if \(mode === "autopilot"\)\s*\{[\s\S]*?setAutopilot\(directory, sid, false\)/.test(exitFn),
+      'supervisor_loop_exit must only call setAutopilot(false) inside a mode === "autopilot" check'
     );
     assert.ok(
-      !/^\s*await supervisorStore\.setAutopilot\(directory, sid, false\)\s*$/m.test(exitFn.replace(/if \([^)]*\) \{[\s\S]*/, '')),
-      'autopilot_exit must not call setAutopilot unconditionally'
+      !/delete\s+s(tate)?\.goal/.test(exitFn),
+      'supervisor_loop_exit must never delete the goal outright — this is the exact footgun the deleted tool caused'
     );
   });
 
@@ -387,5 +403,258 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     assert.ok(src.includes('!actionlessVerdict'), 'hook must gate the normal inject on it');
     assert.ok(src.includes('no_inject_actionless_verdict'), 'hook must log the stand-down reason');
     assert.ok(src.includes('retireProjectGoal('), 'hook must retire an achieved project goal');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RESUME: a paused/exhausted goal is not a dead end.
+//
+// Before this phase, nothing anywhere flipped a paused or exhausted goal back
+// to active — the condition sat on disk forever, inert, with no indication
+// the user needed to re-type it from scratch. resumeGoal() (core/goal.mjs) is
+// the fix; these tests cover its full contract plus the parser/CLI wiring.
+// ---------------------------------------------------------------------------
+
+describe('resume: a paused goal is not a dead end', () => {
+  test('stuck -> paused -> resume -> active round-trip preserves the condition verbatim', () => {
+    const dir = tmp();
+    try {
+      const condition = 'all tests in test/auth pass and the PR is open with green CI';
+      goalStore.setGoal(dir, 'ses_resume_1', condition, {});
+
+      // Simulate the exact mutation both runtimes perform on supervisor_loop_exit
+      // reason:'stuck' (opencode/supervisor-impl.ts, bin/supervisor-on-stop.mjs).
+      sessionStore.mutate(dir, 'ses_resume_1', (s) => {
+        s.goal = { ...s.goal, status: 'paused', lastReason: withResumeHint('agent reported stuck: circular dependency') };
+      });
+      const paused = goalStore.load(dir, 'ses_resume_1').goal;
+      assert.equal(paused.status, 'paused');
+      assert.equal(paused.condition, condition, 'precondition: condition unchanged by the pause');
+
+      const outcome = resumeGoal(dir, 'ses_resume_1');
+      assert.equal(outcome.resumed, true);
+      assert.equal(outcome.previousStatus, 'paused');
+      assert.equal(outcome.status, 'active');
+      assert.equal(outcome.condition, condition);
+
+      const resumed = goalStore.load(dir, 'ses_resume_1').goal;
+      assert.equal(resumed.status, 'active');
+      assert.equal(resumed.condition, condition, 'the condition must survive the pause/resume round-trip VERBATIM');
+      assert.equal(resumed.lastReason, '', 'the stale pause reason must be cleared, not carried into the resumed goal');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resume with no goal at all returns an honest "no-goal" message and changes nothing', () => {
+    const dir = tmp();
+    try {
+      const outcome = resumeGoal(dir, 'ses_resume_none');
+      assert.equal(outcome.resumed, false);
+      assert.equal(outcome.reason, 'no-goal');
+      assert.equal(goalStore.load(dir, 'ses_resume_none').goal, undefined, 'resume must never CREATE a goal');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resume on an already-active goal is an honest no-op, not a fabricated success', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_active', 'ship it', {});
+      const before = goalStore.load(dir, 'ses_resume_active');
+
+      const outcome = resumeGoal(dir, 'ses_resume_active');
+      assert.equal(outcome.resumed, false);
+      assert.equal(outcome.reason, 'already-active');
+      assert.equal(outcome.status, 'active');
+      assert.equal(outcome.condition, 'ship it');
+
+      const after = goalStore.load(dir, 'ses_resume_active');
+      assert.deepEqual(after.goal, before.goal, 'nothing about an already-active goal may change');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resume on a terminal (achieved) goal reports the actual status and changes nothing', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_terminal', 'ship it', {});
+      sessionStore.mutate(dir, 'ses_resume_terminal', (s) => { s.goal = { ...s.goal, status: 'achieved' }; });
+
+      const outcome = resumeGoal(dir, 'ses_resume_terminal');
+      assert.equal(outcome.resumed, false);
+      assert.equal(outcome.reason, 'terminal');
+      assert.equal(outcome.status, 'achieved', 'the honest message must name the ACTUAL status, not a generic refusal');
+
+      const after = goalStore.load(dir, 'ses_resume_terminal').goal;
+      assert.equal(after.status, 'achieved', 'resume must not touch a terminal goal');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resume persists: a fresh read-back through goalStore.load shows the goal active', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_persist', 'ship it', {});
+      sessionStore.mutate(dir, 'ses_resume_persist', (s) => { s.goal = { ...s.goal, status: 'paused', lastReason: 'stuck' }; });
+
+      resumeGoal(dir, 'ses_resume_persist');
+
+      // Simulate a completely separate reader (e.g. a different process/CLI
+      // invocation) re-loading from disk — never trust the in-memory outcome
+      // object alone.
+      const reread = goalStore.load(dir, 'ses_resume_persist');
+      assert.equal(reread.goal.status, 'active');
+      assert.equal(reread.goal.condition, 'ship it');
+      assert.equal(reread.mode, 'goal', 'mode must be forced back to goal on resume');
+      assert.equal(reread.autopilot, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resume resets the per-turn attempt counter — both goal.attempts and the shared state.attempts', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_attempts', 'ship it', {});
+      sessionStore.mutate(dir, 'ses_resume_attempts', (s) => {
+        s.goal = { ...s.goal, status: 'paused', attempts: 12, lastTurnKey: 'old-turn-key' };
+        s.attempts = { count: 12, turnKey: 'old-turn-key', lastIso: new Date().toISOString() };
+      });
+      assert.equal(sessionStore.readAttempts(dir, 'ses_resume_attempts', 'old-turn-key'), 12, 'precondition: budget was spent');
+
+      resumeGoal(dir, 'ses_resume_attempts');
+
+      const state = goalStore.load(dir, 'ses_resume_attempts');
+      assert.equal(state.goal.attempts, 0, 'goal.attempts mirror must reset to 0');
+      assert.equal(state.goal.lastTurnKey, null, 'lastTurnKey must reset so the next stop treats this as a fresh turn');
+      // A brand-new turn key must read 0 — not just the OLD turn key, which
+      // would prove nothing (readAttempts already returns 0 for a stale key).
+      assert.equal(sessionStore.readAttempts(dir, 'ses_resume_attempts', 'a-brand-new-turn-key'), 0);
+      assert.equal(state.attempts, undefined, 'the shared per-turn counter object must be deleted entirely, not just zeroed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a deadline-exhausted goal resumes: deadline extended into the future, mode forced back to goal', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_deadline', 'ship it', {});
+      // Mirror exactly what both runtimes persist when decideGoalTransition
+      // reports action:'exhausted', reason:'deadline' (opencode additionally
+      // sets mode:'reflection' — see the deadline sites in supervisor-impl.ts
+      // and bin/supervisor-on-stop.mjs's finishExhaustedGoal).
+      sessionStore.mutate(dir, 'ses_resume_deadline', (s) => {
+        s.mode = 'reflection';
+        s.autopilot = false;
+        s.goal = { ...s.goal, status: 'exhausted', deadline: Date.now() - 1000, lastReason: withResumeHint('goal deadline reached') };
+      });
+
+      const before = Date.now();
+      const outcome = resumeGoal(dir, 'ses_resume_deadline');
+      assert.equal(outcome.resumed, true);
+      assert.equal(outcome.previousStatus, 'exhausted');
+
+      const state = goalStore.load(dir, 'ses_resume_deadline');
+      assert.equal(state.goal.status, 'active');
+      assert.equal(state.mode, 'goal', 'a resumed deadline-exhausted goal must be visible to the mode===goal filter again');
+      assert.equal(state.autopilot, false);
+      assert.ok(
+        state.goal.deadline > before,
+        `a deadline that already passed must be extended into the future on resume, got ${state.goal.deadline} vs now ${before}`
+      );
+      assert.ok(
+        state.goal.deadline >= before + DEFAULT_MAX_GOAL_DURATION_MS - 5000,
+        'the extension must be a fresh full-length window, not a token bump'
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a future (not-yet-passed) deadline is left untouched by resume — only an OVERDUE deadline is extended', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_future_deadline', 'ship it', {});
+      const originalDeadline = goalStore.load(dir, 'ses_resume_future_deadline').goal.deadline;
+      sessionStore.mutate(dir, 'ses_resume_future_deadline', (s) => {
+        s.goal = { ...s.goal, status: 'paused', lastReason: 'stuck' };
+      });
+
+      resumeGoal(dir, 'ses_resume_future_deadline');
+
+      const state = goalStore.load(dir, 'ses_resume_future_deadline');
+      assert.equal(state.goal.deadline, originalDeadline, 'an ordinary stuck-pause with a future deadline must not get a bonus extension');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('user-wait "pause" never persists a status change — resume correctly reports already-active, nothing to do', () => {
+    // bin/supervisor-on-stop.mjs's goal_paused_user_wait branch (the third
+    // "pause" site) writes ONLY a transient verdictRecord.goal='paused' log
+    // entry — it never touches state.goal.status, which stays 'active' the
+    // entire time. There is no real dead end here; resume must say so
+    // honestly rather than inventing a resume that already happened.
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_userwait', 'ship it', {});
+      // No status mutation — this IS the user-wait "pause": state.goal.status
+      // is never anything but 'active'.
+      const outcome = resumeGoal(dir, 'ses_resume_userwait');
+      assert.equal(outcome.resumed, false);
+      assert.equal(outcome.reason, 'already-active');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('goalStore.resumeGoal is wired to the same function (facade parity with setGoal/clearGoal)', () => {
+    const dir = tmp();
+    try {
+      goalStore.setGoal(dir, 'ses_resume_facade', 'ship it', {});
+      sessionStore.mutate(dir, 'ses_resume_facade', (s) => { s.goal = { ...s.goal, status: 'paused' }; });
+      const outcome = goalStore.resumeGoal(dir, 'ses_resume_facade');
+      assert.equal(outcome.resumed, true);
+      assert.equal(goalStore.load(dir, 'ses_resume_facade').goal.status, 'active');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('goalResumeHintSuffix: only for paused/exhausted goals, empty otherwise', () => {
+    assert.equal(goalResumeHintSuffix(null), '');
+    assert.equal(goalResumeHintSuffix(undefined), '');
+    assert.equal(goalResumeHintSuffix({ status: 'active' }), '');
+    assert.equal(goalResumeHintSuffix({ status: 'achieved' }), '');
+    assert.equal(goalResumeHintSuffix({ status: 'cleared' }), '');
+    assert.match(goalResumeHintSuffix({ status: 'paused' }), /set-goal resume/);
+    assert.match(goalResumeHintSuffix({ status: 'exhausted' }), /set-goal resume/);
+  });
+
+  test('withResumeHint appends the canonical hint without leaving a dangling separator on an empty reason', () => {
+    assert.equal(withResumeHint(''), GOAL_RESUME_HINT);
+    assert.equal(withResumeHint(undefined), GOAL_RESUME_HINT);
+    assert.equal(withResumeHint('agent reported stuck'), `agent reported stuck ${GOAL_RESUME_HINT}`);
+  });
+
+  test('parseSupervisorCommand: "set-goal resume" and "unpause" parse to goal-resume — never /supervisor goal', () => {
+    assert.deepEqual(parseSupervisorCommand('set-goal', 'resume'), { kind: 'goal-resume' });
+    assert.deepEqual(parseSupervisorCommand('set-goal', 'RESUME'), { kind: 'goal-resume' });
+    assert.deepEqual(parseSupervisorCommand('set-goal', 'unpause'), { kind: 'goal-resume' });
+    assert.deepEqual(parseSupervisorCommand('supervisor', 'set-goal resume'), { kind: 'goal-resume' });
+    // legacy bare-`goal` alias still resolves internally — it must simply
+    // never be the string shown to a user (test/manifest.test.mjs pins that).
+    assert.deepEqual(parseSupervisorCommand('goal', 'resume'), { kind: 'goal-resume' });
+    // a condition that happens to start with the word "resume" must still be
+    // treated as a real condition, not swallowed by the alias check.
+    assert.deepEqual(
+      parseSupervisorCommand('set-goal', 'resume shipping the v2 feature'),
+      { kind: 'goal-set', condition: 'resume shipping the v2 feature' }
+    );
   });
 });

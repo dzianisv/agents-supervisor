@@ -233,11 +233,18 @@ function buildResponder(hooks = {}) {
     // continuation or status correction). Answer in prose.
     //
     // DELIBERATELY NOT the shipped fixture's fallback, which calls
-    // `autopilot_exit` whenever that tool is offered — and it is offered
-    // plugin-wide, on every session. In a GOAL-mode session that call runs
-    // setAutopilot(false) -> setMode("reflection") -> `delete state.goal`,
-    // i.e. it silently destroys the user's active goal. That wiped the seeded
-    // goal in scenario 9 before the migration assertion could read it.
+    // `supervisor_loop_exit` whenever that tool is offered — and it is
+    // offered plugin-wide, on every session. This scenario builder wants
+    // exact, predictable prose replies instead, not a tool round-trip that
+    // could end a scenario's autopilot/goal loop out from under it.
+    // (Historical note: the PREDECESSOR `autopilot_exit` tool made this a
+    // safety requirement, not just a convenience — it called
+    // setAutopilot(false) -> setMode("reflection") -> `delete state.goal`
+    // unconditionally, silently destroying a goal-mode session's goal. That
+    // wiped the seeded goal in scenario 9 before the migration assertion
+    // could read it. `supervisor_loop_exit` itself no longer has that
+    // footgun — see AGENTS.md's stop-mechanism section — but this builder
+    // still avoids the shipped fallback for determinism.)
     return { text: DEFAULT_AGENT_REPLY }
   }
 }

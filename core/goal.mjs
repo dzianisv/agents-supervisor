@@ -59,8 +59,18 @@ export function resolveClaudeCodeHardCap(env = process.env) {
 }
 
 const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'cancel']);
+// A paused/exhausted goal used to be a dead end — nothing anywhere flipped it
+// back to active, so the user's only recovery was re-typing the whole
+// condition with no indication that was necessary. `resume`/`unpause` are the
+// explicit recovery verbs; see resumeGoal() below.
+const GOAL_RESUME_ALIASES = new Set(['resume', 'unpause']);
 const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
 const AUTOPILOT_COMPAT_ALIASES = new Set(['static', 'reminder', 'auto-reminder']);
+// Statuses resumeGoal() will revive. 'active' is already running (nothing to
+// resume); 'achieved'/'cleared' are terminal and immediately deleted by
+// clearGoal/retireProjectGoal, so a persisted goal object in either state
+// essentially never exists — but the check stays honest either way.
+const GOAL_RESUMABLE_STATUSES = new Set(['paused', 'exhausted']);
 
 export function resolveSupervisorMode(state = {}) {
   if (SUPERVISOR_MODE_SET.has(state.mode)) return state.mode;
@@ -189,6 +199,7 @@ export function parseSupervisorCommand(name, args) {
   if (name === 'set-goal' || name === 'goal' || name === 'solofounder') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
+    if (GOAL_RESUME_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-resume' };
     return { kind: 'goal-set', condition: trimmed.slice(0, GOAL_CONDITION_MAX_LEN) };
   }
   if (name === 'retry') {
@@ -268,6 +279,101 @@ export function decideGoalTransition({ goal, complete, now, maxAttempts, reason 
   return { action: 'continue', goal: { ...goal, status: 'active', attempts: goal.attempts + 1, lastReason } };
 }
 
+/**
+ * Canonical recovery hint for a goal that just got paused/exhausted. Both
+ * runtimes point at the SAME command name (`/supervisor:set-goal resume`,
+ * README's "deliberately named on both runtimes" rule) so whichever site
+ * paused the goal, the reader is told the one true way back — never a silent
+ * dead end. Used both in `lastReason` (the only user-visible channel the
+ * Claude Code Stop hook has — it cannot show a passive message the instant it
+ * pauses a goal) and in toasts/status text on OpenCode.
+ */
+export const GOAL_RESUME_HINT = "Run `/supervisor:set-goal resume` (or `supervisor set-goal resume` from the CLI) to pick it back up.";
+
+/** Append GOAL_RESUME_HINT to a reason string, never producing a doubled-up or leading-space result. */
+export function withResumeHint(reason) {
+  const base = (reason ?? '').trim();
+  return base ? `${base} ${GOAL_RESUME_HINT}` : GOAL_RESUME_HINT;
+}
+
+/** Status-output suffix for a resumable goal; '' when the goal is not paused/exhausted (or absent). */
+export function goalResumeHintSuffix(goal) {
+  if (!goal || !GOAL_RESUMABLE_STATUSES.has(goal.status)) return '';
+  return `\n${GOAL_RESUME_HINT}`;
+}
+
+/**
+ * Resume a paused or exhausted goal: flips status back to 'active', keeps the
+ * condition VERBATIM, clears the stale lastReason (the pause hint it was
+ * carrying is now moot), resets the per-turn attempt counter (both
+ * goal.attempts AND the shared state.attempts object — two independently
+ * updated counters for one budget was issue #57; deleting state.attempts
+ * makes sessionStore.readAttempts() return 0 for whatever turn key comes
+ * next), and restamps lastTurnKey to null so the very next stop treats this
+ * as a brand-new turn (same initial value setGoal() uses).
+ *
+ * Forces mode back to 'goal' and autopilot off: the OpenCode deadline path
+ * sets mode:'reflection' on exhaustion (decideGoalTransition's 'deadline'
+ * reason), and resolveSupervisorMode() trusts an explicit state.mode over
+ * goal.status — so without this, a resumed deadline-exhausted goal would stay
+ * invisible to the mode==='goal' filter both runtimes use.
+ *
+ * If the OLD deadline has already passed, resume extends it by
+ * maxDurationMs from now — otherwise the very next stop-hook pass re-triggers
+ * decideGoalTransition's `now >= goal.deadline` branch and re-exhausts the
+ * goal instantly, turning "resume" into a trap. A deadline still in the
+ * future (the ordinary stuck-pause case) is left untouched.
+ *
+ * NEVER a silent no-op: returns `{resumed:false, reason, status, condition}`
+ * for every case that isn't a genuine resume (no goal at all; already active;
+ * terminal achieved/cleared) so the caller can print an honest message
+ * instead of reporting success for nothing — the same discipline the
+ * off/on toggle uses (see AGENTS.md's `/supervisor off` history).
+ *
+ * Uses sessionStore.mutate — never load()+save() — so a resume racing another
+ * writer (e.g. a stop-hook pass persisting attempts) cannot clobber a field it
+ * never intended to touch.
+ *
+ * @returns {{resumed:boolean, reason?:string, previousStatus?:string, status:string, condition?:string}}
+ */
+export function resumeGoal(cwd, sessionId, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const maxDurationMs = opts.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS;
+  let outcome;
+  sessionStore.mutate(cwd, sessionId, (state) => {
+    const goal = state.goal;
+    if (!goal) {
+      outcome = { resumed: false, reason: 'no-goal', status: 'none' };
+      return state;
+    }
+    if (!GOAL_RESUMABLE_STATUSES.has(goal.status)) {
+      outcome = {
+        resumed: false,
+        reason: goal.status === 'active' ? 'already-active' : 'terminal',
+        status: goal.status,
+        condition: goal.condition,
+      };
+      return state;
+    }
+    const previousStatus = goal.status;
+    const deadline = now >= goal.deadline ? now + maxDurationMs : goal.deadline;
+    state.goal = {
+      ...goal,
+      status: 'active',
+      attempts: 0,
+      lastReason: '',
+      lastTurnKey: null,
+      deadline,
+    };
+    state.mode = 'goal';
+    state.autopilot = false;
+    delete state.attempts;
+    outcome = { resumed: true, previousStatus, status: 'active', condition: goal.condition };
+    return state;
+  });
+  return outcome;
+}
+
 // --- per-session store (sync) ---------------------------------------------
 //
 // The on-disk layer moved to core/session-store.mjs — ONE accessor shared by
@@ -312,6 +418,10 @@ export const goalStore = {
       state.autopilot = false;
       return state;
     });
+  },
+  /** See resumeGoal() above — kept as a goalStore method for API parity with setGoal/clearGoal. */
+  resumeGoal(cwd, sessionId, opts = {}) {
+    return resumeGoal(cwd, sessionId, opts);
   },
   setMode(cwd, sessionId, mode) {
     if (!SUPERVISOR_MODE_SET.has(mode)) throw new Error(`Invalid supervisor mode: ${JSON.stringify(mode)}`);

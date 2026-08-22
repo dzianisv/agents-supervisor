@@ -306,11 +306,12 @@ export function startFixtureLlmServer(opts = {}) {
       // Any other tool-enabled turn (e.g. an autopilot continuation nudge
       // injected into the active session by the supervisor's own
       // session.idle handler) — never fabricate an unrelated tool call.
-      // Prefer a graceful, deterministic exit: call autopilot_exit if it's
-      // offered (ends the autopilot loop immediately); otherwise just stop.
-      const hasExitTool = (data.tools || []).some((t) => t?.function?.name === "autopilot_exit")
+      // Prefer a graceful, deterministic exit: call supervisor_loop_exit if
+      // it's offered (ends the autopilot loop immediately); otherwise just
+      // stop. The predecessor `autopilot_exit` tool no longer exists.
+      const hasExitTool = (data.tools || []).some((t) => t?.function?.name === "supervisor_loop_exit")
       if (hasExitTool) {
-        callTool("autopilot_exit", {})
+        callTool("supervisor_loop_exit", { reason: "completed" })
         return
       }
       finishWithText("Acknowledged.")

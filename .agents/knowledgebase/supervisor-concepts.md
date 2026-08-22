@@ -40,7 +40,7 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 
 - Autopilot is available on both Claude Code and OpenCode.
 - In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the attempt-budget check, never by any loop check.
-- Autopilot stops when the agent calls `autopilot_exit` (OpenCode) / outputs `AUTOPILOT_EXIT` (Claude Code) or the retry budget exhausts. Those are the ONLY two ways autopilot stops.
+- Autopilot stops when the agent declares `supervisor_loop_exit` (OpenCode tool call) / outputs `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the retry budget exhausts. Those are the ONLY two ways autopilot stops. (`core/loop-exit.mjs` keeps a parse-only legacy alias for stale installed skill copies — not taught here or anywhere else shipped.)
 - Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
 
 ## Tool-Activity Telemetry

@@ -11,18 +11,27 @@ opencode supervisor plugin — reflection, goal-tracking, autopilot for opencode
 
 ## Commands
 
+**The `opencode` binary must be on PATH before running the E2E — it is
+commonly installed at `~/.opencode/bin/opencode`, which is NOT on the default
+PATH.** Without it, `test/e2e-opencode.test.mjs` throws immediately (loud,
+non-zero exit — see below) instead of silently skipping:
+
+```bash
+export PATH="$HOME/.opencode/bin:$PATH"
+```
+
 ```bash
 # Unit/integration tests (E2E is deliberately EXCLUDED — see below)
 npm test
 
-# opencode server E2E test (MUST pass before commit)
-npm run test:e2e
+# opencode server E2E test (MUST pass before commit) — needs opencode on PATH, see above
+export PATH="$HOME/.opencode/bin:$PATH" && npm run test:e2e
 
 # Both, sequentially — never concurrently
-npm run test:all
+export PATH="$HOME/.opencode/bin:$PATH" && npm run test:all
 
 # Live validation against a real `opencode serve` (evidence, not assertions)
-node --experimental-strip-types test/live-validation.mjs
+export PATH="$HOME/.opencode/bin:$PATH" && node --experimental-strip-types test/live-validation.mjs
 
 # Claude Code E2E test
 node test/e2e-cc.mjs
@@ -37,6 +46,14 @@ node evals/judge-eval.mjs
 start a real `opencode serve` alongside 30+ unit files on the same cores, and
 running the documented E2E command straight afterwards started a second one.
 `npm test` now globs `test/!(e2e-*).test.mjs`; the E2E has its own script.
+
+**A missing `opencode` binary fails loud, not quiet.** `node --test` exits 0
+for an all-skipped run — "0 tests, 0 fail" used to be structurally
+indistinguishable from a real pass, and this E2E is a mandatory pre-commit
+gate (see the INVARIANT above). `test/e2e-opencode.test.mjs` now throws at
+module load if `opencode` is not on PATH, unless `SUPERVISOR_E2E_ALLOW_SKIP=1`
+is set explicitly — always check the `ℹ tests N` line reads 20, not 0, on top
+of a green exit code.
 
 ## Structure
 
@@ -97,6 +114,81 @@ The judge's context is `buildConversationChain`: the plain alternating `user:` /
 ### `test/goal-lifecycle.test.mjs` — achieved goals must die; empty verdicts must not loop
 
 `retireProjectGoal` only deletes a file that still parses to the exact condition it judged, and writes `.supervisor/goal-achieved.log` BEFORE unlinking. `isActionlessVerdict` (empty missing + empty next_actions + blank feedback) and `hasFeedbackBody` stand the supervisor down instead of injecting — a content-free verdict was observed re-injecting byte-identically 15x at ~20s intervals. A standing goal alone never counts as actionable content. Source assertions pin both guards into `opencode/supervisor-impl.ts`.
+
+### `test/goal-lifecycle.test.mjs` → `describe("resume: ...")` — a paused goal is not a dead end
+
+A goal that gets `paused` (the agent declaring `supervisor_loop_exit` with reason
+`stuck`) or `exhausted` (the 30-day deadline backstop) used to be permanently
+inert: nothing anywhere flipped it back to `active`, and the user's only recovery
+was re-typing the whole condition from scratch — with no indication that was
+necessary. `resumeGoal()` (`core/goal.mjs`) is the explicit fix, wired through
+`bin/supervisor.mjs set-goal resume` (CLI) and the `supervisor_goal` /
+`supervisor` tools' `resume: true` arg (`opencode/supervisor-impl.ts`).
+
+**The command is `set-goal resume`, never `goal resume`.** `test/manifest.test.mjs`
+bans the literal `/supervisor goal` and `/supervisor:goal` substrings across every
+user-facing surface (see its "no user-facing surface tells anyone to type the
+retired goal command" test) — `set-goal` is the one canonical name, `goal` survives
+only as an internal parser alias. `resume`/`unpause` are recognised the same way
+`clear`/`stop`/`off`/`reset`/`none`/`cancel` already were, via a sibling
+`GOAL_RESUME_ALIASES` set next to `GOAL_CLEAR_ALIASES`.
+
+**Resumable statuses are `paused` and `exhausted`, and nothing else.** `active` is
+already running (an honest `already-active` outcome, not a fabricated success);
+`achieved`/`cleared` are terminal and immediately deleted by
+`clearGoal`/`retireProjectGoal`, so a persisted goal object in either state
+essentially never exists, but the check stays honest either way rather than
+assuming. Every non-resume outcome returns `{resumed:false, reason, status,
+condition}` so the caller can print the goal's ACTUAL current status instead of a
+silent no-op — the same discipline `/supervisor off` failing to persist taught
+this codebase (see the session-store section below).
+
+**Resume forces `mode:'goal'` back on.** `resolveSupervisorMode()` trusts an
+explicit `state.mode` over `goal.status`, and the OpenCode deadline-exhaustion
+path sets `mode:'reflection'` (`decideGoalTransition`'s `'deadline'` branch) — so
+without this, a resumed deadline-exhausted goal would stay invisible to the
+`mode==='goal'` filter both runtimes use before even looking at `state.goal`.
+
+**Resume extends a deadline that has already passed** (to `now +
+DEFAULT_MAX_GOAL_DURATION_MS`) but leaves a still-future deadline (the ordinary
+stuck-pause case) untouched. Without the extension, the very next stop-hook pass
+re-triggers `decideGoalTransition`'s `now >= goal.deadline` branch and
+re-exhausts the goal instantly — turning "resume" into a trap that looks like it
+worked and dies on the next turn.
+
+**Resume resets the attempt counter fully, not just `goal.attempts`.** It
+`delete`s the shared `state.attempts` object (not just zeroes `goal.attempts`),
+so `sessionStore.readAttempts()` reads 0 for whatever turn key comes next —
+consistent with issue #57's fix that `goal.attempts` is a MIRROR of the one
+turn-scoped counter, never a second independently-incremented tally. `lastReason`
+is cleared and `lastTurnKey` is reset to `null` (the same initial value
+`setGoal()` uses), so the very next stop treats it as a brand-new turn.
+
+**Discoverability: every pause site names the recovery command.** `lastReason` —
+the ONE field the Claude Code Stop hook can carry forward, since it has no
+passive user-visible output channel at the exact instant a goal pauses (a
+`{decision:'block'}` reply would force another continuation, defeating the
+pause) — gets `core/goal.mjs`'s `withResumeHint()` appended at both stuck-pause
+sites (`bin/supervisor-on-stop.mjs`, `opencode/supervisor-impl.ts`'s
+`executeSupervisorLoopExit`) and both deadline sites. OpenCode's deadline toasts
+and the `supervisor_loop_exit` tool's own return string get the same hint
+inline. `/supervisor status`, `bin/supervisor.mjs`'s `goal-status` case, and the
+OpenCode `supervisor`/`supervisor_goal` status text all append
+`goalResumeHintSuffix()` whenever the goal is `paused`/`exhausted` — `bin/status.mjs`
+previously printed NO goal detail at all (only `resolveSupervisorMode()`'s
+"effective mode", which reads `'goal'` identically whether the goal is actively
+pushing or dead-in-the-water paused), so that alone was a second, independent
+instance of "shown as if active" this phase fixed.
+
+**One inaccuracy in how this feature was originally described:** the third
+"pause" site named at the start of this work — an active goal standing down
+because the judge says the human must act next (`goal_paused_user_wait` in
+`bin/supervisor-on-stop.mjs`) — never actually persists any status change.
+`goal.status` stays `'active'` on disk; only a transient `verdictRecord.goal =
+'paused'` (a per-turn log line, not state) is written. There is no dead end to
+resume there — the existing "just send another message" flow already reactivates
+it, so `resumeGoal()` correctly reports `already-active` for it and changes
+nothing.
 
 ### `test/status-directive.test.mjs` — status/roadmap directive
 
@@ -161,11 +253,14 @@ Two things it found that unit tests could not:
   true, and an empty verdict stood down with the wrong reason. The judge's
   feedback is now carried through verbatim as `SupervisorAnalysis.rawFeedback`
   and that is what the guard reads.
-- **`autopilot_exit` silently deleted an active goal.** It is registered
-  plugin-wide, so it is in every session's tool catalog; it called
+- **`autopilot_exit` silently deleted an active goal.** It was registered
+  plugin-wide, so it was in every session's tool catalog; it called
   `setAutopilot(false)` unconditionally, which routes through
-  `setMode("reflection")` → `delete state.goal`. It is now a no-op outside
-  autopilot mode.
+  `setMode("reflection")` → `delete state.goal`. It was made a no-op outside
+  autopilot mode as an interim fix, then deleted outright once
+  `supervisor_loop_exit` fully replaced it (see the stop-mechanism section
+  above) — two tools for one job was the drift risk, not just the goal-delete
+  bug.
 
 Both are pinned in `test/goal-lifecycle.test.mjs`.
 
@@ -214,9 +309,18 @@ that can see the loop from inside it.
 
 **One parser, both runtimes** — `parseLoopExitSentinel` (`core/loop-exit.mjs`).
 Line-anchored and fence-stripped, so the sentinel quoted inside the nudge that
-teaches it does not trigger it. `AUTOPILOT_EXIT` remains an alias for
-`completed`. Two regexes for one sentinel is the drift shape this repo keeps
-reproducing; there is exactly one.
+teaches it does not trigger it. `AUTOPILOT_EXIT` remains a **parse-only**
+alias for `completed` — it is deliberately no longer TAUGHT anywhere (no
+nudge, skill, README, or tool description mentions it); the regex is kept
+solely because shipped `skills/*.md` get copied into a user's `~/.config` and
+installed copies have lagged shipped fixes before (the 0.3.1 manifest-bump
+incident), so a stale on-disk skill that still emits the old token must keep
+working. `test/loop-exit-single-signal.test.mjs` is the regression guard: a
+banned-phrase grep over every shipped surface (README, skills, opencode
+commands, the CLI/nudge strings in `bin/*.mjs`, and
+`opencode/supervisor-impl.ts`) asserting none of them teach `AUTOPILOT_EXIT`
+or `autopilot_exit` anymore. Two regexes/tokens for one sentinel is the drift
+shape this repo keeps reproducing; there is exactly one live signal.
 
 **The hint must be runtime-correct or it is dead text.** `buildEscalatingFeedback`
 is shared, so telling a Claude Code agent to "call the supervisor_loop_exit
@@ -230,8 +334,16 @@ above. Arity is unchanged (AGENTS.md pins it; `test/feedback.test.mjs` asserts).
 **Side effects are asymmetric on purpose.** `completed` leaves an active goal
 untouched. `stuck` pauses it (status `paused`, condition retained) and appends
 to `.supervisor/loop-exit.log` so a doom loop leaves forensic evidence. Neither
-ever `delete state.goal` — that footgun is documented at the `autopilot_exit`
-call site and was hit for real in live validation.
+ever `delete state.goal` — that footgun was hit for real in live validation via
+the predecessor `autopilot_exit` TOOL (opencode/supervisor-impl.ts), which is
+now DELETED. It was a second tool for the same job as `supervisor_loop_exit`,
+registered plugin-wide (so it sat in every session's tool catalog including
+goal-mode ones), and it called `setAutopilot(false)` unconditionally — which
+routes through `setMode("reflection")` → `delete state.goal` — silently
+destroying an active user goal with no warning. `supervisor_loop_exit` only
+touches autopilot state when the session is actually in `autopilot` mode, and
+never deletes a goal outright; `test/goal-lifecycle.test.mjs` and
+`test/loop-exit.test.mjs` pin both.
 
 **The gate is a plain `return`,** not a counter saturation: it is a cheap
 idempotent read of persisted state, so saturating would make it

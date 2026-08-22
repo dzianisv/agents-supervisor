@@ -30,7 +30,7 @@ CI uses Node 22 and runs unit tests, Claude hook e2e, judge eval, OpenCode plugi
 - Current command files: `supervisor.md` (bare `/supervisor <mode>` dispatcher) plus colon subcommands — `supervisor:status.md`, `supervisor:on.md`, `supervisor:off.md`, `supervisor:set-goal.md`, `supervisor:retry.md`, `supervisor:train.md`, `supervisor:autopilot.md`, `supervisor:reflection.md`. Naming is identical to Claude Code's skill set.
 - **Regression history — `/supervisor:goal` must never come back.** It was renamed to `/supervisor:objective` on both runtimes (PR #41, `b2a28a4`), then independently renamed `goal → set-goal` on the Claude Code side only (#43, `0d8ead8`). Merge `27d873e` resolved the two by keeping `set-goal` and deleting the `objective` files — but only touched the Claude Code skills, so OpenCode silently kept `supervisor:goal.md`. Unified to `set-goal` on both runtimes; `test/manifest.test.mjs` now pins the OpenCode command filenames and asserts no user-facing surface emits the literal `/supervisor:goal`.
 - README documents the full unified colon-command set and notes OpenCode additionally has the bare `/supervisor <subcommand>` dispatcher.
-- README documents OpenCode tools: `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, and `autopilot_exit`.
+- README documents OpenCode tools: `supervisor`, `set_supervisor`, `supervisor_train`, `supervisor_goal`, `supervisor_retry`, `supervisor_autopilot`, and `supervisor_loop_exit`.
 
 ## Training And Eval
 
@@ -54,7 +54,7 @@ Both Claude Code and OpenCode expose the same 8 colon subcommands (naming differ
 4. `/supervisor:set-goal <condition>` (both runtimes) — set a mandatory completion condition
 5. `/supervisor:retry N` — set the retry budget
 6. `/supervisor:train` — mine and learn from your sessions
-7. `/supervisor:autopilot` — skip judge, auto-continue until AUTOPILOT_EXIT or budget
+7. `/supervisor:autopilot` — skip judge, auto-continue until `supervisor_loop_exit`/`SUPERVISOR_LOOP_EXIT: completed` or budget
 8. `/supervisor:reflection` — return to default completion-judge mode
 
 OpenCode additionally supports a bare `/supervisor <subcommand>` dispatcher as an alternative syntax for the same commands.

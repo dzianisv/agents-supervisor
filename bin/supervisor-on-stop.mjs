@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -42,7 +42,7 @@ import {
   extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
 } from '../core/task-context.mjs';
 import { shouldSkipReflection } from '../core/turn-classifier.mjs';
-import { parseLoopExitSentinel } from '../core/loop-exit.mjs';
+import { parseLoopExitSentinel, appendLoopExitLog } from '../core/loop-exit.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -886,7 +886,16 @@ async function main() {
   function finishExhaustedGoal(t, baseRecord) {
     const deadlineHit = t.reason === 'deadline';
     if (deadlineHit) {
-      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
+      // Claude Code's Stop hook has no passive user-visible output channel at
+      // this exact moment (a {decision:'block'} reply would force another
+      // continuation, defeating the pause) — lastReason is the only place the
+      // recovery instruction can live, surfaced later by `/supervisor status`
+      // or `/supervisor set-goal`.
+      try {
+        sessionStore.mutate(cwd, session_id, (s) => {
+          s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || 'goal deadline reached') };
+        });
+      } catch { /* */ }
     }
     writeVerdict(session_id, { ...baseRecord, goal: deadlineHit ? 'exhausted' : 'turn_budget_spent' }, cwd);
     debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
@@ -909,6 +918,17 @@ async function main() {
         plugin_version: PLUGIN_VERSION, injected: false,
       });
     }
+    // Hitting the runaway ceiling is strictly WORSE than an agent-declared
+    // `stuck` exit — it means the loop never terminated on its own; only the
+    // circuit breaker did. A declared `stuck` already leaves forensic
+    // evidence in .supervisor/loop-exit.log (see the LOOP EXIT handler
+    // below); a ceiling hit previously left only a debug() line, invisible
+    // without SUPERVISOR_DEBUG=1. Same writer, same file, tagged distinctly
+    // so this can never be confused with a declared exit.
+    appendLoopExitLog(cwd, {
+      session: session_id, turnKey, reason: 'runaway_ceiling', detail: '',
+      at: Date.now(), mode, attempts, maxAttempts: effectiveMax,
+    });
     debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal, mode }, cwd);
     process.exit(0);
   }
@@ -965,7 +985,9 @@ async function main() {
   // (the attempt counter is now just a runaway circuit breaker at
   // RUNAWAY_CEILING=50), and standing down on a repeat of it would strand the
   // session in autopilot — or in an endless loop — forever. `AUTOPILOT_EXIT`
-  // is still honoured, as an alias for `reason: 'completed'`.
+  // is still PARSED as an alias for `reason: 'completed'` (stale installed
+  // skill copies may still emit it), but it is no longer TAUGHT anywhere —
+  // see core/loop-exit.mjs.
   const loopExit = parseLoopExitSentinel(ctx.final_assistant_text);
   const autopilotExiting = !!loopExit;
   let priorReplyHash = null;
@@ -997,16 +1019,12 @@ async function main() {
   if (loopExit) {
     const { reason, detail } = loopExit;
     const at = Date.now();
-    // Forensic evidence for a doom loop, in the SAME format the OpenCode tool
-    // writes (opencode/supervisor-impl.ts). Best-effort, never throws.
+    // Forensic evidence for a doom loop, via the ONE shared writer
+    // (core/loop-exit.mjs) also used by the OpenCode tool
+    // (opencode/supervisor-impl.ts) and the runaway-ceiling site above.
+    // Best-effort, never throws.
     if (reason === 'stuck') {
-      try {
-        fs.mkdirSync(path.join(cwd, '.supervisor'), { recursive: true });
-        fs.appendFileSync(
-          path.join(cwd, '.supervisor', 'loop-exit.log'),
-          JSON.stringify({ session: session_id, turnKey, reason, detail, at }) + '\n',
-        );
-      } catch { /* best effort */ }
+      appendLoopExitLog(cwd, { session: session_id, turnKey, reason, detail, at });
     }
     // NEVER `delete state.goal`. A goal is long-lived user intent; "this
     // turn's loop is over" says nothing about it. `stuck` pauses it and KEEPS
@@ -1016,7 +1034,7 @@ async function main() {
       try {
         goalStore.mutate(cwd, session_id, (st) => {
           if (st.goal && st.goal.status === 'active') {
-            st.goal = { ...st.goal, status: 'paused', lastReason: detail || 'agent reported stuck' };
+            st.goal = { ...st.goal, status: 'paused', lastReason: withResumeHint(detail || 'agent reported stuck') };
           }
         });
       } catch { /* best effort */ }
@@ -1034,9 +1052,10 @@ async function main() {
   }
 
   // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
-  // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
+  // until the agent emits SUPERVISOR_LOOP_EXIT or the attempt budget runs out.
   if (mode === 'autopilot' && !goal) {
-    // NOTE: the exit signal (AUTOPILOT_EXIT / SUPERVISOR_LOOP_EXIT) is handled
+    // NOTE: the exit signal (SUPERVISOR_LOOP_EXIT, with a parse-only legacy
+    // AUTOPILOT_EXIT alias for stale installed skill copies) is handled
     // in 4a-0 above, for ALL modes, via the single shared parser.
     const baseVerdict = { session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION };
     const nextAttempt = attempts + 1;
@@ -1045,7 +1064,7 @@ async function main() {
     // the status/roadmap directive rides along with EVERY continuation, on
     // both runtimes. Gated by the same default-on `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
-    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead. The legacy \`AUTOPILOT_EXIT\` is still accepted.\n\nContinue now.`;
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
     const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));

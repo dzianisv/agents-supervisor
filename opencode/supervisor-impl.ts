@@ -22,6 +22,7 @@ import {
   readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
   isStatusDiagramEnabled, isPlainspeakEnabled, goalStore,
+  withResumeHint, goalResumeHintSuffix, GOAL_RESUME_HINT,
 } from "../core/goal.mjs"
 // Plainspeak style detector. DELIBERATELY deterministic-only on this runtime:
 // only `scoreVerbosity(...).verdict === "verbose"` fires, `"suspect"` is
@@ -47,6 +48,7 @@ import {
   pushedToDefaultBranch, hasCodeChangeEvidence, summarizeToolActivity,
   describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
+  evaluateNoProgress,
 } from "../core/evaluation.mjs"
 import {
   DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt, buildJudgePrompt,
@@ -65,6 +67,12 @@ import {
   buildConversationChain, userMessageText, truncateForPrompt, PROMPT_TEXT_LIMIT,
 } from "../core/task-context.mjs"
 import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
+// THE shared parser for the agent-declared loop exit (a real tool here, a
+// text sentinel on Claude Code — see core/loop-exit.mjs's header) and its
+// ONE forensic-log writer, reused by both the runaway-ceiling circuit
+// breaker and executeSupervisorLoopExit below so .supervisor/loop-exit.log
+// never grows a second record format.
+import { appendLoopExitLog } from "../core/loop-exit.mjs"
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -336,6 +344,14 @@ export interface SupervisorState {
     detail: string
     at: number
   }
+  /**
+   * No-progress gate state (core/evaluation.mjs's evaluateNoProgress) —
+   * fingerprint + consecutive-repeat count of the agent's last final reply.
+   * Same on-disk keys as the Claude Code runtime (bin/supervisor-on-stop.mjs)
+   * so the two gates cannot drift onto different persistence shapes.
+   */
+  lastReplyHash?: string | null
+  replyRepeatCount?: number
 }
 
 /** Provenance/idempotency marker on every injected plainspeak directive. */
@@ -411,6 +427,17 @@ export const supervisorStore = {
 
   async setPlainspeak(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
     return goalStore.setPlainspeak(directory, sessionId, enabled) as SupervisorState
+  },
+
+  /**
+   * Flip a paused/exhausted goal back to active — see resumeGoal() in
+   * core/goal.mjs for the full contract (condition preserved verbatim,
+   * lastReason cleared, attempt counter reset, mode forced back to 'goal',
+   * a past deadline extended). Never a silent no-op: the returned outcome's
+   * `resumed` field tells the caller whether anything actually changed.
+   */
+  async resumeGoal(directory: string, sessionId: string, opts?: { now?: number; maxDurationMs?: number }) {
+    return goalStore.resumeGoal(directory, sessionId, opts ?? {})
   },
 
   /**
@@ -635,7 +662,7 @@ const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "superviso
 // Last-resort fallback when no model is configured. Uses a free opencode model
 // to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
 const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
-const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "supervisor_loop_exit", "set_supervisor"])
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "supervisor_loop_exit", "set_supervisor"])
 
 export function trackSessionScopedToolSession(
   currentSessionId: string | null,
@@ -1844,7 +1871,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   // Primary supervisor tool: status, session on/off, and mode selection.
   const supervisorToggleDescription = "Inspect or change supervisor state for the current session. action=off/on disables/enables the supervisor and is INDEPENDENT of mode — when the user asks to turn the supervisor off, send action=\"off\" and leave mode empty. Use mode=autopilot or mode=reflection only to switch modes. Use action=\"status on\"/\"status off\" for the status-checkpoint directive and action=\"plain on\"/\"plain off\" for the plainspeak style nudge. Omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
   const executeSupervisorToggle = async (
-    args: { action?: string; mode?: string; condition?: string; clear?: boolean; n?: number } = {},
+    args: { action?: string; mode?: string; condition?: string; clear?: boolean; resume?: boolean; n?: number } = {},
     context?: any
   ) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
@@ -1901,7 +1928,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
 
     if (requestedMode === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
-      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     if (requestedMode === "reflection") {
       await supervisorStore.setMode(directory, sid, "reflection")
@@ -1934,14 +1961,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     }
     if (action === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
-      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     if (action === "reflection") {
       await supervisorStore.setMode(directory, sid, "reflection")
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
     if (action === "goal") {
-      return executeSupervisorGoal({ condition: normalizeOptionalArg(args.condition), clear: args.clear }, context)
+      return executeSupervisorGoal({ condition: normalizeOptionalArg(args.condition), clear: args.clear, resume: args.resume }, context)
     }
     if (action === "retry") {
       return executeSupervisorRetry({ n: args.n }, context)
@@ -1957,7 +1984,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const disabled = await isSessionDisabled(sid, sessionDir)
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
-    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
+    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}` : "\ngoal: (none)"
     return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
   }
 
@@ -2041,11 +2068,33 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   // supervisor_goal / supervisor_retry tools — wire the supervisor-mode goal loop
   // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
   // this per-session state on the next session.idle.
-  const supervisorGoalDescription = "Set, check, or clear a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear)."
-  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }, context?: any) => {
+  const supervisorGoalDescription = "Set, check, clear, or resume a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear), resume (true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, and resets the turn's attempt budget)."
+  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean; resume?: boolean }, context?: any) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
     currentSessionId = sid
+    if (args.resume) {
+      const outcome = await supervisorStore.resumeGoal(directory, sid)
+      if (!outcome.resumed) {
+        // Never a silent no-op — name the goal's ACTUAL current status so the
+        // caller can't mistake this for a successful resume.
+        if (outcome.reason === "no-goal") {
+          return `No goal is set for session ${sid.slice(0, 8)}… — nothing to resume. Set one with supervisor_goal { condition }.`
+        }
+        if (outcome.reason === "already-active") {
+          return `Goal for session ${sid.slice(0, 8)}… is already active (not paused): "${outcome.condition}". Nothing to resume.`
+        }
+        return `Goal for session ${sid.slice(0, 8)}… is ${outcome.status}, not paused — it cannot be resumed. Set a new one with supervisor_goal { condition }.`
+      }
+      // Never report success for a write that did not persist — read the
+      // state back through the same load() path a fresh reader would use,
+      // matching the off/on FAILED-verification pattern above.
+      const after = await supervisorStore.load(directory, sid)
+      if (after.goal?.status !== "active" || after.goal?.condition !== outcome.condition) {
+        return `FAILED to resume goal for session ${sid.slice(0, 8)}… — the change did not persist (status now: ${after.goal?.status ?? "(no goal)"}). Do not assume the goal is active.`
+      }
+      return `Goal resumed for session ${sid.slice(0, 8)}… (was ${outcome.previousStatus}): "${outcome.condition}". Attempt budget reset for this turn; the supervisor will keep pushing until it's met (or the retry budget runs out).`
+    }
     if (args.clear) {
       await supervisorStore.clearGoal(directory, sid)
       return `Goal cleared for session ${sid.slice(0, 8)}….`
@@ -2059,7 +2108,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     if (!condition) {
       const st = await supervisorStore.load(directory, sid)
       if (st.goal) {
-        return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+        return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}`
       }
       const projectCondition = await readProjectGoalForSessionId(sid)
       if (projectCondition) {
@@ -2136,14 +2185,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
-  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call autopilot_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
+  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call supervisor_loop_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
   const executeSupervisorAutopilot = async (args: { enabled: boolean }, context?: any) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then toggle autopilot."
     currentSessionId = sid
     await supervisorStore.setAutopilot(directory, sid, args.enabled)
     if (args.enabled) {
-      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     return `Autopilot disabled for session ${sid.slice(0, 8)}….`
   }
@@ -2219,29 +2268,26 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
     const mode = resolveSupervisorMode(state)
 
     // Forensic evidence for a doom loop, written BEFORE returning so it
-    // survives even if the state write races or the process dies next.
+    // survives even if the state write races or the process dies next. Via
+    // the ONE shared writer (core/loop-exit.mjs) also used by the Claude
+    // Code hook and the runaway-ceiling circuit breaker above.
     if (reason === "stuck") {
-      try {
-        await mkdir(join(directory, ".supervisor"), { recursive: true })
-        await appendFile(
-          join(directory, ".supervisor", "loop-exit.log"),
-          JSON.stringify({ session: sid, turnKey, reason, detail, at }) + "\n"
-        )
-      } catch (e: any) {
-        debug("loop-exit: log append failed (non-fatal):", e?.message || e)
-      }
+      const ok = appendLoopExitLog(directory, { session: sid, turnKey, reason, detail, at })
+      if (!ok) debug("loop-exit: log append failed (non-fatal) for", sid)
     }
 
     await supervisorStore.mutate(directory, sid, (s) => {
       s.loopExit = { turnKey, reason, detail, at }
       // NEVER `delete s.goal` here. setAutopilot(false) routes through
-      // setMode("reflection"), which drops the goal — the exact footgun
-      // documented on autopilot_exit below. A goal is a long-lived user
-      // intent; "this turn's loop is over" says nothing about it. Only an
+      // setMode("reflection"), which drops the goal — the exact footgun that
+      // was found live in the now-deleted predecessor exit tool (it called
+      // setAutopilot(false) unconditionally and silently destroyed an active
+      // goal; see AGENTS.md's stop-mechanism section). A goal is a long-lived
+      // user intent; "this turn's loop is over" says nothing about it. Only an
       // explicit "stuck" pauses it, and even then the condition is kept so
       // the user can see and resume it.
       if (reason === "stuck" && s.goal && s.goal.status === "active") {
-        s.goal = { ...s.goal, status: "paused", lastReason: detail || "agent reported stuck" }
+        s.goal = { ...s.goal, status: "paused", lastReason: withResumeHint(detail || "agent reported stuck") }
       }
     })
 
@@ -2251,54 +2297,22 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
       try { await supervisorStore.setAutopilot(directory, sid, false) } catch { /* best effort */ }
     }
 
+    // `state` was loaded BEFORE the mutate above, so its goal.status still
+    // reflects the PRE-pause value — exactly the condition the mutate itself
+    // used to decide whether to pause. A goal that WAS active and WILL become
+    // paused is the only case that needs the recovery hint in the output the
+    // caller (and therefore the user) actually sees.
+    const goalWasPaused = reason === "stuck" && !!state.goal && state.goal.status === "active"
     debug("loop-exit recorded:", sid, "turn:", turnKey, "reason:", reason, "detail:", detail)
     return reason === "stuck"
       ? {
           title: "Supervision loop ended (stuck)",
-          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.`,
+          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.${goalWasPaused ? ` The associated goal is now paused. ${GOAL_RESUME_HINT}` : ""}`,
         }
       : {
           title: "Supervision loop ended",
           output: "Supervision loop ended for this turn: task reported complete. The supervisor will not push again until the human sends a new message.",
         }
-  }
-
-  // autopilot_exit tool — signal that autopilot work is complete
-  const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
-Call this tool:
-- After finishing the autonomous implementation task
-- When you are ready to provide a final concise summary
-Do NOT call this tool:
-- Before implementation work is complete
-- If you still need to run more tools to finish the task`
-  const executeAutopilotExit = async (_args?: any, context?: any) => {
-    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
-    if (sid) {
-      currentSessionId = sid
-      // Only touch the mode if autopilot is actually on.
-      //
-      // This tool is registered plugin-wide, so it sits in the tool catalog of
-      // EVERY session, including goal-mode ones. Unconditionally calling
-      // setAutopilot(false) routes through setMode("reflection"), which does
-      // `delete state.goal` (core/goal.mjs) — so a model that calls
-      // autopilot_exit while a goal is active silently destroys the user's
-      // goal, with no warning and no log line. Hit for real while building
-      // test/live-validation.mjs scenario 9. Exiting a mode you are not in is
-      // a no-op, not a state reset.
-      const state = await supervisorStore.load(directory, sid)
-      if (resolveSupervisorMode(state) === "autopilot") {
-        // Thin wrapper over the loop-exit logic (which also disarms
-        // autopilot), so the two tools cannot diverge.
-        await executeSupervisorLoopExit({ reason: "completed", detail: "autopilot_exit" }, context)
-      } else {
-        debug("autopilot_exit called while not in autopilot mode — no state change for", sid)
-        return {
-          title: "Not in autopilot",
-          output: "Autopilot is not active for this session — nothing to exit. Supervisor state left unchanged.",
-        }
-      }
-    }
-    return { title: "Exited autopilot", output: "Autopilot completed." }
   }
 
   let setSupervisorTool: any = null
@@ -2308,7 +2322,6 @@ Do NOT call this tool:
   let supervisorRetryTool: any = null
   let supervisorAutopilotTool: any = null
   let supervisorAutoreviewTool: any = null
-  let autopilotExitTool: any = null
   let supervisorLoopExitTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
@@ -2316,7 +2329,8 @@ Do NOT call this tool:
       description: supervisorGoalDescription,
       args: {
         condition: tool.schema.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
-        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal.")
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal."),
+        resume: tool.schema.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
       },
       execute: executeSupervisorGoal as any
     })
@@ -2351,6 +2365,7 @@ Do NOT call this tool:
         action: tool.schema.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
         condition: tool.schema.string().optional().describe("Goal text when action is 'goal'."),
         clear: tool.schema.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+        resume: tool.schema.boolean().optional().describe("Set true with action 'goal' to resume a paused or exhausted goal."),
         n: tool.schema.number().optional().describe("Retry budget when action is 'retry'.")
       },
       execute: executeSupervisorToggle as any
@@ -2368,11 +2383,6 @@ Do NOT call this tool:
         enabled: tool.schema.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
       },
       execute: executeSupervisorAutoreview as any
-    })
-    autopilotExitTool = tool({
-      description: autopilotExitDescription,
-      args: {},
-      execute: executeAutopilotExit as any
     })
     supervisorLoopExitTool = tool({
       description: supervisorLoopExitDescription,
@@ -2408,6 +2418,7 @@ Do NOT call this tool:
           action: z.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
           condition: z.string().optional().describe("Goal text when action is 'goal'."),
           clear: z.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+          resume: z.boolean().optional().describe("Set true with action 'goal' to resume a paused or exhausted goal."),
           n: z.number().optional().describe("Retry budget when action is 'retry'.")
         },
         execute: executeSupervisorToggle
@@ -2425,7 +2436,8 @@ Do NOT call this tool:
         description: supervisorGoalDescription,
         args: {
           condition: z.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
-          clear: z.boolean().optional().describe("Set true to clear the current session goal.")
+          clear: z.boolean().optional().describe("Set true to clear the current session goal."),
+          resume: z.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
         },
         execute: executeSupervisorGoal
       }
@@ -2450,11 +2462,6 @@ Do NOT call this tool:
         },
         execute: executeSupervisorAutoreview
       }
-      autopilotExitTool = {
-        description: autopilotExitDescription,
-        args: {},
-        execute: executeAutopilotExit
-      }
       supervisorLoopExitTool = {
         description: supervisorLoopExitDescription,
         args: {
@@ -2478,7 +2485,6 @@ Do NOT call this tool:
       supervisorRetryTool = { description: supervisorRetryDescription, args: {}, execute: executeSupervisorRetry }
       supervisorAutopilotTool = { description: supervisorAutopilotDescription, args: {}, execute: executeSupervisorAutopilot }
       supervisorAutoreviewTool = { description: supervisorAutoreviewDescription, args: {}, execute: executeSupervisorAutoreview }
-      autopilotExitTool = { description: autopilotExitDescription, args: {}, execute: executeAutopilotExit }
       supervisorLoopExitTool = { description: supervisorLoopExitDescription, args: {}, execute: executeSupervisorLoopExit }
     }
   }
@@ -2660,9 +2666,10 @@ Do NOT call this tool:
               const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMaxAttempts })
               if (t.action === "exhausted" && t.reason === "deadline") {
                 await supervisorStore.mutate(directory, sessionId, (s) => {
-                  s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+                  s.mode = "reflection"; s.autopilot = false
+                  s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
                 })
-                await showToast(client, directory, "Goal deadline reached — paused", "warning")
+                await showToast(client, directory, `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`, "warning")
               } else if (mode !== "autopilot") {
                 await showToast(client, directory, `Goal budget spent for this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
               }
@@ -2671,6 +2678,19 @@ Do NOT call this tool:
             }
           }
           debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", effectiveMaxAttempts, "mode:", mode, "goal:", !!goal)
+          // Hitting the ceiling is strictly WORSE than an agent-declared
+          // `stuck` exit (executeSupervisorLoopExit, above): it means the
+          // loop never terminated on its own — only the circuit breaker did.
+          // A declared `stuck` already leaves forensic evidence in
+          // .supervisor/loop-exit.log; a ceiling hit previously left only the
+          // debug() line just above, invisible without SUPERVISOR_DEBUG=1.
+          // Same shared writer (core/loop-exit.mjs) as the CC hook and the
+          // supervisor_loop_exit tool, tagged distinctly so this can never be
+          // confused with a declared exit.
+          appendLoopExitLog(directory, {
+            session: sessionId, turnKey, reason: "runaway_ceiling", detail: "",
+            at: Date.now(), mode, attempts: currentAttemptCount, maxAttempts: effectiveMaxAttempts,
+          })
           return
         }
 
@@ -2681,6 +2701,54 @@ Do NOT call this tool:
         const customPrompt = await loadSupervisorPrompt(sessionDirectory)
         const agents = await getAgentsFile(sessionDirectory)
         const rubric = await loadRubric(sessionDirectory)
+
+        // ── No-progress gate (deterministic, no LLM) ─────────────────────
+        //
+        // Parity fix: this gate existed ONLY on the Claude Code runtime
+        // (bin/supervisor-on-stop.mjs's "NO-PROGRESS GATE") — opencode had no
+        // detection at all for "the agent's reply is unchanged from last
+        // time, so pushing again is pointless". Same shared helper
+        // (core/evaluation.mjs's evaluateNoProgress), same threshold
+        // (NO_PROGRESS_REPEAT_THRESHOLD), same on-disk keys
+        // (lastReplyHash/replyRepeatCount), same locked mutate() — one
+        // implementation, two runtimes.
+        //
+        // ORDERING: placed AFTER the agent-declared loop-exit gate (near the
+        // top of this handler, over `sup.loopExit`) and the runaway-ceiling
+        // circuit breaker above, but BEFORE the non-actionable turn gate,
+        // the autopilot fast-path and the judge — mirroring the Claude Code
+        // hook's "4a-pre" placement, so it covers reflection, goal AND
+        // autopilot alike. Because the loop-exit gate already returned above
+        // whenever `supervisor_loop_exit` was called for THIS turn, an agent
+        // that repeats itself AND declares an exit always exits — the
+        // no-progress gate never gets a chance to swallow that signal.
+        //
+        // BUDGET: this is an ELIGIBILITY gate, not a spent attempt — it does
+        // NOT call writeTurnAttempts. Saturating the counter here would make
+        // "the agent repeated itself" indistinguishable from "the budget is
+        // spent", and opencode raises several session.idle events per human
+        // turn, so a LATER idle in the same turn would then read the
+        // saturated counter and take the budget-exhausted branch above,
+        // firing its side effects (setAutopilot(false), goal transitions)
+        // for the wrong reason. The gate re-derives the same answer for free
+        // on every idle, so it needs no counter of its own to terminate.
+        const noProgress = evaluateNoProgress(lastAssistantText, sup.lastReplyHash, sup.replyRepeatCount)
+        if (noProgress.standDown) {
+          debug("no-progress gate: standing down for", sessionId.slice(0, 8), "mode:", mode, "goal:", !!goal, "repeats:", noProgress.repeatCount)
+          return
+        }
+        // Locked read-modify-write: never save() a whole state object read
+        // earlier in this turn, or the goal/attempts/loopExit keys already
+        // resolved above would be lost (the exact lost-update shape
+        // test/goal-per-turn.test.mjs guards).
+        try {
+          await supervisorStore.mutate(directory, sessionId, (s) => {
+            s.lastReplyHash = noProgress.hash
+            s.replyRepeatCount = noProgress.repeatCount
+          })
+        } catch (e: any) {
+          debug("no-progress gate: persist failed (non-fatal):", e?.message || e)
+        }
 
         // ── Non-actionable turn gate ─────────────────────────────────────
         // A completion judge only makes sense when the human actually asked for
@@ -2987,7 +3055,8 @@ Continue now.`
             const deadlineHit = t.reason === "deadline"
             if (deadlineHit) {
               await supervisorStore.mutate(directory, sessionId, (s) => {
-                s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+                s.mode = "reflection"; s.autopilot = false
+                s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
               })
             }
             standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
@@ -2995,7 +3064,7 @@ Continue now.`
               client,
               directory,
               deadlineHit
-                ? `Goal deadline reached — paused`
+                ? `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`
                 : `Goal budget spent for this turn (${t.goal.attempts} attempts) — resumes on your next message`,
               "warning"
             )
@@ -3421,7 +3490,7 @@ Call the tool now. Do not explain, just execute the tool call.`
         reportError(e, { plugin: "supervisor-3", op: "status-directive-system" })
       }
     },
-    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || supervisorLoopExitTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
       ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
       ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
@@ -3429,7 +3498,6 @@ Call the tool now. Do not explain, just execute the tool call.`
       ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
       ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
       ...(supervisorAutoreviewTool ? { supervisor_autoreview: supervisorAutoreviewTool } : {}),
-      ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
       ...(supervisorLoopExitTool ? { supervisor_loop_exit: supervisorLoopExitTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {

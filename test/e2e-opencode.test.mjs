@@ -146,6 +146,29 @@ function callsMentioning(fixtureLlm, probe) {
 
 const SKIP = !hasOpencode()
 
+// A missing `opencode` binary used to make every test in this file report
+// "skip" — `node --test` still exits 0 for an all-skipped run, so "0 tests,
+// 0 fail" looked identical to a real pass. AGENTS.md documents this suite as
+// a MANDATORY pre-commit gate; a gate that reports green without running is
+// worse than no gate (it was hit for real: the opencode binary lives at
+// ~/.opencode/bin/opencode, not on the default PATH, on this machine). Make
+// the vacuous case LOUD by default: throwing here fails the whole test file
+// with a non-zero exit and a clear message, instead of a silent, structurally
+// identical-to-passing skip. `SUPERVISOR_E2E_ALLOW_SKIP=1` is the explicit,
+// opt-in escape hatch for a machine that genuinely has no opencode installed.
+if (SKIP && process.env.SUPERVISOR_E2E_ALLOW_SKIP !== "1") {
+  throw new Error(
+    "opencode binary not found on PATH — refusing to silently skip test/e2e-opencode.test.mjs " +
+    "(a skipped E2E run exits 0, indistinguishable from a real pass, and this suite is a mandatory " +
+    "pre-commit gate per AGENTS.md).\n" +
+    "Fix: put the opencode binary on PATH before running, e.g.:\n" +
+    '  export PATH="$HOME/.opencode/bin:$PATH" && npm run test:e2e\n' +
+    "(binary commonly lives at ~/.opencode/bin/opencode).\n" +
+    "To intentionally run without opencode installed and accept that these tests are skipped, " +
+    "set SUPERVISOR_E2E_ALLOW_SKIP=1."
+  )
+}
+
 describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
   let server
   let baseUrl
@@ -505,15 +528,20 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     // Uses the suite-level fixture `model` — no cooldown needed since the
     // fixture is local and instantaneous (no remote rate limiting to avoid).
 
-    // Proves the real `autopilot_exit` tool (opencode/supervisor-impl.ts,
-    // executeAutopilotExit) round-trips end to end: enabling autopilot makes
-    // the tool available to the model; a plain, non-"/supervisor"
+    // Proves the real `supervisor_loop_exit` tool (opencode/supervisor-impl.ts,
+    // executeSupervisorLoopExit) round-trips end to end: enabling autopilot
+    // makes the tool available to the model; a plain, non-"/supervisor"
     // continuation-style message (standing in for the nudge the plugin's own
     // session.idle handler injects) causes the fixture to call it, the real
     // server executes it, and supervisorStore records autopilot as disabled
     // for the session — the concrete mechanism by which "the agent must call
-    // autopilot_exit to stop" (see the tool's own description string) works.
-    test("autopilot_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
+    // supervisor_loop_exit when work is complete" (see the autopilot tool
+    // description string) works. The predecessor `autopilot_exit` tool has
+    // been deleted (a second tool for the same job that unconditionally
+    // called setAutopilot(false), silently destroying an active goal — see
+    // AGENTS.md's stop-mechanism section); this test covers the same
+    // end-to-end behavior against its replacement.
+    test("supervisor_loop_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
       const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
       assert.equal(createRes.status, 200)
       const session = await createRes.json()
@@ -522,33 +550,54 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       assert.ok(JSON.stringify(enableRes).toLowerCase().includes("autopilot"))
 
       // Plain continuation nudge — no "/supervisor" prefix, tools available.
-      // The fixture routes this to autopilot_exit (see
+      // The fixture routes this to supervisor_loop_exit (see
       // test/helpers/opencode-fixture-llm.mjs), exactly as a real model is
       // instructed to once "genuinely completed ALL work" (see the
-      // autopilotExitDescription / continuation-nudge prompt text in
+      // supervisorLoopExitDescription / continuation-nudge prompt text in
       // opencode/supervisor-impl.ts).
       const exitRes = await sendMessage(baseUrl, session.id, "Continue with the next step.", 120_000, { model })
       const exitContent = JSON.stringify(exitRes).toLowerCase()
       assert.ok(
-        exitContent.includes("exit") || exitContent.includes("autopilot completed"),
-        `Expected autopilot_exit tool round-trip to be reflected in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
+        exitContent.includes("supervision loop ended"),
+        `Expected the supervisor_loop_exit tool's own summary text in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
+      )
+
+      // `POST /session/{id}/message` returns ONLY the final assistant message
+      // of the turn — the text-only summary written AFTER the tool executed
+      // (verified live: its `parts` contain just step-start/text/step-finish,
+      // never a `type: "tool"` part). The tool-call part with the literal
+      // tool name lives on an EARLIER message in the same turn
+      // (`finish: "tool-calls"`), so asserting the tool's NAME against
+      // `exitRes` can never pass — it is asserting an API shape that does not
+      // exist. Fetch the full transcript and inspect the real tool-call part
+      // instead, so this proves the actual `supervisor_loop_exit` tool
+      // executed, not merely that some text happened to mention "exit".
+      const allMsgs = await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()
+      const toolParts = allMsgs.flatMap((m) => m.parts || []).filter((p) => p?.type === "tool")
+      assert.ok(
+        toolParts.some((p) => p.tool === "supervisor_loop_exit"),
+        `Expected a real supervisor_loop_exit tool-call part in the transcript. Tool parts seen: ${JSON.stringify(toolParts.map((p) => p.tool))}`
+      )
+      assert.ok(
+        !toolParts.some((p) => p.tool === "autopilot_exit"),
+        `The deleted autopilot_exit tool must never appear as a tool-call part in the transcript. Tool parts seen: ${JSON.stringify(toolParts.map((p) => p.tool))}`
       )
 
       // Confirm the mode was actually flipped off server-side (not merely
       // that the tool call text was echoed) by checking status afterward.
-      // executeAutopilotExit -> supervisorStore.setAutopilot(..., false) ->
-      // setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
+      // executeSupervisorLoopExit -> supervisorStore.setAutopilot(..., false)
+      // -> setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
       // (core/goal.mjs), so the status report's "mode:" line must read
       // "reflection", never "autopilot".
       const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 120_000, { model })
       const statusContent = JSON.stringify(statusRes).toLowerCase()
       assert.ok(
         statusContent.includes("mode: reflection"),
-        `Expected mode: reflection after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+        `Expected mode: reflection after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
       )
       assert.ok(
         !statusContent.includes("mode: autopilot"),
-        `Expected autopilot to be disabled after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+        `Expected autopilot to be disabled after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
       )
     })
 
@@ -633,13 +682,25 @@ const ACTIONLESS = -1
  * deterministically.
  *
  * The final `text` branch is deliberately NOT the shipped fixture's fallback,
- * which calls `autopilot_exit` whenever that tool is offered — and it is
+ * which calls `supervisor_loop_exit` whenever that tool is offered — and it is
  * offered plugin-wide, on every session, so the shipped fallback would end an
  * autopilot loop on nudge 1 and silently defeat the autopilot cap test.
+ *
+ * `opts.staticReply` (default false): when false (every budget test below),
+ * the fallback reply is suffixed with the fixture's own monotonic request
+ * index, so consecutive replies are never byte-identical. A real agent does
+ * not repeat itself verbatim forever; a fixture that does collides with the
+ * no-progress gate (core/evaluation.mjs's `evaluateNoProgress`, wired into
+ * opencode by the `no-progress-parity` fix) and silently caps EVERY one of
+ * these budget tests at `NO_PROGRESS_REPEAT_THRESHOLD` (2) regardless of the
+ * configured budget — the exact false failure this comment is pinning down.
+ * `staticReply: true` opts back into the old fixed text and is used ONLY by
+ * the dedicated "no-progress gate" test below, which needs a genuinely
+ * repeating agent to prove the gate really caps one.
  */
-function budgetResponder(judgeFor) {
+function budgetResponder(judgeFor, { staticReply = false } = {}) {
   return (ctx) => {
-    const { fullText, lastText, hasTools, messages } = ctx
+    const { fullText, lastText, hasTools, messages, index } = ctx
     const prompt = (lastText || "").trimStart()
     if (prompt.startsWith(JUDGE_MARKER)) return { text: judgeFor(ctx) }
     if (prompt.startsWith(REFLECTION_MARKER) || fullText.includes("SELF-ASSESS SUPERVISOR")) {
@@ -659,7 +720,11 @@ function budgetResponder(judgeFor) {
     const lastRole = messages[messages.length - 1]?.role
     if (lastRole === "tool") return null
     if (/^\/?supervisor\b/i.test(prompt)) return null
-    return { text: "Made some progress. Stopping here for now." }
+    return {
+      text: staticReply
+        ? "Made some progress. Stopping here for now."
+        : `Made some progress on attempt ${index}. Stopping here for now.`
+    }
   }
 }
 
@@ -879,6 +944,61 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
       readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
     )
     assert.notEqual(state.mode, "autopilot", "autopilot must be disarmed once its budget is spent")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// No-progress gate parity (opencode side). Own describe/server: every test
+// above this line deliberately uses a VARYING fixture reply (budgetResponder's
+// default) so the gate never fires and the budget itself is what's under
+// test. This block does the opposite on purpose: a byte-identical agent
+// reply, every attempt, to prove `evaluateNoProgress` (core/evaluation.mjs)
+// really does cap a genuinely-repeating agent on the opencode runtime — the
+// parity gap `no-progress-parity` (1b49b72) closed. Without this test, the
+// only coverage of the no-progress gate was the CC-only hook path.
+// ---------------------------------------------------------------------------
+describe("no-progress gate caps a genuinely-repeating agent (opencode)", { skip: SKIP && "opencode binary not in PATH", timeout: 600_000 }, () => {
+  let server
+  let baseUrl
+  const model = { providerID: "test-fixture", modelID: "fixture-model" }
+
+  before(async () => {
+    server = await startLiveServer({
+      label: "no-progress",
+      responder: budgetResponder(() => verdict(), { staticReply: true }),
+    })
+    baseUrl = server.baseUrl
+  })
+
+  after(async () => {
+    if (server) await server.stop()
+  })
+
+  test("a byte-identical agent reply stands down after NO_PROGRESS_REPEAT_THRESHOLD repeats, even with budget left", { timeout: 600_000 }, async () => {
+    const probe = "PROBE-NO-PROGRESS"
+    const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+
+    // A generous budget (5) — if this capped at 2 only because the budget
+    // was small, it would prove nothing about the no-progress gate itself.
+    await sendMessage(baseUrl, session.id, "/supervisor retry 5", 120_000, { model })
+    await sleep(3000)
+    const startIndex = (await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()).length
+
+    await sendMessage(baseUrl, session.id, actionableTask(probe), 180_000, { model })
+    const injections = await settleInjections(baseUrl, session.id, { fromIndex: startIndex })
+
+    // NO_PROGRESS_REPEAT_THRESHOLD = 2 (core/evaluation.mjs): the first
+    // repeat is tolerated (injection 1), the SECOND consecutive repeat stands
+    // the supervisor down before a 3rd injection — so exactly 2, not 5.
+    assert.equal(
+      injections, 2,
+      `a genuinely repeating agent (byte-identical reply every attempt) must be capped at ` +
+      `NO_PROGRESS_REPEAT_THRESHOLD (2) injections regardless of the configured budget (5), got ${injections}`
+    )
+    assert.match(
+      server.debugLog(), /no-progress gate: standing down/,
+      "plugin debug log must record the no-progress stand-down reason, not just fall silent"
+    )
   })
 })
 

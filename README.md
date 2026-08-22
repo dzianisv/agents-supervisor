@@ -74,8 +74,9 @@ Inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (budget resets each human turn)
+- `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal (keeps the same condition, resets this turn's attempt budget)
 - `/supervisor:retry N` — set the per-turn retry budget (1–100, default 16)
-- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `AUTOPILOT_EXIT` or budget exhaustion
+- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `SUPERVISOR_LOOP_EXIT: completed` or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
 - `/supervisor:off` — disable for this session
@@ -99,6 +100,7 @@ Use the same colon-command set as Claude Code:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition
+- `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal
 - `/supervisor:retry N` — set the retry budget (1–100)
 - `/supervisor:autopilot` — skip the judge, auto-continue until exit or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
@@ -110,6 +112,7 @@ OpenCode also supports a bare `/supervisor <subcommand>` dispatcher as an altern
 - `/supervisor status`
 - `/supervisor autopilot`
 - `/supervisor set-goal <condition>`
+- `/supervisor set-goal resume`
 - `/supervisor reflection`
 - `/supervisor on`
 - `/supervisor off`
@@ -130,7 +133,7 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
 | `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met. The retry budget bounds one human turn, then resets when you speak again. |
-| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
+| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or budget exhaustion. |
 
 The effective default mode is `reflection`.
 
@@ -178,9 +181,17 @@ goal's met.
 the supervisor may re-prompt inside one unbroken turn; the moment you send another
 message, the budget resets and the goal keeps driving. Spending the budget stands
 the supervisor down for the rest of that turn and hands control back to you — it
-does not end the goal. Only two things end a goal: the judge confirming the
-condition is met, or the 30-day deadline backstop (see
-`DEFAULT_MAX_GOAL_DURATION_MS`). Clear one early with `/supervisor:set-goal clear`.
+does not end the goal. Only the judge confirming the condition is met, or an
+explicit `/supervisor:set-goal clear`, truly END a goal (deleted from disk). Two
+other things stand it down without deleting it — the agent declaring itself
+`stuck` (`supervisor_loop_exit`), or the 30-day deadline backstop (see
+`DEFAULT_MAX_GOAL_DURATION_MS`) — and both leave it `paused`/`exhausted` with the
+condition intact rather than a dead end: resume either with
+`/supervisor:set-goal resume`, which flips it back to `active`, clears the stale
+pause reason, and gives it a fresh attempt budget (and a fresh 30-day window if
+the old deadline had already passed). `/supervisor:status` (and the OpenCode
+`supervisor` tool's status text) always reports a paused/exhausted goal honestly,
+with the reason and the resume hint — never silently as if it were still active.
 
 This used to be a separate `solofounder` mode. It isn't any more — those semantics
 are goal mode's default, and `solofounder` survives only as a skill
@@ -250,12 +261,12 @@ prescriptive nudge to keep working.
 
 For web app / OpenCode API, call tools directly:
 - `supervisor_autopilot` — toggle on/off (`enabled: true | false`)
-- `autopilot_exit` — the agent calls this when work is genuinely complete
+- `supervisor_loop_exit` — the agent calls this with `reason: 'completed'` when work is genuinely complete
 
 **Autopilot semantics:**
 - Agent continues on every idle **unconditionally** (no judge evaluation)
 - Judge is **bypassed entirely** — no latency from scoring/reflection
-- Agent must call `AUTOPILOT_EXIT` to signal work is complete
+- Agent must call `supervisor_loop_exit` (OpenCode) / output `SUPERVISOR_LOOP_EXIT: completed` alone on its own line (Claude Code) to signal work is complete
 - Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
 - Safety rails still apply: attempt budget, destructive-action flagging
 
@@ -265,7 +276,7 @@ For web app / OpenCode API, call tools directly:
 |---|---|---|
 | Judge evaluation | Yes (self-assessment + optional cross-model) | No (skipped entirely) |
 | Continuation trigger | Judge says "not done" | Every idle (unconditional) |
-| Stop condition | Goal met (or 30-day deadline) | Agent calls `autopilot_exit` or budget exhausted |
+| Stop condition | Goal met (or 30-day deadline) | Agent calls `supervisor_loop_exit` / outputs `SUPERVISOR_LOOP_EXIT: completed`, or budget exhausted |
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:
