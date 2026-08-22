@@ -75,7 +75,7 @@ Inside any Claude Code session, use any of these commands:
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (the per-turn attempt counter resets each human turn)
 - `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal (keeps the same condition, resets this turn's attempt counter)
-- `/supervisor:retry N` — tune the runaway safety valve (1–100; default 50, clamped to 7 on Claude Code). This is NOT a budget you are meant to spend — see "The stop mechanism" below.
+- `/supervisor:retry N` — tune the runaway safety valve (any positive integer, honoured verbatim; `0`/`unlimited` removes the cap; default **50**, reduced to 7 on Claude Code — see the platform-cap note). This is NOT a budget you are meant to spend — see "The stop mechanism" below.
 - `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `SUPERVISOR_LOOP_EXIT: completed`
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
@@ -101,7 +101,7 @@ Use the same colon-command set as Claude Code:
 - `/supervisor:train` — learn from your sessions
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition
 - `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal
-- `/supervisor:retry N` — tune the runaway safety valve (1–100)
+- `/supervisor:retry N` — tune the runaway safety valve (any positive integer, or `unlimited`/`0` for no cap; default **50**)
 - `/supervisor:autopilot` — skip the judge, auto-continue until the agent exits or the runaway valve trips
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
@@ -178,7 +178,7 @@ session in `reflection` (the mode that verifies it) and keeps it there.
 
 ```
 /supervisor:set-goal all tests in test/auth pass and the PR is open with green CI
-/supervisor:retry 24           # set this turn's retry budget (1–100)
+/supervisor:retry 24           # tune the runaway valve (any positive int; unlimited/0 = no cap)
 ```
 
 > **In autopilot, a goal is context, not a verified condition.** Autopilot never
@@ -231,10 +231,73 @@ agent is not allowed to stop until the goal is met. The intended stop is the age
 own `supervisor_loop_exit` (OpenCode) / `SUPERVISOR_LOOP_EXIT:` sentinel (Claude
 Code); a per-turn attempt counter exists only as a **runaway safety valve** (default
 `RUNAWAY_CEILING = 50`, the same in every mode — there are no per-mode defaults). On
-Claude Code the Stop hook clamps that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus
+Claude Code the Stop hook reduces that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus
 one), so 50 means 7 effective there. State is per-session at
 `.supervisor/sessions/<sessionId>/state.json` (mode 0600); the counter is spent only
 when a continuation actually fires, and it resets on each new human turn.
+
+> **Why 50?** It is not folklore — it is explained and sourced. **First, the unit:**
+> this counts supervisor **injections** (outer-loop re-prompts), and each injection
+> *restarts a whole agent turn* that may itself run dozens of tool calls. So 50
+> injections ≈ 50 completed agent turns ≈ plausibly hundreds-to-thousands of model
+> steps — this is NOT the same unit as a framework's per-run step/turn cap
+> (LangChain `max_iterations=15`, LangGraph `recursion_limit=25`, OpenAI Agents SDK
+> `max_turns=10`, smolagents `max_steps=20`, CrewAI `max_iter=25`, Aider
+> `max_reflections=3`, OpenHands `max_iteration_per_run=500`). Measured against
+> them, 50 is one of the **most permissive** limits in the ecosystem, effectively
+> unbounded in dollars. **Second, it is a backstop, not a tuned optimum.** A 30-day
+> forensic sample on the author's machine (59 authoritative last-turn samples / 19
+> projects; 133-sample same-task corroboration) shows legitimate turns cap at **≤3
+> injections** (p50=3, p90=3, p99≈3); everything above ~16 was a doom loop that
+> *saturated* whatever cap existed, so the region above 3 is **censored**, not real
+> work. **50 ≈ 17× the observed p99** — deliberately far above reality. That is
+> the right shape: the long-horizon coding frameworks that tuned a stop moved OFF
+> a step count onto a **cost budget** (SWE-agent `$3`/instance; mini-SWE-agent
+> `step_limit=0` + `$3`; Claude Agent SDK ships no turn cap and recommends a USD
+> budget "for production agents"; Anthropic's own SWE-bench scaffold has no turn
+> cap), because **successful runs live in the tail** (Anthropic reports successes
+> at ">100 turns"; arXiv 2510.16786 finds median turns-to-solve 41–58, tail >175)
+> — so a low static cap trades tail *success* for cost. It bounds only the *cost*
+> of a loop that never declares an exit; the real stops are `supervisor_loop_exit`,
+> the no-progress gate, a goal deadline, and `/supervisor off`. (The same evidence
+> says the *right primary* control is a per-turn cost/token budget — a mechanism
+> change deliberately NOT made here.) Full write-up with source URLs:
+> `.scratch/runaway-limit-analysis.md`.
+
+**Making it configurable.** The valve is resolved by ONE shared function
+(`describeRunawayLimit`, `core/goal.mjs`), used by both runtimes, with this
+precedence (first parseable value wins):
+
+| Tier | Surface | Spelling |
+|---|---|---|
+| 1. session override | `/supervisor:retry N` (CLI) / `supervisor_retry` tool `n` (OpenCode) | positive int, or `0`/`unlimited`/`off`/`none` |
+| 2. config file | `maxAttempts:` in `~/.config/opencode/supervisor.yaml` | positive int, or `unlimited`/`off`/`none`/`0` |
+| 3. env | `SUPERVISOR_MAX_ATTEMPTS` (or legacy `REFLECTION_CC_MAX_ATTEMPTS`) | positive int, or `unlimited`/`off`/`none`/`0` |
+| 4. default | — | `50` |
+
+```yaml
+# ~/.config/opencode/supervisor.yaml
+maxAttempts: 128         # any positive integer, honoured verbatim (no upper clamp)
+# maxAttempts: unlimited # or off / none / 0 — remove the cap entirely
+```
+
+- **No silent rewriting.** A positive integer you type is honoured verbatim —
+  there is no upper clamp. An out-of-range value (negative, fractional,
+  non-numeric) is **rejected** at the CLI/tool with a message naming the
+  accepted range, and **ignored with a debug warning** in the config file
+  (falling through to the next tier) — it is never quietly changed to something
+  else.
+- **`unlimited` (= `0`/`off`/`none`) means no attempt cap at all.** The loop is
+  then bounded only by the agent's own `supervisor_loop_exit`, the no-progress
+  gate, a goal deadline, and `/supervisor off`. This is a deliberate operator
+  choice, so it is honoured — and made **visible**: `/supervisor:status` reports
+  it plainly and the debug log records it once per turn, so an unbounded session
+  is never a surprise.
+- **Claude Code cannot honour `unlimited`.** Its Stop hook is physically capped
+  by the platform at `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1` (currently **7**).
+  When the resolved limit is reduced by that cap — especially when you asked for
+  `unlimited` — `/supervisor:status` and the debug log say so explicitly, naming
+  the cap and that Claude Code, not the supervisor, imposes it.
 
 In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 
@@ -283,7 +346,7 @@ For web app / OpenCode API, call tools directly:
 - Agent continues on every idle **unconditionally** (no judge evaluation)
 - Judge is **bypassed entirely** — no latency from scoring/reflection
 - Agent must call `supervisor_loop_exit` (OpenCode) / output `SUPERVISOR_LOOP_EXIT: completed` alone on its own line (Claude Code) to signal work is complete
-- Or the supervisor's runaway safety valve trips (default 50, 7 on Claude Code; tune via `/supervisor:retry N`)
+- Or the supervisor's runaway safety valve trips (default 50, 7 on Claude Code, or `unlimited`; tune via `/supervisor:retry N`)
 - Safety rails still apply: attempt budget, destructive-action flagging
 
 **How it differs from the goal loop:**
@@ -296,7 +359,7 @@ For web app / OpenCode API, call tools directly:
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:
-- **Runaway safety valve**: a last-resort breaker that trips at the runaway limit (default 50, 7 on Claude Code; tune via `/supervisor retry N`) — NOT a budget the agent is meant to spend; the intended stop is `supervisor_loop_exit`
+- **Runaway safety valve**: a last-resort breaker that trips at the runaway limit (default 50, 7 on Claude Code, or `unlimited` for no cap; tune via `/supervisor retry N`) — NOT a budget the agent is meant to spend; the intended stop is `supervisor_loop_exit`
 - **Destructive-action flagging**: force-push, hard reset, history rewrite, branch deletion, `rm -rf`, and unapproved spend are flagged to the user for approval instead of being nudged
 - **Tool-activity telemetry**: a bounded, non-binding note (read/write tool-call counts) may be appended to the nudge as factual context — it never itself decides completion or emits a stop verdict
 
@@ -325,9 +388,11 @@ CC, the Stop hook clamps its runaway safety valve to
 **8**; the hook always stays one under it) and can be overridden via env var if
 you raise CC's limit or a future CC version changes it. There are **no per-mode
 defaults**: reflection, goal mode, and autopilot all share the same runaway limit
-(default 50), which CC then clamps to 7 within any single unbroken turn — the limit
+(default 50), which CC then reduces to 7 within any single unbroken turn — the limit
 still spans multiple turns, it just can't all be spent in one uninterrupted block
-chain, since CC itself wouldn't honor that many.
+chain, since CC itself wouldn't honor that many. If you set the limit to
+`unlimited`, Claude Code still reduces it to 7 (it physically cannot honour an
+uncapped Stop hook) and says so in `/supervisor:status` and the debug log.
 
 The counter is also scoped **per turn**: it resets whenever a new, genuine
 user message arrives, and persists across Stop events that belong to the same

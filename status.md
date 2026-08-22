@@ -1,5 +1,39 @@
 # status
 
+## Track F — configurable runaway limit (RUNAWAY_CEILING now derived + tunable)
+
+Task: `RUNAWAY_CEILING = 50` was picked by feel. Derive the default from real
+data, make it genuinely configurable (incl. an explicit `unlimited` opt-out),
+stop silently rewriting the operator, and surface — never silently apply — the
+Claude Code platform cap.
+
+```
+ROADMAP  ████████████████████  done
+ [x] 1. forensic analysis of 30d real sessions -> .scratch/runaway-limit-analysis.md
+ [x] 2. RUNAWAY_CEILING 50 kept as backstop; doc comment now EXPLAINED + SOURCED (core/goal.mjs)
+ [x] 3. describeRunawayLimit descriptor: {limit,requested,unlimited,tier,cappedByPlatform,hardCap}
+ [x] 4. unlimited/off/none/0 opt-out; positive ints honoured verbatim (no [1,100] clamp)
+ [x] 5. config maxAttempts: in supervisor.yaml (shared sync reader, both runtimes)
+ [x] 6. CC platform cap surfaced in status + debug (never silently pretended)
+ [x] 7. loop-exit.log runaway_ceiling record names resolved limit + tier
+ [x] 8. docs (README/AGENTS/tdd/concepts/skills/commands) + tests + sensitivity
+```
+
+UNIT + MEASUREMENT: N counts supervisor INJECTIONS (outer-loop re-prompts), each
+≈ a whole agent turn of dozens of steps — so 50 injections ≈ 50 completed agent
+turns ≈ hundreds-to-thousands of model steps, NOT comparable to a framework's
+per-run cap (LangChain 15, OpenAI SDK max_turns=10, OpenHands 500). Measured (59
+authoritative last-turn samples, 19 projects; 133 same-task corroboration): legit
+turns cap at ≤3 injections (p50=3, p90=3, p99≈3); everything above ~16 is censored
+doom-loop saturation. So 50 ≈ 17× observed p99 — a backstop set well above reality,
+not a tuned optimum. The frameworks that tuned a stop moved to COST budgets
+(SWE-agent $3, Claude SDK, Anthropic scaffold) because successes live in the tail
+(arXiv 2510.16786 median 41–58, tail >175). REPORTED to owner (not built): a
+per-turn cost/token budget as the primary control (opencode exposes per-message
+cost+tokens); and whether no-progress threshold 2 is too twitchy vs OpenHands 3–4.
+
+---
+
 ## Track E — agent-declared loop exit (replaces static retry counter)
 
 Task: static per-turn retry budget (3 reflection / 16 goal) stood the

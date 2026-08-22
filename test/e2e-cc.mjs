@@ -18,7 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { verdictsPath } from '../core/session-store.mjs';
-import { goalStore, readGoalAchievedLog } from '../core/goal.mjs';
+import { goalStore, readGoalAchievedLog, resolveClaudeCodeHardCap } from '../core/goal.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
@@ -280,6 +280,47 @@ check('default runaway limit allows a goal loop to inject well past 3 (a 4th tim
   // CC's HARD_CAP=7), so 4 injections are well within it — the old "goal raises
   // the budget to 16" special-case is gone but the loop still runs freely.
   assert.equal(blocks, 4, `default runaway limit should allow >3 injects, got ${blocks}`);
+});
+
+check('retry unlimited on Claude Code is CLAMPED to the platform cap and SAYS so (never silently pretends)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-unlimited-cc';
+  goalStore.setGoal(dir, sid, 'keep going');       // a goal so the loop keeps pushing
+  goalStore.setRetry(dir, sid, 'unlimited');        // operator explicitly asks for NO cap
+  const cap = resolveClaudeCodeHardCap();           // 7 = CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1
+  let blocks = 0;
+  for (let i = 0; i < cap + 2; i++) {               // drive PAST the cap in one turn
+    const text = `Working, step ${i + 1}. Next: run the tests to verify it.`;
+    fs.writeFileSync(tp, [
+      driftTurns[0],
+      { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'tool_use', name: 'Edit', input: {} },
+        { type: 'text', text },
+      ] } },
+    ].map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+    const { stdout } = runHook(payload, { ...fakeEnv('summary_drift_stop'), SUPERVISOR_DEBUG: '1' });
+    if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
+  }
+  // Claude Code physically cannot honour `unlimited` — the Stop hook is capped
+  // by the platform — so the loop still stops at HARD_CAP, NOT forever.
+  assert.equal(blocks, cap, `unlimited must still be clamped to the CC platform cap ${cap}, got ${blocks}`);
+  // The ceiling record names the resolved limit, the tier that set it, and that
+  // the platform forced the requested `unlimited` down — surfaced, not silent.
+  const recs = fs.readFileSync(path.join(dir, '.supervisor', 'loop-exit.log'), 'utf8')
+    .trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const ceiling = recs.find((r) => r.reason === 'runaway_ceiling');
+  assert.ok(ceiling, 'a runaway_ceiling record must be written when the platform cap is hit');
+  assert.equal(ceiling.maxAttempts, cap);
+  assert.equal(ceiling.limit, String(cap));
+  assert.equal(ceiling.limitTier, 'retry');
+  assert.equal(ceiling.requested, 'unlimited');
+  assert.equal(ceiling.cappedByPlatform, true);
+  assert.equal(ceiling.platformHardCap, cap);
+  // The debug log states the cap explicitly, naming Claude Code as its source.
+  const debug = fs.readFileSync(path.join(dir, '.supervisor', 'debug.log'), 'utf8');
+  assert.match(debug, /runaway_limit_platform_capped/);
+  assert.match(debug, /Claude Code caps the Stop hook/);
 });
 
 // ── Loop exit sentinel (the CC mirror of the supervisor_loop_exit tool) ────

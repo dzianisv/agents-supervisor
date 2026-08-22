@@ -16,6 +16,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { sessionStore } from './session-store.mjs';
 
@@ -102,45 +103,195 @@ export function resolveSupervisorMode(state = {}) {
  * counter — which cannot observe completion — stand the supervisor down
  * mid-task, so it is deliberately high. Hitting it is LOUD: both runtimes
  * append a reason:'runaway_ceiling' record to .supervisor/loop-exit.log.
+ *
+ * THE UNIT — read this before comparing 50 to any framework number. N counts
+ * SUPERVISOR INJECTIONS: OUTER-loop re-prompts. Each injection RESTARTS a whole
+ * agent turn that itself may run dozens of tool calls. So N is NOT the same unit
+ * as the per-run step/turn caps in agent frameworks, which bound the INNER loop
+ * of ONE run: LangChain AgentExecutor.max_iterations=15; LangGraph
+ * recursion_limit=25; OpenAI Agents SDK max_turns=10; smolagents max_steps=20;
+ * CrewAI max_iter=25; Aider max_reflections=3; AutoGen v0.2
+ * max_consecutive_auto_reply=100; OpenHands max_iteration_per_run=500 (with
+ * stuck_detection on). 50 of OUR injections ≈ 50 completed agent turns ≈
+ * plausibly hundreds-to-thousands of model steps — one of the MOST PERMISSIVE
+ * limits in the ecosystem, effectively unbounded in dollars. Anyone who reads
+ * "50" and compares it to LangChain's 15 or the SDK's 10 draws the wrong
+ * conclusion: the comparable unit is a whole agent RUN, not one step.
+ *
+ * WHY 50, AND WHY IT IS NOT FOLKLORE (explained + sourced, not tuned). This is a
+ * BACKSTOP set well above observed reality, not an optimum:
+ *   - MEASURED (this machine, ~30 days; see .scratch/runaway-limit-analysis.md).
+ *     The authoritative per-turn counter (attempts.count) over 59 last-turn
+ *     samples across 19 `.supervisor` stores had p50=3, p90=3, p99≈3; a same-task
+ *     corroboration (133 samples) gave the same p99=3. NO legitimate turn ever
+ *     exceeded 3 injections; every sample above ~16 was a doom loop that
+ *     SATURATED whatever cap was in force (old reflection 3, old goal 16, this
+ *     50 — hit 3× — or a configured 100 — once). The region above 3 is CENSORED,
+ *     not real work. So 50 ≈ 17× the observed p99: deliberately far above reality.
+ *   - The long-horizon coding frameworks that DID tune a stop moved OFF a step
+ *     count onto a COST budget: SWE-agent per_instance_cost_limit=$3 (step cap
+ *     disabled); mini-SWE-agent step_limit=0, $3 cost_limit is the real stop;
+ *     Claude Agent SDK ships no turn cap and recommends a USD budget "for
+ *     production agents"; Anthropic's own SWE-bench scaffold has NO turn cap
+ *     ("sample until the model decides it is finished, or exceeds 200k context").
+ *     Their empirical reason: successful runs live in the TAIL — Anthropic reports
+ *     successes at ">100 turns", and arXiv 2510.16786 finds median turns-to-solve
+ *     41–58 with a tail >175 — so a LOW static cap trades tail SUCCESS for cost.
+ *     That paper recommends setting the limit at the p75 of YOUR OWN observed
+ *     distribution (+ a dynamic extension on failure) and calls fixed step limits
+ *     "a brute-force approach that lacks the adaptability needed for tasks of
+ *     varying complexity". Our p75 is 3, so any static backstop is many× p75 by
+ *     construction — which is fine for a backstop and useless as an optimum.
+ * Net: keep the injection cap HIGH and crude (a runaway backstop); let the real
+ * stops do the work — supervisor_loop_exit, the no-progress gate, a goal
+ * deadline, `/supervisor off`. The evidence says the RIGHT primary control is a
+ * per-turn COST/TOKEN budget (opencode exposes per-message `cost` + `tokens`, so
+ * a plugin could sum them) — but that is a mechanism change and the owner's call,
+ * NOT made here. 50 bounds only the COST of a never-exiting loop, never signals
+ * completion, and is fully configurable — `/supervisor retry N`, `maxAttempts:`,
+ * `SUPERVISOR_MAX_ATTEMPTS` — `unlimited` included.
  */
 export const RUNAWAY_CEILING = 50;
 
 /**
- * THE ONE runaway-limit resolver, shared verbatim by both runtimes. Returns the
- * maximum number of supervisor injections allowed in a SINGLE human turn before
- * the loop is force-stopped. It is the safety valve described on
- * RUNAWAY_CEILING — not a budget the agent should pace against — so it is
- * deliberately not called "maxAttempts" at the call sites.
+ * Sentinel for "no runaway cap". `Infinity` is the natural in-code form: every
+ * ceiling gate is a `attempts >= limit` comparison, and `x >= Infinity` is
+ * always false, so an unlimited limit force-stops the turn on NO count. It is
+ * never persisted as a number (JSON turns Infinity into null) — the on-disk /
+ * on-the-wire spelling is the string `'unlimited'`, mapped here by
+ * parseAttemptsValue.
+ */
+export const UNLIMITED = Infinity;
+
+/** Word spellings of "no limit", accepted identically on every surface (CLI arg, opencode tool, supervisor.yaml, env). */
+export const UNLIMITED_ALIASES = Object.freeze(['unlimited', 'off', 'none', 'infinite']);
+const UNLIMITED_ALIAS_SET = new Set(UNLIMITED_ALIASES);
+
+/**
+ * Parse ONE raw attempts value — from a `/supervisor retry` arg, the opencode
+ * tool `n`, `maxAttempts:` in supervisor.yaml, an env var, or persisted
+ * `state.maxAttempts` — into exactly one of:
+ *   - a positive integer (honoured verbatim, NO upper clamp — a number the
+ *     operator explicitly typed is never silently rewritten; 2a);
+ *   - `Infinity` (UNLIMITED) for the opt-out spellings `unlimited`/`off`/`none`
+ *     /`infinite`/`0` (0 means "no cap", NOT zero attempts — documented);
+ *   - `null` for absent OR invalid (negative, fractional, non-numeric garbage),
+ *     so a config/env tier falls through and a CLI/tool tier can reject LOUDLY.
  *
- * Precedence (first finite value wins), each clamped to [1,100]:
+ * @param {unknown} raw
+ * @returns {number|null} positive int, Infinity, or null
+ */
+export function parseAttemptsValue(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'number') {
+    if (raw === Infinity) return Infinity;
+    if (!Number.isFinite(raw)) return null;          // NaN / -Infinity → invalid
+    if (raw === 0) return Infinity;                   // 0 spelled opt-out
+    if (!Number.isInteger(raw) || raw < 1) return null; // fractional / negative → invalid
+    return raw;
+  }
+  const s = String(raw).trim().toLowerCase();
+  if (s === '') return null;
+  if (s === '0' || UNLIMITED_ALIAS_SET.has(s)) return Infinity;
+  if (/^\d+$/.test(s)) { const n = parseInt(s, 10); return n === 0 ? Infinity : n; }
+  return null;                                         // non-numeric garbage → invalid
+}
+
+/** True iff the resolved limit is the unbounded sentinel. */
+export function isUnlimited(limit) { return limit === Infinity; }
+
+/** Human display for a resolved/requested limit: a number, or the word `unlimited`. */
+export function formatRunawayLimit(limit) { return Number.isFinite(limit) ? String(limit) : 'unlimited'; }
+
+/**
+ * THE ONE runaway-limit resolver, shared verbatim by both runtimes. It returns
+ * a DESCRIPTOR (not a bare number) so every surface — the ceiling gate, the
+ * status text, the loop-exit.log forensic record, the once-per-turn debug line
+ * — reads the same resolution and cannot drift. `resolveRunawayLimit()` is the
+ * thin number accessor over it.
+ *
+ * Precedence (first PARSEABLE value wins; invalid values at a tier fall through
+ * rather than disabling the loop):
  *   1. sessionOverride — `/supervisor retry N`     (state.maxAttempts)
  *   2. config          — `maxAttempts:` in supervisor.yaml
  *   3. env             — SUPERVISOR_MAX_ATTEMPTS ?? REFLECTION_CC_MAX_ATTEMPTS
  *   4. RUNAWAY_CEILING — the same default for every mode
- * Then clamped DOWN to `hardCap` when the runtime has a platform ceiling
- * (Claude Code's Stop-hook block cap — resolveClaudeCodeHardCap; OpenCode has
- * none and passes no hardCap).
+ * Each tier is parsed by parseAttemptsValue → a positive int (honoured verbatim,
+ * NO upper clamp), `Infinity` (unlimited), or skipped. The default is finite.
+ * The resolved `requested` value is then reduced to `hardCap` when the runtime
+ * has a platform ceiling (Claude Code's Stop-hook block cap —
+ * resolveClaudeCodeHardCap; OpenCode has none and passes no hardCap). A hardCap
+ * ALWAYS caps `unlimited`, because the platform physically cannot honour it.
  *
- * The first three tiers are all deliberate operator choices, so any of them
- * overrides the default. There is intentionally NO `mode` input — mode never
- * changes the limit.
+ * There is intentionally NO `mode` input — mode never changes the limit.
  *
  * @param {object} opts
- * @param {number} [opts.sessionOverride] state.maxAttempts (`/supervisor retry N`)
- * @param {number} [opts.config] runtime config file value
+ * @param {number|string} [opts.sessionOverride] state.maxAttempts (`/supervisor retry N`; may be 'unlimited')
+ * @param {number|string} [opts.config] supervisor.yaml value (may be 'unlimited')
  * @param {number} [opts.hardCap] platform ceiling, applied last (Claude Code only)
  * @param {object} [opts.env] test seam; defaults to process.env
+ * @returns {{limit:number, requested:number, unlimited:boolean, tier:('retry'|'config'|'env'|'default'), cappedByPlatform:boolean, hardCap:(number|null)}}
+ */
+export function describeRunawayLimit(opts = {}) {
+  const env = opts.env ?? process.env;
+  const envRaw = env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS;
+  let tier = 'default';
+  let requested = RUNAWAY_CEILING;
+  for (const [name, raw] of [['retry', opts.sessionOverride], ['config', opts.config], ['env', envRaw]]) {
+    const v = parseAttemptsValue(raw);
+    if (v !== null) { tier = name; requested = v; break; }
+  }
+  const unlimited = requested === Infinity;
+  const hardCap = Number.isFinite(opts.hardCap) ? Math.max(1, Math.floor(opts.hardCap)) : null;
+  let limit = requested;
+  let cappedByPlatform = false;
+  if (hardCap !== null && (requested === Infinity || requested > hardCap)) {
+    limit = hardCap;
+    cappedByPlatform = true;
+  }
+  return { limit, requested, unlimited, tier, cappedByPlatform, hardCap };
+}
+
+/**
+ * Thin number accessor over describeRunawayLimit — the maximum injections
+ * allowed in a SINGLE human turn (or `Infinity` when unlimited and the runtime
+ * has no platform cap). Kept as the name every ceiling gate imports.
  */
 export function resolveRunawayLimit(opts = {}) {
-  const env = opts.env ?? process.env;
-  const clamp = (n) => Math.min(100, Math.max(1, Math.floor(n)));
-  const envRaw = env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS;
-  const envVal = envRaw === undefined ? NaN : parseInt(envRaw, 10);
-  let limit = RUNAWAY_CEILING;
-  for (const tier of [opts.sessionOverride, opts.config, envVal]) {
-    if (Number.isFinite(tier)) { limit = clamp(tier); break; }
-  }
-  return Number.isFinite(opts.hardCap) ? Math.max(1, Math.min(limit, opts.hardCap)) : limit;
+  return describeRunawayLimit(opts).limit;
+}
+
+/**
+ * Shared SYNC reader for `maxAttempts:` in ~/.config/opencode/supervisor.yaml,
+ * used by BOTH runtimes so the config-file surface (and its `unlimited`
+ * spelling) is identical on Claude Code and OpenCode. Returns the parsed value
+ * (a positive int, `Infinity` for unlimited, or `undefined` if absent), and
+ * reports an invalid `maxAttempts:` line via the optional `warn` callback
+ * (the file-surface form of "reject with a clear message" — there is no
+ * interactive channel, so we warn and fall through to the next tier).
+ *
+ * @param {(msg:string)=>void} [warn]
+ * @param {string} [configPath] override for tests
+ * @returns {number|undefined}
+ */
+export function readConfiguredMaxAttempts(warn, configPath) {
+  const p = configPath ?? path.join(os.homedir(), '.config', 'opencode', 'supervisor.yaml');
+  try {
+    const content = fs.readFileSync(p, 'utf-8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const m = line.match(/^maxAttempts\s*:\s*(.+?)\s*$/);
+      if (!m) continue;
+      const token = m[1].replace(/\s+#.*$/, '').trim().replace(/^["']|["']$/g, '');
+      const v = parseAttemptsValue(token);
+      if (v === null && typeof warn === 'function') {
+        warn(`supervisor.yaml: ignoring invalid maxAttempts "${token}" — use a positive integer or unlimited/off/0. Falling back to the default.`);
+      }
+      return v === null ? undefined : v;
+    }
+  } catch { /* missing file / unreadable → undefined */ }
+  return undefined;
 }
 
 /** Parse `/supervisor` and colon command args into a typed action. */
@@ -180,8 +331,13 @@ export function parseSupervisorCommand(name, args) {
   }
   if (name === 'retry') {
     if (trimmed === '') return { kind: 'retry-status' };
-    if (/^\d+$/.test(trimmed)) return { kind: 'retry-set', n: parseInt(trimmed, 10) };
-    return { kind: 'retry-status' };
+    if (trimmed.toLowerCase() === 'status') return { kind: 'retry-status' };
+    const v = parseAttemptsValue(trimmed);
+    if (v === Infinity) return { kind: 'retry-set', n: 'unlimited' };
+    if (typeof v === 'number') return { kind: 'retry-set', n: v };
+    // Non-empty but unparseable (negative, fractional, garbage): reject LOUDLY
+    // rather than silently rewriting a number the operator typed (2a).
+    return { kind: 'retry-invalid', raw: trimmed };
   }
   if (name === 'autopilot') {
     const lower = trimmed.toLowerCase();

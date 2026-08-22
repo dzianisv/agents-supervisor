@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { statePath } from '../core/session-store.mjs';
 import {
-  goalStore, resolveRunawayLimit,
+  goalStore, resolveRunawayLimit, describeRunawayLimit, readConfiguredMaxAttempts,
   resolveClaudeCodeHardCap, decideGoalTransition, RUNAWAY_CEILING,
   parseSupervisorCommand, buildGoalRequirementSection,
   DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode, appendGoalContextToNudge,
@@ -292,11 +292,71 @@ test('resolveRunawayLimit: precedence is retry > config > env > ceiling', () => 
   assert.equal(resolveRunawayLimit({ sessionOverride: 2, config: 4, env: { SUPERVISOR_MAX_ATTEMPTS: '9' } }), 2);
 });
 
-test('resolveRunawayLimit: clamps out-of-range values instead of disabling the loop', () => {
-  for (const bad of [0, -3, -1]) {
-    assert.equal(resolveRunawayLimit({ sessionOverride: bad, env: {} }), 1);
+test('resolveRunawayLimit: honours any positive integer verbatim (no upper clamp) and opts out on 0/unlimited', () => {
+  // 2a: a number the operator explicitly typed is NEVER silently rewritten.
+  assert.equal(resolveRunawayLimit({ sessionOverride: 500, env: {} }), 500);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 10_000, env: {} }), 10_000);
+  // 0 and the word spellings mean UNLIMITED (no cap), not "1 attempt".
+  for (const off of [0, 'unlimited', 'off', 'none', 'infinite']) {
+    assert.equal(resolveRunawayLimit({ sessionOverride: off, env: {} }), Infinity,
+      `${off} must resolve to Infinity (no cap)`);
   }
-  assert.equal(resolveRunawayLimit({ sessionOverride: 500, env: {} }), 100);
+  // Invalid values (negative, fractional, garbage) fall THROUGH to the next
+  // tier, never disabling the loop and never becoming some other number.
+  for (const bad of [-3, -1, 2.5]) {
+    assert.equal(resolveRunawayLimit({ sessionOverride: bad, config: 12, env: {} }), 12,
+      `${bad} at retry tier must fall through to config 12`);
+    assert.equal(resolveRunawayLimit({ sessionOverride: bad, env: {} }), RUNAWAY_CEILING,
+      `${bad} with no lower tier must fall through to the default`);
+  }
+});
+
+test('describeRunawayLimit: tier attribution + unlimited + platform cap surfaced', () => {
+  assert.equal(describeRunawayLimit({ env: {} }).tier, 'default');
+  assert.equal(describeRunawayLimit({ sessionOverride: 5, env: {} }).tier, 'retry');
+  assert.equal(describeRunawayLimit({ config: 9, env: {} }).tier, 'config');
+  assert.equal(describeRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '9' } }).tier, 'env');
+  const un = describeRunawayLimit({ sessionOverride: 'unlimited', env: {} });
+  assert.equal(un.unlimited, true);
+  assert.equal(un.limit, Infinity);
+  assert.equal(un.cappedByPlatform, false);
+  // Claude Code CANNOT honour unlimited: the platform cap always wins, and the
+  // descriptor records that it did (requested unlimited, enforced 7).
+  const cc = describeRunawayLimit({ sessionOverride: 'unlimited', hardCap: 7, env: {} });
+  assert.equal(cc.limit, 7);
+  assert.equal(cc.cappedByPlatform, true);
+  assert.equal(cc.unlimited, true);
+  assert.equal(cc.requested, Infinity);
+  assert.equal(cc.hardCap, 7);
+  // A finite requested value above the cap is likewise reduced and flagged.
+  const cc2 = describeRunawayLimit({ sessionOverride: 100, hardCap: 7, env: {} });
+  assert.equal(cc2.limit, 7);
+  assert.equal(cc2.cappedByPlatform, true);
+  assert.equal(cc2.requested, 100);
+  // A finite requested value BELOW the cap is honoured and NOT flagged.
+  const cc3 = describeRunawayLimit({ sessionOverride: 3, hardCap: 7, env: {} });
+  assert.equal(cc3.limit, 3);
+  assert.equal(cc3.cappedByPlatform, false);
+});
+
+test('readConfiguredMaxAttempts: parses maxAttempts:, accepts unlimited, warns on invalid', () => {
+  const d = mkcwd();
+  const p = path.join(d, 'supervisor.yaml');
+  fs.writeFileSync(p, 'model: anthropic/claude\nmaxAttempts: 128\n');
+  assert.equal(readConfiguredMaxAttempts(() => {}, p), 128);
+  fs.writeFileSync(p, 'maxAttempts: unlimited\n');
+  assert.equal(readConfiguredMaxAttempts(() => {}, p), Infinity);
+  fs.writeFileSync(p, 'maxAttempts: 0\n');
+  assert.equal(readConfiguredMaxAttempts(() => {}, p), Infinity);
+  // Invalid value: warn AND fall through (return undefined so the next tier wins).
+  fs.writeFileSync(p, 'maxAttempts: -4\n');
+  let warned = '';
+  assert.equal(readConfiguredMaxAttempts((m) => { warned = m; }, p), undefined);
+  assert.match(warned, /invalid maxAttempts/i);
+  // Absent key / missing file → undefined, no throw.
+  fs.writeFileSync(p, 'model: x\n');
+  assert.equal(readConfiguredMaxAttempts(() => {}, p), undefined);
+  assert.equal(readConfiguredMaxAttempts(() => {}, path.join(d, 'nope.yaml')), undefined);
 });
 
 test('resolveRunawayLimit: hardCap applies last and only where a runtime has one', () => {

@@ -99,7 +99,7 @@ reads/writes: .supervisor/sessions/<sessionId>/state.json
 | `assessment.mjs` | Constructs the self-assessment prompt (injects task context, patterns, anti-pattern rules, few-shot examples). Parses raw LLM output to `{ category, confidence }`. |
 | `evaluation.mjs` | Infers task type from transcript signals (`coding/docs/research/ops/other`). Evaluates classification to inject decision. Detects local test commands and default-branch push state. Provides bounded, non-binding tool-activity counting (`summarizeToolActivity`/`describeToolActivity`) that feeds informational telemetry into the autopilot nudge and reflection judge prompt. |
 | `feedback.mjs` | Selects feedback tone and content based on attempt count. Escalates from neutral to firm across attempts. Rewrites destructive-action nudges (force-push, hard reset, history rewrite, branch deletion, `rm -rf`) into a "flag to user for approval" message instead of nudging the action. |
-| `goal.mjs` | Manages goal state: sets goal + `maxAttempts=16`, evaluates per-stop as `achieved | continue | exhausted`. No inject on terminal states. |
+| `goal.mjs` | Manages goal state: sets goal, evaluates per-stop as `achieved | continue | exhausted`. No inject on terminal states. `maxAttempts` is the shared runaway valve (no per-mode default), resolved by `describeRunawayLimit`. |
 | `llm-client.mjs` | Single Anthropic SDK call with 30s hard timeout. Used for both self-assessment (haiku-4-5) and optional cross-model judge. |
 
 ---
@@ -172,7 +172,7 @@ never touching the live session.
 breaker; failing to take the lock degrades to last-writer-wins rather than
 blocking a turn.
 
-There are no per-mode `maxAttempts` defaults: every mode shares one runaway safety valve (`RUNAWAY_CEILING = 50`, resolved by `resolveRunawayLimit` in `core/goal.mjs`), tunable via `/supervisor:retry N` and clamped to 7 on Claude Code. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent declares the loop over — the `supervisor_loop_exit` tool on OpenCode, the `SUPERVISOR_LOOP_EXIT: completed` text sentinel on Claude Code (Stop hooks have no tool registry) — or the runaway safety valve trips.
+There are no per-mode `maxAttempts` defaults: every mode shares one runaway safety valve (`RUNAWAY_CEILING = 50`, explained + sourced — it counts supervisor INJECTIONS (outer-loop re-prompts, each ≈ a whole agent turn of dozens of steps), so it is NOT comparable to a framework's per-run cap (LangChain 15, OpenAI Agents SDK `max_turns=10`, OpenHands 500); a 30-day forensic sample shows legit turns cap at ≤3 injections (p50=3, p99≈3), so 50 ≈ 17× the observed p99 — a backstop set well above reality, not a tuned optimum; resolved by `describeRunawayLimit` in `core/goal.mjs`), tunable via `/supervisor:retry N` > `maxAttempts:` in `~/.config/opencode/supervisor.yaml` > `SUPERVISOR_MAX_ATTEMPTS` env, where a positive integer is honoured verbatim and `unlimited`/`0` removes the cap. It is reduced to 7 on Claude Code (surfaced in status/debug when it forces the requested value down). Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent declares the loop over — the `supervisor_loop_exit` tool on OpenCode, the `SUPERVISOR_LOOP_EXIT: completed` text sentinel on Claude Code (Stop hooks have no tool registry) — or the runaway safety valve trips.
 
 ---
 

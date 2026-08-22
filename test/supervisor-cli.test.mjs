@@ -194,6 +194,55 @@ test('retry 7 → sets budget; state.maxAttempts === 7', () => {
   assert.equal(state?.maxAttempts, 7);
 });
 
+test('retry 500 → honoured verbatim, NOT clamped (2a)', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-retry-big';
+  writeSession(tmp, sid);
+  const { stdout } = runSupervisor(tmp, ['retry', '500']);
+  assert.match(stdout, /500/);
+  assert.equal(loadGoalState(tmp, sid)?.maxAttempts, 500);
+});
+
+test('retry unlimited (and 0) → stores the unlimited sentinel; status reports no cap', () => {
+  for (const arg of ['unlimited', '0', 'off']) {
+    const tmp = mktmp();
+    const sid = 'cli-test-retry-unl';
+    writeSession(tmp, sid);
+    const { stdout } = runSupervisor(tmp, ['retry', arg]);
+    assert.match(stdout, /UNLIMITED|reduced from unlimited/i, `arg=${arg}`);
+    // On this CLI (Claude Code control surface) the platform cap of 7 applies,
+    // so the message must ALSO name the Claude Code cap rather than pretend
+    // unlimited is honoured.
+    assert.match(stdout, /Claude Code caps|7/i, `arg=${arg}`);
+    assert.equal(loadGoalState(tmp, sid)?.maxAttempts, 'unlimited', `arg=${arg}`);
+  }
+});
+
+test('retry <invalid> → rejected loudly (exit 1), value unchanged (2a)', () => {
+  for (const bad of ['-5', '3.5', 'abc']) {
+    const tmp = mktmp();
+    const sid = 'cli-test-retry-bad';
+    writeSession(tmp, sid);
+    // Pre-set a valid value so we can prove it was NOT rewritten.
+    runSupervisor(tmp, ['retry', '9']);
+    const { stdout, status } = runSupervisor(tmp, ['retry', bad]);
+    assert.match(stdout, /Invalid retry value/i, `bad=${bad}`);
+    assert.match(stdout, /positive integer|unlimited/i, `bad=${bad}`);
+    assert.equal(status, 1, `bad=${bad} must exit non-zero`);
+    assert.equal(loadGoalState(tmp, sid)?.maxAttempts, 9, `bad=${bad} must not change the stored value`);
+  }
+});
+
+test('retry status → reports resolved limit, tier, and the Claude Code platform cap', () => {
+  const tmp = mktmp();
+  const sid = 'cli-test-retry-status';
+  writeSession(tmp, sid);
+  runSupervisor(tmp, ['retry', 'unlimited']);
+  const { stdout } = runSupervisor(tmp, ['retry']);
+  assert.match(stdout, /in effect: 7/);          // reduced by CC cap
+  assert.match(stdout, /Stop-hook cap of 7|reduced from unlimited/i);
+});
+
 // ── 7. off / on — disabled file ───────────────────────────────────────────────
 
 test('off adds session to .supervisor/disabled; on removes it', () => {

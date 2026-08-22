@@ -67,7 +67,13 @@ export function parseSupervisorRouting(rawText) {
     return { tool: "supervisor", args: { action: "goal", condition: rest } }
   }
   if (lower.startsWith("retry")) {
-    const rest = withoutSlash.slice(5).trim()
+    const rest = withoutSlash.slice(5).trim().toLowerCase()
+    // Unlimited opt-out spellings map to n:0 — the same routing a capable model
+    // would infer from the /supervisor:retry command template. The tool treats
+    // 0 as "no cap".
+    if (["unlimited", "off", "none", "infinite", "0"].includes(rest)) {
+      return { tool: "supervisor", args: { action: "retry", n: 0 } }
+    }
     const n = parseInt(rest, 10)
     return { tool: "supervisor", args: { action: "retry", n: Number.isFinite(n) ? n : 1 } }
   }

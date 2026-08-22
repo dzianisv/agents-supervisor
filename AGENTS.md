@@ -466,21 +466,57 @@ goal/autopilot escape hatches — the only rule that does. Autopilot bypasses th
 turn gate by design, so with a real budget it burned the whole thing on its own
 command turn.
 
-**The runaway limit is ONE rule** (`resolveRunawayLimit`, core/goal.mjs), applied
-by both runtimes: `/supervisor retry N` (session override) > config `maxAttempts`
-> env (`SUPERVISOR_MAX_ATTEMPTS` ?? `REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING`
-(50) — the SAME for every mode, no `mode` parameter — each clamped to [1,100], then
-clamped DOWN to the runtime's platform hard cap (Claude Code passes
-`resolveClaudeCodeHardCap()` = 7; opencode passes none). The old per-mode defaults
-(16 goal/autopilot, 3 reflection) and the pile of overlapping helpers
-(`resolveTurnMaxAttempts` / `resolveReflectionMaxAttempts` / `resolveMaxAttempts` /
-`DEFAULT_MAX_ATTEMPTS` / `DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default
-IS the premature-stand-down bug, and per-mode branches were the drift surface. An
-explicit override at any of the first three tiers is a deliberate operator choice
-and still wins. The value is now a **runaway safety valve**, not a budget: it never
-signals completion, and it never leaks into the agent-facing nudge (see the
-`describe("subagent gate")`-style guard `test/nudge-no-counter.test.mjs`, which
-fails if a `(n/N)` counter reappears in either nudge template).
+**The runaway limit is ONE rule** (`describeRunawayLimit`, core/goal.mjs, with
+`resolveRunawayLimit` as the thin number accessor over it), applied by both
+runtimes: `/supervisor retry N` (session override) > config `maxAttempts` (in
+`~/.config/opencode/supervisor.yaml`) > env (`SUPERVISOR_MAX_ATTEMPTS` ??
+`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**50**) — the SAME for every
+mode, no `mode` parameter. Each tier is parsed by `parseAttemptsValue`: a positive
+integer is **honoured verbatim (no upper clamp** — a number the operator typed is
+never silently rewritten), `unlimited`/`off`/`none`/`0` means **no cap**
+(`Infinity`; every gate is `attempts >= limit` and `x >= Infinity` is always
+false), and a negative/fractional/garbage value is invalid — rejected LOUDLY at
+the CLI/tool, warn-and-fall-through in the config file. The resolved value is then
+reduced to the runtime's platform hard cap (Claude Code passes
+`resolveClaudeCodeHardCap()` = 7 and CANNOT honour `unlimited`; opencode passes
+none). `describeRunawayLimit` returns a DESCRIPTOR — `{limit, requested, unlimited,
+tier, cappedByPlatform, hardCap}` — so the ceiling gate, status text, once-per-turn
+debug line, and the `runaway_ceiling` loop-exit.log record all read the same
+resolution and cannot drift; the log record and status name the resolved limit AND
+the tier that set it, and surface `cappedByPlatform` (esp. when `unlimited` was
+requested but the platform forced it down). **50 is explained + sourced, not
+folklore — and the UNIT matters.** N counts supervisor INJECTIONS (outer-loop
+re-prompts); each injection restarts a whole agent turn of dozens of tool calls,
+so 50 injections ≈ 50 completed agent turns ≈ hundreds-to-thousands of model
+steps — NOT comparable to a framework's per-run cap (LangChain `max_iterations=15`,
+LangGraph `recursion_limit=25`, OpenAI Agents SDK `max_turns=10`, smolagents
+`max_steps=20`, CrewAI `max_iter=25`, Aider `max_reflections=3`, OpenHands
+`max_iteration_per_run=500`); measured against those, 50 is one of the MOST
+PERMISSIVE limits in the ecosystem, effectively unbounded in dollars. It is a
+BACKSTOP set well above observed reality, not a tuned optimum: a 30-day forensic
+sample (59 authoritative last-turn samples, 19 projects; 133-sample same-task
+corroboration) shows legit turns cap at ≤3 injections (p50=3, p90=3, p99≈3);
+everything above ~16 is censored doom-loop saturation, so 50 ≈ 17× the observed
+p99. The long-horizon coding frameworks that tuned a stop moved OFF a step count
+onto a COST budget (SWE-agent `$3`/instance; mini-SWE-agent `step_limit=0` + `$3`;
+Claude Agent SDK ships no turn cap and recommends a USD budget; Anthropic's own
+SWE-bench scaffold has no turn cap) because SUCCESSES LIVE IN THE TAIL (Anthropic
+">100 turns"; arXiv 2510.16786 median 41–58, tail >175, and recommends setting the
+limit at the p75 of your OWN distribution) — a low static cap trades tail success
+for cost (`.scratch/runaway-limit-analysis.md`). The SAME evidence says the RIGHT
+PRIMARY control is a per-turn cost/token budget (opencode exposes per-message
+`cost` + `tokens`), NOT a step count — a mechanism change deliberately left to the
+owner, not made here; the injection cap stays a crude runaway backstop.
+The old per-mode defaults (16 goal/autopilot, 3 reflection), the `[1,100]` clamp,
+and the pile of overlapping helpers (`resolveTurnMaxAttempts` /
+`resolveReflectionMaxAttempts` / `resolveMaxAttempts` / `DEFAULT_MAX_ATTEMPTS` /
+`DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default IS the
+premature-stand-down bug, per-mode branches were the drift surface, and a silent
+clamp rewrote the operator. An explicit override at any of the first three tiers
+is a deliberate operator choice and still wins. The value is a **runaway safety
+valve**, not a budget: it never signals completion, and it never leaks into the
+agent-facing nudge (see the guard `test/nudge-no-counter.test.mjs`, which fails if
+a `(n/N)` counter reappears in either nudge template).
 
 ### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
 

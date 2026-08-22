@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
-import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled, goalResumeHintSuffix } from '../core/goal.mjs';
+import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled, goalResumeHintSuffix, describeRunawayLimit, formatRunawayLimit, readConfiguredMaxAttempts, resolveClaudeCodeHardCap } from '../core/goal.mjs';
 import { resolveSessionId, listSessions, sessionStore } from '../core/session-store.mjs';
 
 const cwd = process.cwd();
@@ -64,6 +64,21 @@ if (cur) {
     const goalState = goalStore.load(cwd, cur);
     const effectiveMode = resolveSupervisorMode(goalState);
     line('effective mode', effectiveMode);
+    // Runaway safety valve actually in effect (retry > config > env > default),
+    // reduced to Claude Code's Stop-hook platform cap. Reported honestly: shows
+    // `unlimited`, the tier that set it, and whether the platform forced it down
+    // below what was requested — an unbounded session must never be a surprise.
+    {
+      const desc = describeRunawayLimit({
+        sessionOverride: goalState.maxAttempts,
+        config: readConfiguredMaxAttempts(() => {}),
+        hardCap: resolveClaudeCodeHardCap(),
+      });
+      let valve = `${formatRunawayLimit(desc.limit)} injections/turn (tier: ${desc.tier})`;
+      if (desc.cappedByPlatform) valve += ` — reduced from ${desc.unlimited ? 'unlimited' : desc.requested} by Claude Code cap ${desc.hardCap} (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1)`;
+      else if (desc.unlimited) valve += ' — no cap; stops only on SUPERVISOR_LOOP_EXIT / no-progress / goal deadline / supervisor off';
+      line('runaway valve', valve);
+    }
     // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
     line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
     // Goal detail — reported HONESTLY as a fact SEPARATE from the mode. A goal

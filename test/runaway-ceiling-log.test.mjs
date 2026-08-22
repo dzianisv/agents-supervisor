@@ -128,6 +128,10 @@ describe('Claude Code: hitting the per-turn ceiling writes a runaway_ceiling rec
     assert.equal(rec.mode, 'reflection');
     assert.equal(rec.attempts, 1);
     assert.equal(rec.maxAttempts, 1);
+    // NEW: the record names the resolved limit and the tier that set it, so a
+    // forensic reader can tell the operator chose this (retry) vs the default.
+    assert.equal(rec.limit, '1');
+    assert.equal(rec.limitTier, 'retry');
     assert.ok(Number.isFinite(rec.at));
     assert.notEqual(rec.reason, 'stuck', 'a ceiling hit must never be recorded as a declared stuck exit');
   });
@@ -232,6 +236,8 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
     assert.equal(rec.mode, 'autopilot');
     assert.equal(rec.attempts, 1);
     assert.equal(rec.maxAttempts, 1);
+    assert.equal(rec.limit, '1');
+    assert.equal(rec.limitTier, 'retry');
     assert.ok(Number.isFinite(rec.at));
   });
 
@@ -289,12 +295,31 @@ describe('source pins: one writer, both call sites', () => {
 
   test('opencode: both the ceiling circuit breaker and executeSupervisorLoopExit call appendLoopExitLog', () => {
     assert.match(ocSrc, /import \{ appendLoopExitLog \} from "\.\.\/core\/loop-exit\.mjs"/);
-    const capStart = ocSrc.indexOf('if (currentAttemptCount >= runawayLimit) {');
+    const capStart = ocSrc.indexOf('if (Number.isFinite(runawayLimit) && currentAttemptCount >= runawayLimit) {');
     assert.ok(capStart > 0, 'ceiling gate not found');
     const capBlock = ocSrc.slice(capStart, ocSrc.indexOf('const context = await buildTaskContext', capStart));
     assert.match(capBlock, /appendLoopExitLog\(directory, \{/);
     assert.match(capBlock, /reason: "runaway_ceiling"/);
     const stuckBlock = ocSrc.slice(ocSrc.indexOf('const executeSupervisorLoopExit ='), ocSrc.indexOf('// autopilot_exit tool'));
     assert.match(stuckBlock, /appendLoopExitLog\(directory, \{ session: sid, turnKey, reason, detail, at \}\)/);
+  });
+
+  test('opencode: the ceiling gate is Number.isFinite-guarded so UNLIMITED never fires the runaway branch', () => {
+    // Under `unlimited` runawayLimit is Infinity. A stand-down path saturates
+    // the counter to runawayLimit (standDownForTurn), so the counter itself can
+    // become Infinity, and `Infinity >= Infinity` is TRUE. Without the guard a
+    // stray later idle in the same turn would fire the runaway branch — a bogus
+    // runaway_ceiling record plus goal side-effects — for a session the operator
+    // explicitly asked NOT to cap. This pins the guard that prevents it.
+    assert.match(
+      ocSrc,
+      /if \(Number\.isFinite\(runawayLimit\) && currentAttemptCount >= runawayLimit\) \{/,
+      'the opencode ceiling gate must be Number.isFinite-guarded so unlimited (Infinity) never trips it'
+    );
+    // The unguarded form must be gone, or the guard is defeated.
+    assert.equal(
+      /\n\s*if \(currentAttemptCount >= runawayLimit\) \{/.test(ocSrc), false,
+      'the unguarded ceiling check must not exist — it fires under unlimited when the counter saturates to Infinity'
+    );
   });
 });
