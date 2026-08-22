@@ -201,7 +201,7 @@ test(
 //
 // The hook used to keep TWO independent tallies of "how many times have we
 // pushed the agent this turn": the turn-scoped file counter (gated against the
-// clamped effectiveMax) and goal.attempts (checked by decideGoalTransition).
+// clamped runawayLimit) and goal.attempts (checked by decideGoalTransition).
 // The file gate runs first with the SAME cap, so goal.attempts could never
 // reach it — decideGoalTransition's reason:'attempts' branch, and the
 // `turn_budget_spent` verdict it feeds, were dead code on Claude Code.

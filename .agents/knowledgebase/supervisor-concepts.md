@@ -31,16 +31,16 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 - Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
 - Goal state is stored under `.supervisor/goals/<sessionId>.json` (per-session). A separate project-level goal persists across sessions in `.agents/supervisor/Goal.md` (manually set, takes precedence) or lower-case `.agents/supervisor/goal.md` (see `writeProjectGoal`/`readProjectGoalCondition` in `core/goal.mjs`), with every write also appended to `goal-history.jsonl` so concurrent writers never silently lose a condition.
 - On OpenCode, `/supervisor:set-goal` invoked with no condition and no existing session/project goal makes a bounded LLM call (`deriveGoalWithLLM`/`buildGoalDerivationPrompt` in `core/goal.mjs` + `opencode/supervisor-impl.ts`) to derive a concise, falsifiable goal from the task context, persisting it to `goal.md` only on success (`parseDerivedGoalResponse` requires `falsifiable: true` and rejects prompt-injection artifacts). If derivation fails or is invalid, no default is fabricated — the goal is left unset with an explicit request to set it manually.
-- The default goal retry budget is 16 attempts, clamped to 1-100.
+- The attempt counter is a **runaway safety valve**, not a budget the agent is meant to spend: the intended stop is the agent's own `supervisor_loop_exit` / `SUPERVISOR_LOOP_EXIT:` declaration. It defaults to `RUNAWAY_CEILING = 50`, the SAME in every mode (no per-mode defaults), clamped to 1-100, then clamped down to 7 on Claude Code (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one). Tune it with `/supervisor:retry N`. One function resolves it: `resolveRunawayLimit` in `core/goal.mjs`.
 - Goal state can become active, achieved, or exhausted.
-- A goal exhausts when the attempt budget or deadline is reached.
+- A goal exhausts when the runaway safety valve or deadline is reached.
 - `buildGoalRequirementSection` injects the goal as a mandatory evidence-backed completion requirement.
 
 ## Autopilot
 
 - Autopilot is available on both Claude Code and OpenCode.
-- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the attempt-budget check, never by any loop check. If a goal is active, its condition is appended to that nudge as context (via `appendGoalContextToNudge`), but autopilot never verifies it.
-- Autopilot stops when the agent declares `supervisor_loop_exit` (OpenCode tool call) / outputs `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the retry budget exhausts. Those are the ONLY two ways autopilot stops. (`core/loop-exit.mjs` keeps a parse-only legacy alias for stale installed skill copies — not taught here or anywhere else shipped.)
+- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the runaway-valve check, never by any loop check. If a goal is active, its condition is appended to that nudge as context (via `appendGoalContextToNudge`), but autopilot never verifies it.
+- Autopilot stops when the agent declares `supervisor_loop_exit` (OpenCode tool call) / outputs `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the runaway safety valve trips. Those are the ONLY two ways autopilot stops. (`core/loop-exit.mjs` keeps a parse-only legacy alias for stale installed skill copies — not taught here or anywhere else shipped.)
 - Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
 
 ## Tool-Activity Telemetry

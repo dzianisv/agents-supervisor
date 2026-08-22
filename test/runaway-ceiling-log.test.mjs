@@ -99,7 +99,7 @@ describe('Claude Code: hitting the per-turn ceiling writes a runaway_ceiling rec
     const d = mkcwd();
     const sid = 'ceiling-cc-goal';
     goalStore.setGoal(d, sid, 'ship the feature');
-    goalStore.setRetry(d, sid, 1); // effectiveMax = 1 for this turn
+    goalStore.setRetry(d, sid, 1); // runawayLimit = 1 for this turn
 
     const turns = [
       { type: 'user', message: { role: 'user', content: 'ship the feature end to end' } },
@@ -208,7 +208,7 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
   test('autopilot capped at maxAttempts=1 logs on the SECOND idle of the same turn', async () => {
     const SESSION_ID = 'ses_oc_ceiling';
     goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
-    goalStore.setRetry(tmpDir, SESSION_ID, 1); // effectiveMaxAttempts = 1
+    goalStore.setRetry(tmpDir, SESSION_ID, 1); // runawayLimit = 1
 
     const { client, activePrompts } = createStubClient(SESSION_ID, () => makeMessages('do the thing', 'Working — pass 1.'));
     const plugin = await SupervisorPlugin({ client, directory: tmpDir });
@@ -278,7 +278,7 @@ describe('source pins: one writer, both call sites', () => {
 
   test('Claude Code: both the ceiling gate and the stuck loop-exit handler call appendLoopExitLog', () => {
     assert.match(ccSrc, /import \{ parseLoopExitSentinel, appendLoopExitLog \} from '\.\.\/core\/loop-exit\.mjs';/);
-    const capBlock = ccSrc.slice(ccSrc.indexOf('if (attempts >= effectiveMax) {'), ccSrc.indexOf("msg: 'attempt_cap_reached'"));
+    const capBlock = ccSrc.slice(ccSrc.indexOf('if (attempts >= runawayLimit) {'), ccSrc.indexOf("msg: 'attempt_cap_reached'"));
     assert.match(capBlock, /appendLoopExitLog\(cwd, \{/);
     assert.match(capBlock, /reason: 'runaway_ceiling'/);
     const stuckBlock = ccSrc.slice(ccSrc.indexOf('// 4a-0. LOOP EXIT'), ccSrc.indexOf('// 4a. Autopilot fast-path'));
@@ -289,7 +289,7 @@ describe('source pins: one writer, both call sites', () => {
 
   test('opencode: both the ceiling circuit breaker and executeSupervisorLoopExit call appendLoopExitLog', () => {
     assert.match(ocSrc, /import \{ appendLoopExitLog \} from "\.\.\/core\/loop-exit\.mjs"/);
-    const capStart = ocSrc.indexOf('if (currentAttemptCount >= effectiveMaxAttempts) {');
+    const capStart = ocSrc.indexOf('if (currentAttemptCount >= runawayLimit) {');
     assert.ok(capStart > 0, 'ceiling gate not found');
     const capBlock = ocSrc.slice(capStart, ocSrc.indexOf('const context = await buildTaskContext', capStart));
     assert.match(capBlock, /appendLoopExitLog\(directory, \{/);

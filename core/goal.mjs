@@ -4,9 +4,11 @@
  * and the CC goal/retry CLI (bin/supervisor-goal.mjs).
  *
  * A "goal" is a user-set condition the agent must demonstrably meet before the
- * supervisor lets it stop. While a goal is active the retry budget rises
- * (default 16) and the goal is injected into the judge prompt as a mandatory
- * completion requirement.
+ * supervisor lets it stop. While a goal is active the goal is injected into the
+ * judge prompt as a mandatory completion requirement. A goal does NOT raise any
+ * per-turn "budget" — the loop stops when the agent declares an exit
+ * (supervisor_loop_exit / SUPERVISOR_LOOP_EXIT), and the only numeric bound is
+ * the runaway safety valve shared by every mode (see resolveRunawayLimit).
  *
  * State: <cwd>/.supervisor/sessions/<sessionId>/state.json (mode 0600) — see
  * core/session-store.mjs, which owns the layout, migration, atomicity and GC.
@@ -21,15 +23,14 @@ import { sessionStore } from './session-store.mjs';
 // surface — a second import path is how the previous duplicates started.
 export { sessionStore } from './session-store.mjs';
 
-export const DEFAULT_MAX_ATTEMPTS = 16;
 // The deadline is a safety backstop against a goal outliving the session that
-// set it — NOT the budget control. The budget control is the per-turn attempt
-// cap (see the per-turn attempts reset in bin/supervisor-on-stop.mjs): the
-// loop can only ever run HARD_CAP injections before it hands control back to
-// the human, so a short wall-clock ceiling adds nothing but a silent death for
-// any goal a human is still actively working on. It used to be 30 minutes,
-// which killed long-running goals mid-drive with no verdict and no message.
-// 30 days is effectively unbounded for a human-turn-gated loop.
+// set it — NOT the loop's stop control. The loop stops when the agent declares
+// an exit (supervisor_loop_exit / SUPERVISOR_LOOP_EXIT); the only numeric bound
+// is the runaway safety valve (resolveRunawayLimit), which force-stops the turn
+// after at most that many injections. A short wall-clock ceiling adds nothing
+// but a silent death for any goal a human is still actively working on. It used
+// to be 30 minutes, which killed long-running goals mid-drive with no verdict
+// and no message. 30 days is effectively unbounded for a human-turn-gated loop.
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 // TWO modes only. A goal is no longer a mode — it is an ORTHOGONAL ATTRIBUTE
 // of the session (`state.goal`), enforced in reflection mode and carried as
@@ -52,8 +53,9 @@ export const GOAL_CONDITION_MAX_LEN = 4000;
  * Claude Code allows only a limited number of consecutive Stop-hook
  * {decision:'block'} responses within one unbroken turn (default 8) before it
  * overrides the hook and lets the turn end regardless. The Stop hook therefore
- * clamps its own per-turn budget to ONE UNDER that threshold so its exhaustion
- * bookkeeping fires deterministically instead of being silently pre-empted.
+ * clamps its runaway safety valve (resolveRunawayLimit) to ONE UNDER that
+ * threshold so its exhaustion bookkeeping fires deterministically instead of
+ * being silently pre-empted.
  *
  * Single source of truth: bin/supervisor-on-stop.mjs applies it, and
  * bin/supervisor.mjs quotes it to the user so the number printed by `set-goal`
@@ -89,92 +91,56 @@ export function resolveSupervisorMode(state = {}) {
 }
 
 /**
- * Priority: sessionOverride > config > opts.fallback > 16.
- * Clamped [1,100]; non-finite ignored.
- *
- * `fallback` exists so a runtime can supply its own *default* budget without
- * weakening the explicit `/supervisor retry N` override, which must always
- * win. Do not add a second precedence rule anywhere — pass `fallback` instead.
- */
-export function resolveMaxAttempts(opts = {}) {
-  for (const c of [opts.sessionOverride, opts.config, opts.fallback, DEFAULT_MAX_ATTEMPTS]) {
-    if (c !== undefined && Number.isFinite(c)) return Math.min(100, Math.max(1, Math.floor(c)));
-  }
-  return DEFAULT_MAX_ATTEMPTS;
-}
-
-/**
- * The plain-reflection per-turn budget: how many times the supervisor may push
- * an agent that never asked for an autonomous loop.
- *
- * NO LONGER THE DEFAULT PATH. `resolveTurnMaxAttempts` used to fall back to 3
- * here for plain reflection, which made the counter — not the agent — decide
- * the task was over, and it stood down mid-task. The default is now
- * RUNAWAY_CEILING for every mode; this function survives only to read the two
- * env knobs BOTH runtimes have always honoured (an explicit operator choice,
- * like `/supervisor retry N`). `opts.fallback` lets the caller supply the
- * default used when neither env var is set.
- */
-export const DEFAULT_REFLECTION_MAX_ATTEMPTS = 3;
-/**
- * The runaway circuit breaker. Not a completion signal: the intended stop is
- * the agent's own `supervisor_loop_exit` tool call. This number only bounds a
- * pathological loop (e.g. a judge repeating identical feedback forever).
+ * The runaway safety valve ceiling. This is NOT a budget and NOT a completion
+ * signal: the intended stop is the agent's own supervisor_loop_exit tool
+ * (opencode) / SUPERVISOR_LOOP_EXIT sentinel (Claude Code), honoured before
+ * this number is ever consulted. It exists ONLY to bound a PATHOLOGICAL loop —
+ * an agent that never declares an exit and varies its wording every turn (the
+ * no-progress gate only catches BYTE-IDENTICAL replies), or a judge repeating
+ * feedback forever. Every mode shares this one value: there are no per-mode
+ * budgets. A low per-mode default (once 3 for reflection, 16 for goal) let the
+ * counter — which cannot observe completion — stand the supervisor down
+ * mid-task, so it is deliberately high. Hitting it is LOUD: both runtimes
+ * append a reason:'runaway_ceiling' record to .supervisor/loop-exit.log.
  */
 export const RUNAWAY_CEILING = 50;
-export function resolveReflectionMaxAttempts(env = process.env, opts = {}) {
-  const dflt = Number.isFinite(opts.fallback) ? opts.fallback : DEFAULT_REFLECTION_MAX_ATTEMPTS;
-  const raw = parseInt(
-    env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS ?? String(dflt),
-    10,
-  );
-  return Number.isFinite(raw) ? Math.min(100, Math.max(1, raw)) : dflt;
-}
 
 /**
- * THE per-turn attempt budget, for both runtimes.
+ * THE ONE runaway-limit resolver, shared verbatim by both runtimes. Returns the
+ * maximum number of supervisor injections allowed in a SINGLE human turn before
+ * the loop is force-stopped. It is the safety valve described on
+ * RUNAWAY_CEILING — not a budget the agent should pace against — so it is
+ * deliberately not called "maxAttempts" at the call sites.
  *
- * This exists because the two runtimes had silently diverged: the Claude Code
- * hook used 3 for plain reflection and 16 only for goal/autopilot, while the
- * OpenCode plugin used 16 for everything. That divergence was invisible only
- * because OpenCode's boolean "already reflected this turn" gate made its
- * budget unreachable — the moment the counter became the real stop condition,
- * OpenCode would have started running 16 unattended pushes per human message.
+ * Precedence (first finite value wins), each clamped to [1,100]:
+ *   1. sessionOverride — `/supervisor retry N`     (state.maxAttempts)
+ *   2. config          — `maxAttempts:` in supervisor.yaml
+ *   3. env             — SUPERVISOR_MAX_ATTEMPTS ?? REFLECTION_CC_MAX_ATTEMPTS
+ *   4. RUNAWAY_CEILING — the same default for every mode
+ * Then clamped DOWN to `hardCap` when the runtime has a platform ceiling
+ * (Claude Code's Stop-hook block cap — resolveClaudeCodeHardCap; OpenCode has
+ * none and passes no hardCap).
  *
- * THE COUNTER IS NO LONGER THE INTENDED STOP. It is a RUNAWAY CIRCUIT
- * BREAKER. The intended stop is the agent explicitly calling the
- * `supervisor_loop_exit` tool (reason: completed | stuck), which the idle
- * handler honours before this budget is even consulted. A low default (3)
- * made the supervisor stand down while the task was still unfinished — the
- * counter was deciding completion, which it cannot observe. So every mode now
- * falls back to RUNAWAY_CEILING; the number only exists to bound a pathology.
- *
- * Rules (identical on both runtimes):
- *   - explicit `/supervisor retry N`   → N            (always wins)
- *   - config `maxAttempts:` in yaml    → that value
- *   - anything else (goal/autopilot/
- *     plain reflection alike)          → RUNAWAY_CEILING
- *   - then clamp to `hardCap` if the runtime has a platform ceiling
- *     (Claude Code does — see resolveClaudeCodeHardCap; OpenCode does not).
+ * The first three tiers are all deliberate operator choices, so any of them
+ * overrides the default. There is intentionally NO `mode` input — mode never
+ * changes the limit.
  *
  * @param {object} opts
- * @param {string} [opts.mode] resolveSupervisorMode() output
  * @param {number} [opts.sessionOverride] state.maxAttempts (`/supervisor retry N`)
  * @param {number} [opts.config] runtime config file value
- * @param {number} [opts.hardCap] platform ceiling, applied last
- * @param {object} [opts.env] for tests
+ * @param {number} [opts.hardCap] platform ceiling, applied last (Claude Code only)
+ * @param {object} [opts.env] test seam; defaults to process.env
  */
-export function resolveTurnMaxAttempts(opts = {}) {
-  // Env knobs stay honoured (both runtimes have always read them) — they are
-  // an explicit operator choice, exactly like `/supervisor retry N`. Only the
-  // implicit default changes: RUNAWAY_CEILING, never 3 and never 16.
-  const envBudget = resolveReflectionMaxAttempts(opts.env ?? process.env, { fallback: RUNAWAY_CEILING });
-  const budget = resolveMaxAttempts({
-    sessionOverride: opts.sessionOverride,
-    config: opts.config,
-    fallback: envBudget,
-  });
-  return Number.isFinite(opts.hardCap) ? Math.max(1, Math.min(budget, opts.hardCap)) : budget;
+export function resolveRunawayLimit(opts = {}) {
+  const env = opts.env ?? process.env;
+  const clamp = (n) => Math.min(100, Math.max(1, Math.floor(n)));
+  const envRaw = env.SUPERVISOR_MAX_ATTEMPTS ?? env.REFLECTION_CC_MAX_ATTEMPTS;
+  const envVal = envRaw === undefined ? NaN : parseInt(envRaw, 10);
+  let limit = RUNAWAY_CEILING;
+  for (const tier of [opts.sessionOverride, opts.config, envVal]) {
+    if (Number.isFinite(tier)) { limit = clamp(tier); break; }
+  }
+  return Number.isFinite(opts.hardCap) ? Math.max(1, Math.min(limit, opts.hardCap)) : limit;
 }
 
 /** Parse `/supervisor` and colon command args into a typed action. */
@@ -292,7 +258,7 @@ export function appendGoalContextToNudge(nudge, condition) {
  * `goal.attempts` and `maxAttempts` MUST be the caller's ONE per-turn counter
  * and its ONE effective cap — not a second, independently-incremented tally.
  * On Claude Code that means goal.attempts is mirrored from the turn-scoped
- * file counter and maxAttempts is the same clamped `effectiveMax` the hook's
+ * file counter and maxAttempts is the same clamped `runawayLimit` the hook's
  * cap gate uses (bin/supervisor-on-stop.mjs); on OpenCode it is the persisted
  * goal count checked before the per-message fallback map. A caller that
  * gates on a different counter or a different cap before calling this makes

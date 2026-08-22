@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import {
   goalStore,
   parseSupervisorCommand,
-  resolveMaxAttempts,
+  resolveRunawayLimit,
   resolveSupervisorMode,
   resolveClaudeCodeHardCap,
   writeProjectGoal,
@@ -196,15 +196,15 @@ switch (cmd.kind) {
     // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
     // across sessions. Safe under concurrent writers — see writeProjectGoal.
     writeProjectGoal(cwd, cmd.condition);
-    const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
-    // The Stop hook clamps the per-turn budget to one under Claude Code's own
-    // block-override threshold, so the requested number is not what actually
-    // runs here. Quote both rather than the misleading raw budget.
-    const ccCap = Math.min(budget, resolveClaudeCodeHardCap());
+    const override = goalStore.load(cwd, sid).maxAttempts;
+    // The Stop hook clamps the runaway safety valve to one under Claude Code's
+    // own block-override threshold, so the effective valve here on CC is the
+    // clamped number.
+    const runawayLimit = resolveRunawayLimit({ sessionOverride: override, hardCap: resolveClaudeCodeHardCap() });
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
-      `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met.\n` +
-      `Budget: ${budget} attempts per human turn (clamped to ${ccCap} here on Claude Code by CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) — it resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
+      `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met, or until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
+      `A runaway safety valve force-stops the loop after ${runawayLimit} injections in one human turn (clamped here on Claude Code by CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) — it resets each time you speak, so the goal is never permanently exhausted mid-session. Tune it with 'supervisor retry N'.\n` +
       `Also saved to .agents/supervisor/Goal.md for reflection mode.`
     );
     break;
@@ -287,13 +287,16 @@ switch (cmd.kind) {
   case 'retry-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     goalStore.setRetry(cwd, sid, cmd.n);
-    console.log(`Retry budget set to ${resolveMaxAttempts({ sessionOverride: cmd.n })} for session ${sid.slice(0, 8)}….`);
+    console.log(`Runaway safety valve set to ${resolveRunawayLimit({ sessionOverride: cmd.n })} injections per human turn for session ${sid.slice(0, 8)}….`);
     break;
   }
   case 'retry-status': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     const st = goalStore.load(cwd, sid);
-    console.log(`Retry budget (session override): ${st.maxAttempts ?? '(default 16 when a goal is active; 3 otherwise)'}.`);
+    console.log(
+      `Runaway safety valve (session override): ${st.maxAttempts ?? `default (${resolveRunawayLimit({})})`} injections per human turn ` +
+      `— the loop's real stop is SUPERVISOR_LOOP_EXIT, not this number.`
+    );
     break;
   }
 
@@ -304,12 +307,12 @@ switch (cmd.kind) {
     // A mode switch KEEPS any active goal now (a goal is an attribute, not a
     // mode) — announce that instead of silently clearing it.
     noteGoalKeptOnModeSwitch(cwd, sid, cmd.mode);
-    const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
+    const runawayLimit = resolveRunawayLimit({ sessionOverride: goalStore.load(cwd, sid).maxAttempts, hardCap: resolveClaudeCodeHardCap() });
     console.log(`mode: ${cmd.mode}`);
     if (cmd.mode === 'autopilot') {
       console.log(
-        `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line) or budget runs out.\n` +
-        `Budget: ${budget} attempts.`
+        `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
+        `Runaway safety valve: ${runawayLimit} injections per human turn (tune with 'supervisor retry N').`
       );
     } else if (cmd.mode === 'reflection') {
       console.log('Supervisor back to reflection mode (judge runs on each stop).');
@@ -323,11 +326,11 @@ switch (cmd.kind) {
     goalStore.setAutopilot(cwd, sid, true);
     // Autopilot KEEPS any active goal as context now (it is not verified).
     noteGoalKeptOnModeSwitch(cwd, sid, 'autopilot');
-    const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
+    const runawayLimit = resolveRunawayLimit({ sessionOverride: goalStore.load(cwd, sid).maxAttempts, hardCap: resolveClaudeCodeHardCap() });
     console.log('mode: autopilot');
     console.log(
-      `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line) or budget runs out.\n` +
-      `Budget: ${budget} attempts.`
+      `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
+      `Runaway safety valve: ${runawayLimit} injections per human turn (tune with 'supervisor retry N').`
     );
     break;
   }

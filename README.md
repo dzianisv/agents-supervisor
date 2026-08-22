@@ -73,10 +73,10 @@ so both runtimes — and the trainer — share one brain.
 Inside any Claude Code session, use any of these commands:
 - `/supervisor:status` — effective patterns + recent verdicts
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
-- `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (budget resets each human turn)
-- `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal (keeps the same condition, resets this turn's attempt budget)
-- `/supervisor:retry N` — set the per-turn retry budget (1–100, default 16)
-- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `SUPERVISOR_LOOP_EXIT: completed` or budget exhaustion
+- `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (the per-turn attempt counter resets each human turn)
+- `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal (keeps the same condition, resets this turn's attempt counter)
+- `/supervisor:retry N` — tune the runaway safety valve (1–100; default 50, clamped to 7 on Claude Code). This is NOT a budget you are meant to spend — see "The stop mechanism" below.
+- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `SUPERVISOR_LOOP_EXIT: completed`
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
 - `/supervisor:off` — disable for this session
@@ -101,8 +101,8 @@ Use the same colon-command set as Claude Code:
 - `/supervisor:train` — learn from your sessions
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition
 - `/supervisor:set-goal resume` — resume a `paused` or `exhausted` goal
-- `/supervisor:retry N` — set the retry budget (1–100)
-- `/supervisor:autopilot` — skip the judge, auto-continue until exit or budget exhaustion
+- `/supervisor:retry N` — tune the runaway safety valve (1–100)
+- `/supervisor:autopilot` — skip the judge, auto-continue until the agent exits or the runaway valve trips
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
 - `/supervisor:off` — disable for this session
@@ -132,7 +132,7 @@ The supervisor has **two** public modes, available on both Claude Code and OpenC
 | Mode | Command | Behavior |
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. If a goal is set, the judge grades against the goal too. |
-| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or budget exhaustion. If a goal is set, its condition rides along as context on the nudge — **but autopilot never verifies it** (see below). |
+| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the runaway valve trips. If a goal is set, its condition rides along as context on the nudge — **but autopilot never verifies it** (see below). |
 
 The effective default mode is `reflection`.
 
@@ -227,12 +227,14 @@ Beyond the per-session goal above, a project-level goal can also persist across
 sessions — see "Project goals (`Goal.md`)" below.
 
 The goal is injected into the judge as a **mandatory completion requirement** — the
-agent is not allowed to stop until the goal is met. While a goal is active the retry
-budget rises to 16 per human turn (vs 3 normally) — on Claude Code the Stop hook
-clamps that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), so 16 requested
-means 7 effective there. State is per-session at
-`.supervisor/sessions/<sessionId>/state.json` (mode 0600); budget is spent only
-when a continuation actually fires.
+agent is not allowed to stop until the goal is met. The intended stop is the agent's
+own `supervisor_loop_exit` (OpenCode) / `SUPERVISOR_LOOP_EXIT:` sentinel (Claude
+Code); a per-turn attempt counter exists only as a **runaway safety valve** (default
+`RUNAWAY_CEILING = 50`, the same in every mode — there are no per-mode defaults). On
+Claude Code the Stop hook clamps that to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus
+one), so 50 means 7 effective there. State is per-session at
+`.supervisor/sessions/<sessionId>/state.json` (mode 0600); the counter is spent only
+when a continuation actually fires, and it resets on each new human turn.
 
 In the web app call the `supervisor_goal` / `supervisor_retry` tools directly.
 
@@ -281,7 +283,7 @@ For web app / OpenCode API, call tools directly:
 - Agent continues on every idle **unconditionally** (no judge evaluation)
 - Judge is **bypassed entirely** — no latency from scoring/reflection
 - Agent must call `supervisor_loop_exit` (OpenCode) / output `SUPERVISOR_LOOP_EXIT: completed` alone on its own line (Claude Code) to signal work is complete
-- Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
+- Or the supervisor's runaway safety valve trips (default 50, 7 on Claude Code; tune via `/supervisor:retry N`)
 - Safety rails still apply: attempt budget, destructive-action flagging
 
 **How it differs from the goal loop:**
@@ -290,16 +292,16 @@ For web app / OpenCode API, call tools directly:
 |---|---|---|
 | Judge evaluation | Yes (self-assessment + optional cross-model) | No (skipped entirely) |
 | Continuation trigger | Judge says "not done" | Every idle (unconditional) |
-| Stop condition | Goal met (or 30-day deadline) | Agent calls `supervisor_loop_exit` / outputs `SUPERVISOR_LOOP_EXIT: completed`, or budget exhausted |
+| Stop condition | Goal met (or 30-day deadline) | Agent calls `supervisor_loop_exit` / outputs `SUPERVISOR_LOOP_EXIT: completed`, or the runaway valve trips |
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:
-- **Attempt budget**: stops at `maxAttempts` (default 16, configurable via `/supervisor retry N`)
+- **Runaway safety valve**: a last-resort breaker that trips at the runaway limit (default 50, 7 on Claude Code; tune via `/supervisor retry N`) — NOT a budget the agent is meant to spend; the intended stop is `supervisor_loop_exit`
 - **Destructive-action flagging**: force-push, hard reset, history rewrite, branch deletion, `rm -rf`, and unapproved spend are flagged to the user for approval instead of being nudged
 - **Tool-activity telemetry**: a bounded, non-binding note (read/write tool-call counts) may be appended to the nudge as factual context — it never itself decides completion or emits a stop verdict
 
-State is per-session at `.supervisor/sessions/<sessionId>/state.json`. When the budget
-exhausts, autopilot disables itself automatically.
+State is per-session at `.supervisor/sessions/<sessionId>/state.json`. When the runaway
+valve trips, autopilot disables itself automatically.
 
 ## How it decides
 
@@ -315,18 +317,19 @@ had to reply.
 
 Claude Code allows only **8 consecutive Stop-hook `{decision:'block'}` responses**
 within one unbroken turn before it overrides the hook and lets the turn end
-regardless. To keep the supervisor's own exhaustion handling (attempt-cap-reached,
+regardless. To keep the supervisor's own runaway handling (runaway-ceiling reached,
 goal-exhausted) firing deterministically instead of being silently pre-empted by
-CC, the Stop hook caps its per-turn retry budget at
-`min(effectiveMax, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1)`, where
+CC, the Stop hook clamps its runaway safety valve to
+`min(runawayLimit, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1)`, where
 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` mirrors CC's own override threshold (default
 **8**; the hook always stays one under it) and can be overridden via env var if
-you raise CC's limit or a future CC version changes it. This applies uniformly to reflection (default budget 3, unaffected), goal
-mode, and autopilot (default budget 16, tightened to 7 within any single unbroken
-turn — the higher budget still spans multiple turns, it just can't all be spent in
-one uninterrupted block chain, since CC itself wouldn't honor that many).
+you raise CC's limit or a future CC version changes it. There are **no per-mode
+defaults**: reflection, goal mode, and autopilot all share the same runaway limit
+(default 50), which CC then clamps to 7 within any single unbroken turn — the limit
+still spans multiple turns, it just can't all be spent in one uninterrupted block
+chain, since CC itself wouldn't honor that many.
 
-The retry budget is also scoped **per turn**: it resets whenever a new, genuine
+The counter is also scoped **per turn**: it resets whenever a new, genuine
 user message arrives, and persists across Stop events that belong to the same
 turn (e.g. a goal or autopilot loop running without new human input).
 

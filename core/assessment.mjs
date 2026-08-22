@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+import { RUNAWAY_CEILING } from './goal.mjs'
 import { loadShipped } from './patterns.mjs'
 import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
 
@@ -134,7 +134,7 @@ export function buildSelfAssessmentPrompt(
   if (requirements.length === 0) requirements.push('No explicit workflow gates detected')
 
   const rb = rubric ?? parseRubric(DEFAULT_RUBRIC)
-  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const effectiveCap = maxAttempts ?? RUNAWAY_CEILING
   const currentAttempt = attemptCount || 0
   const attemptSection = currentAttempt > 0
     ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`

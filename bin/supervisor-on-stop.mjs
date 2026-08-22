@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
+import { goalStore, resolveRunawayLimit, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -738,7 +738,7 @@ async function main() {
   // attempt 1 in real usage — the second Stop event of any blocked chain
   // always sees stop_hook_active=true and stood down before ever checking
   // the attempt counter. The turn-scoped attempt counter (below), hard
-  // capped at min(effectiveMax, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP), is now the
+  // capped at min(runawayLimit, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP), is now the
   // sole continuation gate.
   if (loopGuard(payload)) {
     debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, payload.cwd);
@@ -828,18 +828,17 @@ async function main() {
     try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
   }
 
-  // ONE budget rule, shared with the OpenCode plugin (core/goal.mjs):
-  // `/supervisor retry N` > config > (16 for goal/autopilot | 3 for plain
-  // reflection), then clamped to CC's platform ceiling.
+  // ONE runaway-limit rule, shared with the OpenCode plugin (core/goal.mjs
+  // resolveRunawayLimit): `/supervisor retry N` > config > env > RUNAWAY_CEILING
+  // for EVERY mode, then clamped to CC's platform ceiling. There is no per-mode
+  // default — the limit is a runaway safety valve, not a budget.
   //
-  // HARD_CAP is a universal per-turn ceiling — see its definition for the full
-  // rationale. It intentionally tightens autopilot/goal's higher session
-  // budget (default 16) during any single unbroken turn: by design, since
-  // CC's own override already made anything beyond ~8 unreachable in
-  // practice, so this just makes our own exhaustion bookkeeping fire
-  // deterministically instead of being silently pre-empted by CC.
-  const effectiveMax = resolveTurnMaxAttempts({
-    mode,
+  // HARD_CAP is that platform ceiling — see its definition for the full
+  // rationale. It intentionally tightens the runaway limit during any single
+  // unbroken turn: CC's own override already made anything beyond ~8
+  // unreachable in practice, so this just makes our own exhaustion bookkeeping
+  // fire deterministically instead of being silently pre-empted by CC.
+  const runawayLimit = resolveRunawayLimit({
     sessionOverride: goalState?.maxAttempts,
     hardCap: HARD_CAP,
   });
@@ -903,7 +902,7 @@ async function main() {
     debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
   }
 
-  if (attempts >= effectiveMax) {
+  if (attempts >= runawayLimit) {
     // Disable autopilot on budget exhaustion so the next stop is clean.
     if (mode === 'autopilot') {
       try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
@@ -914,7 +913,7 @@ async function main() {
     // window, else 'attempts'. `complete` is irrelevant: exhaustion is checked
     // strictly before achievement, so the judge never has to run to get here.
     if (goal) {
-      const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMax });
+      const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: runawayLimit });
       finishExhaustedGoal(t, {
         session_id, attempt: attempts, timestamp: new Date().toISOString(),
         plugin_version: PLUGIN_VERSION, injected: false,
@@ -929,9 +928,9 @@ async function main() {
     // so this can never be confused with a declared exit.
     appendLoopExitLog(cwd, {
       session: session_id, turnKey, reason: 'runaway_ceiling', detail: '',
-      at: Date.now(), mode, attempts, maxAttempts: effectiveMax,
+      at: Date.now(), mode, attempts, maxAttempts: runawayLimit,
     });
-    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal, mode }, cwd);
+    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: runawayLimit, goal: !!goal, mode }, cwd);
     process.exit(0);
   }
 
@@ -1072,7 +1071,13 @@ async function main() {
     // the status/roadmap directive rides along with EVERY continuation, on
     // both runtimes. Gated by the same default-on `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
-    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
+    //
+    // The attempt number is tracked and written to the verdict/debug log, but
+    // is deliberately NOT rendered into the nudge: a visible "n/N" denominator
+    // tells the agent a budget exists and invites it to pace or wrap up early,
+    // when the only thing that should stop the loop is the agent declaring it
+    // done. Kept identical to the OpenCode nudge apart from the runtime exit.
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
     // If a goal is set (session goal, else the project Goal.md), append it to
     // the nudge as working context — shared with the OpenCode runtime via the
     // ONE helper so the two nudges cannot drift.
@@ -1130,7 +1135,7 @@ async function main() {
     agents,
     lastAssistantText: ctx.final_assistant_text,
     attemptCount: attempts,
-    maxAttempts: effectiveMax,
+    maxAttempts: runawayLimit,
     goalSection: sessionGoalSection || projectGoalSection || undefined,
   });
 
@@ -1284,7 +1289,7 @@ async function main() {
       goal,
       complete: analysis.complete,
       now: Date.now(),
-      maxAttempts: effectiveMax,
+      maxAttempts: runawayLimit,
       reason: analysis.reason,
     });
     if (t.action === 'achieved') {
@@ -1312,7 +1317,7 @@ async function main() {
     }
     if (t.action === 'exhausted') {
       // Reachable here only via the deadline: the per-turn cap gate above
-      // already stood down for any turn where `attempts >= effectiveMax`.
+      // already stood down for any turn where `attempts >= runawayLimit`.
       // Both reasons still flow through one handler so the two sites can
       // never drift on what a spent budget means.
       finishExhaustedGoal(t, verdictRecord);

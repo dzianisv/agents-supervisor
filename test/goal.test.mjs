@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseSupervisorCommand, resolveMaxAttempts, decideGoalTransition,
+  parseSupervisorCommand, resolveRunawayLimit, decideGoalTransition,
   parseRubric, buildGoalRequirementSection, DEFAULT_SUPERVISOR_MODE,
   resolveSupervisorMode, supervisorStore, SupervisorPlugin,
   trackSessionScopedToolSession,
@@ -94,13 +94,13 @@ test('supervisorStore persists mode and resolves legacy autopilot state', async 
   assert.equal((await supervisorStore.load(d, 's1')).goal, undefined);
 });
 
-test('resolveMaxAttempts: sessionOverride > config > default 16, clamped [1,100]', () => {
-  assert.equal(resolveMaxAttempts({}), 16);
-  assert.equal(resolveMaxAttempts({ config: 8 }), 8);
-  assert.equal(resolveMaxAttempts({ sessionOverride: 5, config: 8 }), 5);
-  assert.equal(resolveMaxAttempts({ sessionOverride: 999 }), 100); // clamp high
-  assert.equal(resolveMaxAttempts({ sessionOverride: 0 }), 1);     // clamp low
-  assert.equal(resolveMaxAttempts({ sessionOverride: NaN }), 16);  // non-finite → default
+test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (50), clamped [1,100]', () => {
+  assert.equal(resolveRunawayLimit({ env: {} }), 50);              // default = RUNAWAY_CEILING
+  assert.equal(resolveRunawayLimit({ config: 8, env: {} }), 8);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 5, config: 8, env: {} }), 5);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 999, env: {} }), 100); // clamp high
+  assert.equal(resolveRunawayLimit({ sessionOverride: 0, env: {} }), 1);     // clamp low
+  assert.equal(resolveRunawayLimit({ sessionOverride: NaN, env: {} }), 50);  // non-finite → default
 });
 
 test('decideGoalTransition: exhausted > achieved > continue', () => {

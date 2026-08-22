@@ -172,7 +172,7 @@ never touching the live session.
 breaker; failing to take the lock degrades to last-writer-wins rather than
 blocking a turn.
 
-Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent declares the loop over — the `supervisor_loop_exit` tool on OpenCode, the `SUPERVISOR_LOOP_EXIT: completed` text sentinel on Claude Code (Stop hooks have no tool registry) — or the attempt budget exhausts.
+There are no per-mode `maxAttempts` defaults: every mode shares one runaway safety valve (`RUNAWAY_CEILING = 50`, resolved by `resolveRunawayLimit` in `core/goal.mjs`), tunable via `/supervisor:retry N` and clamped to 7 on Claude Code. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent declares the loop over — the `supervisor_loop_exit` tool on OpenCode, the `SUPERVISOR_LOOP_EXIT: completed` text sentinel on Claude Code (Stop hooks have no tool registry) — or the runaway safety valve trips.
 
 ---
 
