@@ -42,7 +42,7 @@ import {
   extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
 } from '../core/task-context.mjs';
 import { shouldSkipReflection } from '../core/turn-classifier.mjs';
-import { parseLoopExitSentinel } from '../core/loop-exit.mjs';
+import { parseLoopExitSentinel, appendLoopExitLog } from '../core/loop-exit.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -909,6 +909,17 @@ async function main() {
         plugin_version: PLUGIN_VERSION, injected: false,
       });
     }
+    // Hitting the runaway ceiling is strictly WORSE than an agent-declared
+    // `stuck` exit — it means the loop never terminated on its own; only the
+    // circuit breaker did. A declared `stuck` already leaves forensic
+    // evidence in .supervisor/loop-exit.log (see the LOOP EXIT handler
+    // below); a ceiling hit previously left only a debug() line, invisible
+    // without SUPERVISOR_DEBUG=1. Same writer, same file, tagged distinctly
+    // so this can never be confused with a declared exit.
+    appendLoopExitLog(cwd, {
+      session: session_id, turnKey, reason: 'runaway_ceiling', detail: '',
+      at: Date.now(), mode, attempts, maxAttempts: effectiveMax,
+    });
     debug({ msg: 'attempt_cap_reached', session_id, attempts, max: effectiveMax, goal: !!goal, mode }, cwd);
     process.exit(0);
   }
@@ -999,16 +1010,12 @@ async function main() {
   if (loopExit) {
     const { reason, detail } = loopExit;
     const at = Date.now();
-    // Forensic evidence for a doom loop, in the SAME format the OpenCode tool
-    // writes (opencode/supervisor-impl.ts). Best-effort, never throws.
+    // Forensic evidence for a doom loop, via the ONE shared writer
+    // (core/loop-exit.mjs) also used by the OpenCode tool
+    // (opencode/supervisor-impl.ts) and the runaway-ceiling site above.
+    // Best-effort, never throws.
     if (reason === 'stuck') {
-      try {
-        fs.mkdirSync(path.join(cwd, '.supervisor'), { recursive: true });
-        fs.appendFileSync(
-          path.join(cwd, '.supervisor', 'loop-exit.log'),
-          JSON.stringify({ session: session_id, turnKey, reason, detail, at }) + '\n',
-        );
-      } catch { /* best effort */ }
+      appendLoopExitLog(cwd, { session: session_id, turnKey, reason, detail, at });
     }
     // NEVER `delete state.goal`. A goal is long-lived user intent; "this
     // turn's loop is over" says nothing about it. `stuck` pauses it and KEEPS

@@ -17,6 +17,9 @@
  * and a quoted example must not fire.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 /** Canonical sentinel keyword. */
 export const LOOP_EXIT_SENTINEL = 'SUPERVISOR_LOOP_EXIT';
 
@@ -59,4 +62,39 @@ export function parseLoopExitSentinel(text) {
   }
   if (AUTOPILOT_EXIT_RE.test(scanned)) return { reason: 'completed', detail: 'AUTOPILOT_EXIT' };
   return null;
+}
+
+/**
+ * THE single writer for `.supervisor/loop-exit.log` — forensic evidence that
+ * a supervision loop ended without the human driving it further.
+ *
+ * Two call sites, both runtimes, share this: an agent-declared `stuck` exit
+ * (the `supervisor_loop_exit` tool on opencode, the `SUPERVISOR_LOOP_EXIT:
+ * stuck` sentinel on Claude Code) and a `runaway_ceiling` hit — the per-turn
+ * attempt budget exhausted without the agent ever declaring an exit, which is
+ * strictly WORSE than a declared `stuck` because it means the loop never
+ * terminated on its own and nothing but the circuit breaker stopped it.
+ *
+ * One writer, one file, one JSON-lines format — the shape each caller passes
+ * as `record` may differ (a ceiling hit adds `mode`/`attempts`/`maxAttempts`;
+ * a declared exit adds `turnKey`/`detail`), but there is exactly one function
+ * that touches the file, so the two call sites cannot drift onto two formats.
+ *
+ * Best-effort by contract: a failed write must never block or crash a turn.
+ *
+ * @param {string} cwd project directory (session cwd on Claude Code, plugin
+ *   `directory` on opencode)
+ * @param {Record<string, unknown>} record JSON-serializable forensic record.
+ *   Callers should always include `reason` and `at` (epoch ms).
+ * @returns {boolean} true if the write succeeded, false on any failure
+ */
+export function appendLoopExitLog(cwd, record) {
+  try {
+    const dir = path.join(cwd, '.supervisor');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, 'loop-exit.log'), JSON.stringify(record) + '\n');
+    return true;
+  } catch {
+    return false;
+  }
 }

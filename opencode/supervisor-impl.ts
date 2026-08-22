@@ -47,6 +47,7 @@ import {
   pushedToDefaultBranch, hasCodeChangeEvidence, summarizeToolActivity,
   describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
+  evaluateNoProgress,
 } from "../core/evaluation.mjs"
 import {
   DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt, buildJudgePrompt,
@@ -65,6 +66,12 @@ import {
   buildConversationChain, userMessageText, truncateForPrompt, PROMPT_TEXT_LIMIT,
 } from "../core/task-context.mjs"
 import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
+// THE shared parser for the agent-declared loop exit (a real tool here, a
+// text sentinel on Claude Code — see core/loop-exit.mjs's header) and its
+// ONE forensic-log writer, reused by both the runaway-ceiling circuit
+// breaker and executeSupervisorLoopExit below so .supervisor/loop-exit.log
+// never grows a second record format.
+import { appendLoopExitLog } from "../core/loop-exit.mjs"
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -336,6 +343,14 @@ export interface SupervisorState {
     detail: string
     at: number
   }
+  /**
+   * No-progress gate state (core/evaluation.mjs's evaluateNoProgress) —
+   * fingerprint + consecutive-repeat count of the agent's last final reply.
+   * Same on-disk keys as the Claude Code runtime (bin/supervisor-on-stop.mjs)
+   * so the two gates cannot drift onto different persistence shapes.
+   */
+  lastReplyHash?: string | null
+  replyRepeatCount?: number
 }
 
 /** Provenance/idempotency marker on every injected plainspeak directive. */
@@ -2219,17 +2234,12 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
     const mode = resolveSupervisorMode(state)
 
     // Forensic evidence for a doom loop, written BEFORE returning so it
-    // survives even if the state write races or the process dies next.
+    // survives even if the state write races or the process dies next. Via
+    // the ONE shared writer (core/loop-exit.mjs) also used by the Claude
+    // Code hook and the runaway-ceiling circuit breaker above.
     if (reason === "stuck") {
-      try {
-        await mkdir(join(directory, ".supervisor"), { recursive: true })
-        await appendFile(
-          join(directory, ".supervisor", "loop-exit.log"),
-          JSON.stringify({ session: sid, turnKey, reason, detail, at }) + "\n"
-        )
-      } catch (e: any) {
-        debug("loop-exit: log append failed (non-fatal):", e?.message || e)
-      }
+      const ok = appendLoopExitLog(directory, { session: sid, turnKey, reason, detail, at })
+      if (!ok) debug("loop-exit: log append failed (non-fatal) for", sid)
     }
 
     await supervisorStore.mutate(directory, sid, (s) => {
@@ -2623,6 +2633,19 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
             }
           }
           debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", effectiveMaxAttempts, "mode:", mode, "goal:", !!goal)
+          // Hitting the ceiling is strictly WORSE than an agent-declared
+          // `stuck` exit (executeSupervisorLoopExit, above): it means the
+          // loop never terminated on its own — only the circuit breaker did.
+          // A declared `stuck` already leaves forensic evidence in
+          // .supervisor/loop-exit.log; a ceiling hit previously left only the
+          // debug() line just above, invisible without SUPERVISOR_DEBUG=1.
+          // Same shared writer (core/loop-exit.mjs) as the CC hook and the
+          // supervisor_loop_exit tool, tagged distinctly so this can never be
+          // confused with a declared exit.
+          appendLoopExitLog(directory, {
+            session: sessionId, turnKey, reason: "runaway_ceiling", detail: "",
+            at: Date.now(), mode, attempts: currentAttemptCount, maxAttempts: effectiveMaxAttempts,
+          })
           return
         }
 
@@ -2633,6 +2656,54 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         const customPrompt = await loadSupervisorPrompt(sessionDirectory)
         const agents = await getAgentsFile(sessionDirectory)
         const rubric = await loadRubric(sessionDirectory)
+
+        // ── No-progress gate (deterministic, no LLM) ─────────────────────
+        //
+        // Parity fix: this gate existed ONLY on the Claude Code runtime
+        // (bin/supervisor-on-stop.mjs's "NO-PROGRESS GATE") — opencode had no
+        // detection at all for "the agent's reply is unchanged from last
+        // time, so pushing again is pointless". Same shared helper
+        // (core/evaluation.mjs's evaluateNoProgress), same threshold
+        // (NO_PROGRESS_REPEAT_THRESHOLD), same on-disk keys
+        // (lastReplyHash/replyRepeatCount), same locked mutate() — one
+        // implementation, two runtimes.
+        //
+        // ORDERING: placed AFTER the agent-declared loop-exit gate (near the
+        // top of this handler, over `sup.loopExit`) and the runaway-ceiling
+        // circuit breaker above, but BEFORE the non-actionable turn gate,
+        // the autopilot fast-path and the judge — mirroring the Claude Code
+        // hook's "4a-pre" placement, so it covers reflection, goal AND
+        // autopilot alike. Because the loop-exit gate already returned above
+        // whenever `supervisor_loop_exit` was called for THIS turn, an agent
+        // that repeats itself AND declares an exit always exits — the
+        // no-progress gate never gets a chance to swallow that signal.
+        //
+        // BUDGET: this is an ELIGIBILITY gate, not a spent attempt — it does
+        // NOT call writeTurnAttempts. Saturating the counter here would make
+        // "the agent repeated itself" indistinguishable from "the budget is
+        // spent", and opencode raises several session.idle events per human
+        // turn, so a LATER idle in the same turn would then read the
+        // saturated counter and take the budget-exhausted branch above,
+        // firing its side effects (setAutopilot(false), goal transitions)
+        // for the wrong reason. The gate re-derives the same answer for free
+        // on every idle, so it needs no counter of its own to terminate.
+        const noProgress = evaluateNoProgress(lastAssistantText, sup.lastReplyHash, sup.replyRepeatCount)
+        if (noProgress.standDown) {
+          debug("no-progress gate: standing down for", sessionId.slice(0, 8), "mode:", mode, "goal:", !!goal, "repeats:", noProgress.repeatCount)
+          return
+        }
+        // Locked read-modify-write: never save() a whole state object read
+        // earlier in this turn, or the goal/attempts/loopExit keys already
+        // resolved above would be lost (the exact lost-update shape
+        // test/goal-per-turn.test.mjs guards).
+        try {
+          await supervisorStore.mutate(directory, sessionId, (s) => {
+            s.lastReplyHash = noProgress.hash
+            s.replyRepeatCount = noProgress.repeatCount
+          })
+        } catch (e: any) {
+          debug("no-progress gate: persist failed (non-fatal):", e?.message || e)
+        }
 
         // ── Non-actionable turn gate ─────────────────────────────────────
         // A completion judge only makes sense when the human actually asked for
