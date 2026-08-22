@@ -1,8 +1,11 @@
 ---
 description: Set / check / clear a session goal the supervisor pushes the agent to meet before stopping.
 ---
-Manage the supervisor session goal. Setting a goal switches the session to
-`goal` mode; clearing it returns the session to `reflection` mode.
+Manage the supervisor session goal. A goal is a session **attribute**, not a
+mode: setting one puts the session in `reflection` mode (where the judge verifies
+the goal on each stop). Clearing it leaves the session in `reflection`. Note: in
+`autopilot` mode a goal is not verified — its condition is only added to the
+auto-continue nudge as context.
 
 Do not use the `task` tool or delegate to a subagent. Call `supervisor_goal`
 directly in this session so the plugin-provided tool is available.

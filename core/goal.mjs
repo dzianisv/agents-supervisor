@@ -31,7 +31,13 @@ export const DEFAULT_MAX_ATTEMPTS = 16;
 // which killed long-running goals mid-drive with no verdict and no message.
 // 30 days is effectively unbounded for a human-turn-gated loop.
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
-export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'goal', 'reflection']);
+// TWO modes only. A goal is no longer a mode — it is an ORTHOGONAL ATTRIBUTE
+// of the session (`state.goal`), enforced in reflection mode and carried as
+// context in autopilot. 'goal' survives ONLY as a deprecated INPUT alias
+// (CLI/tool `mode: 'goal'`) that maps to reflection+goal, and as a persisted
+// value migrated forward at load time (see core/session-store.mjs); it is
+// never a valid stored `state.mode`.
+export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'reflection']);
 export const DEFAULT_SUPERVISOR_MODE = 'reflection';
 // Shared cap on a goal condition's length. Single source of truth for BOTH
 // runtime surfaces: parseSupervisorCommand (CC CLI) and executeSupervisorGoal
@@ -74,8 +80,11 @@ const GOAL_RESUMABLE_STATUSES = new Set(['paused', 'exhausted']);
 
 export function resolveSupervisorMode(state = {}) {
   if (SUPERVISOR_MODE_SET.has(state.mode)) return state.mode;
+  // A persisted legacy `mode:'goal'` (or any unknown value) is NOT a mode any
+  // more — a goal is an attribute. session-store normalises it to 'reflection'
+  // on load, but resolve here too so a raw/un-normalised state still maps
+  // correctly. Autopilot flag wins if set; everything else is reflection.
   if (state.autopilot === true) return 'autopilot';
-  if (state.goal?.status === 'active') return 'goal';
   return DEFAULT_SUPERVISOR_MODE;
 }
 
@@ -192,10 +201,11 @@ export function parseSupervisorCommand(name, args) {
   }
   // `solofounder` used to be its own supervisor mode with its own state file,
   // its own deadline and its own continuation template. Everything that made
-  // it different is now goal mode's default behavior (per-turn budget reset,
-  // long deadline, condition injected into the judge), so the name survives
-  // only as an alias that arms a plain goal. The CEO playbook lives in
-  // skills/solofounder/SKILL.md, which is where prompt-level guidance belongs.
+  // it different is now the default behaviour of an active goal (per-turn
+  // budget reset, long deadline, condition injected into the judge in
+  // reflection), so the name survives only as an alias that arms a plain
+  // goal. The CEO playbook lives in skills/solofounder/SKILL.md, which is
+  // where prompt-level guidance belongs.
   if (name === 'set-goal' || name === 'goal' || name === 'solofounder') {
     if (trimmed === '') return { kind: 'goal-status' };
     if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return { kind: 'goal-clear' };
@@ -237,6 +247,29 @@ MANDATORY: The following user-set goal condition MUST be demonstrably met before
 This is an ADDITIONAL requirement on top of the existing workflow gates (tests, build, PR, CI checks) — it does not replace them. The task is NOT complete until this condition is satisfied AND all normal completion criteria are met.
 
 Evidence rule: a claim that this goal condition is met must be backed by evidence already surfaced in the transcript — commands run and their output, tests actually executed, artefacts produced. A bare assertion that the condition is satisfied does NOT count as evidence.`;
+}
+
+/**
+ * Append an active goal condition to an autopilot continuation nudge as
+ * working CONTEXT. Shared by BOTH runtimes (the Claude Code Stop hook and the
+ * OpenCode session.idle handler) so the two nudges cannot drift — duplicated
+ * prompt logic across the runtimes is this repo's most-repeated bug shape.
+ *
+ * IMPORTANT: in autopilot the supervisor does NOT run the judge, so this goal
+ * is context only — it is never independently verified. (Use reflection mode
+ * if you want the goal actually checked.) The nudge presents it as the
+ * objective to keep working toward; the "not verified" caveat lives in the
+ * user-facing docs, not in the agent-facing nudge.
+ *
+ * Returns the nudge unchanged when the condition is blank. The appended block
+ * carries real body text, so it never turns an otherwise-empty message into a
+ * spuriously non-empty one — but the autopilot nudge always has a body anyway
+ * and never rides the hasFeedbackBody empty-injection guard.
+ */
+export function appendGoalContextToNudge(nudge, condition) {
+  const trimmed = (condition ?? '').trim();
+  if (!trimmed) return nudge ?? '';
+  return `${nudge}\n\nKeep working toward the user-set goal for this session:\n\n  "${trimmed}"`;
 }
 
 /**
@@ -312,11 +345,13 @@ export function goalResumeHintSuffix(goal) {
  * next), and restamps lastTurnKey to null so the very next stop treats this
  * as a brand-new turn (same initial value setGoal() uses).
  *
- * Forces mode back to 'goal' and autopilot off: the OpenCode deadline path
- * sets mode:'reflection' on exhaustion (decideGoalTransition's 'deadline'
- * reason), and resolveSupervisorMode() trusts an explicit state.mode over
- * goal.status — so without this, a resumed deadline-exhausted goal would stay
- * invisible to the mode==='goal' filter both runtimes use.
+ * Forces mode back to 'reflection' and autopilot off: a resumed goal must be
+ * VERIFIED, and only reflection runs the judge. The OpenCode deadline path
+ * sets mode:'reflection' on exhaustion already; forcing it here means a
+ * resumed goal is always active AND checked, regardless of what mode the
+ * session was left in. (There is no 'goal' mode any more — a goal is an
+ * attribute keyed off goal.status, so no special mode is needed to make it
+ * visible to the runtimes.)
  *
  * If the OLD deadline has already passed, resume extends it by
  * maxDurationMs from now — otherwise the very next stop-hook pass re-triggers
@@ -365,7 +400,7 @@ export function resumeGoal(cwd, sessionId, opts = {}) {
       lastTurnKey: null,
       deadline,
     };
-    state.mode = 'goal';
+    state.mode = 'reflection';
     state.autopilot = false;
     delete state.attempts;
     outcome = { resumed: true, previousStatus, status: 'active', condition: goal.condition };
@@ -406,7 +441,14 @@ export const goalStore = {
         // bin/supervisor-on-stop.mjs.
         deadline: now + maxDurationMs, lastReason: '', lastTurnKey: null,
       };
-      state.mode = 'goal';
+      // A goal is an ATTRIBUTE, not a mode. Setting one forces REFLECTION
+      // (not the retired 'goal' mode) because a goal is only ever VERIFIED in
+      // reflection — autopilot never runs the judge. Setting a goal is a
+      // strong "I want this checked" signal, so guarantee it is checked rather
+      // than silently leaving an autopilot session where the goal is mere
+      // context. To run autopilot WITH a goal-as-context, set the goal first,
+      // then switch to autopilot (which now KEEPS the goal).
+      state.mode = 'reflection';
       state.autopilot = false;
       return state;
     });
@@ -428,9 +470,12 @@ export const goalStore = {
     return sessionStore.mutate(cwd, sessionId, (state) => {
       state.mode = mode;
       state.autopilot = mode === 'autopilot';
-      // Only 'goal' runs a condition through the goal-loop primitives
-      // (state.goal); switching to any other mode drops it.
-      if (mode !== 'goal') delete state.goal;
+      // A goal is an ATTRIBUTE, orthogonal to the mode — a mode switch NEVER
+      // drops it. This deletion used to live here (`if (mode !== 'goal')
+      // delete state.goal`) and was the single most dangerous line in the
+      // two-modes refactor: AGENTS.md documents that `delete state.goal` has
+      // silently destroyed users' goals before. A goal now dies ONLY on an
+      // explicit clear (clearGoal) or on achievement-retirement.
       return state;
     });
   },
@@ -661,13 +706,13 @@ export function writeDerivedProjectGoal(cwd, condition) {
   }
 }
 
-// --- LLM-derived goal (goal mode, no condition, nothing set yet) -----------
+// --- LLM-derived goal (set-goal with no condition, nothing set yet) ---------
 //
-// Binding architecture: the `goal` supervisor mode invoked with no condition
-// AND no existing session/project goal MUST make an LLM call to derive a
-// concise, falsifiable goal — it must never silently no-op, and it must
-// never fabricate a static default when derivation fails or is invalid. The
-// runtime (opencode/supervisor-impl.ts's executeSupervisorGoal) owns
+// Binding architecture: `set-goal` (the `supervisor_goal` tool / CLI) invoked
+// with no condition AND no existing session/project goal MUST make an LLM call
+// to derive a concise, falsifiable goal — it must never silently no-op, and it
+// must never fabricate a static default when derivation fails or is invalid.
+// The runtime (opencode/supervisor-impl.ts's executeSupervisorGoal) owns
 // spawning the actual LLM call (ephemeral session, model cascade); this
 // module owns the pure, runtime-agnostic prompt construction and strict
 // response validation so both are independently unit-testable without a
@@ -772,7 +817,7 @@ function fenceUntrusted(label, content, nonce) {
 
 /**
  * Build the LLM prompt used to derive a goal condition from untrusted task
- * context when the user invokes goal mode with no explicit condition and no
+ * context when the user invokes set-goal with no explicit condition and no
  * goal exists yet. Pure string construction — no network call here.
  * @param {{ taskSummary?: string, transcriptExcerpt?: string, agentsExcerpt?: string }} opts
  * @returns {string}

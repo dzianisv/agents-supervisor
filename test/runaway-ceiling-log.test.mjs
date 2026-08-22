@@ -124,7 +124,8 @@ describe('Claude Code: hitting the per-turn ceiling writes a runaway_ceiling rec
     const rec = recs[0];
     assert.equal(rec.session, sid);
     assert.equal(rec.reason, 'runaway_ceiling');
-    assert.equal(rec.mode, 'goal');
+    // Setting a goal now forces reflection (goal is an attribute, not a mode).
+    assert.equal(rec.mode, 'reflection');
     assert.equal(rec.attempts, 1);
     assert.equal(rec.maxAttempts, 1);
     assert.ok(Number.isFinite(rec.at));

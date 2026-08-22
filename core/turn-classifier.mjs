@@ -160,8 +160,10 @@ export function isSupervisorControlTurn(text) {
  *
  * ESCAPE HATCH: an active goal (or autopilot) keeps supervising regardless —
  * a goal is a standing, user-set completion contract that outlives any single
- * chatty turn, so "thanks" must not silently disarm it. The ONE thing that
- * escape hatch does not cover is a supervisor control command; see
+ * chatty turn, so "thanks" must not silently disarm it. A goal is an
+ * ATTRIBUTE now, not a mode, so `hasActiveGoal` is what escapes for a goal
+ * (the check just above); `mode` only escapes for autopilot. The ONE thing
+ * neither escape hatch covers is a supervisor control command; see
  * isSupervisorControlTurn.
  *
  * @param {{text?: string, hasActiveGoal?: boolean, mode?: string}} opts
@@ -170,7 +172,7 @@ export function isSupervisorControlTurn(text) {
 export function shouldSkipReflection({ text, hasActiveGoal, mode } = {}) {
   if (isSupervisorControlTurn(text)) return { skip: true, reason: 'supervisor-control-command' }
   if (hasActiveGoal) return { skip: false, reason: 'active-goal' }
-  if (mode === 'autopilot' || mode === 'goal') return { skip: false, reason: `mode:${mode}` }
+  if (mode === 'autopilot') return { skip: false, reason: `mode:${mode}` }
   const { actionable, category } = classifyTurn(text)
   if (actionable) return { skip: false, reason: 'actionable' }
   return { skip: true, reason: `non-actionable:${category}` }

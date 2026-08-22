@@ -165,7 +165,10 @@ describe('migration from the old layout', () => {
     assert.equal(state.maxAttempts, 9, 'retry override survives');
     assert.equal(state.statusDiagram, false, 'flags survive');
     assert.equal(state.projectDir, cwd);
-    assert.equal(resolveSupervisorMode(state), 'goal');
+    // A legacy mode:'goal' is migrated forward to reflection at load time (goal
+    // is no longer a mode), with the goal object itself preserved verbatim.
+    assert.equal(state.mode, 'reflection', 'legacy mode:goal must migrate to reflection');
+    assert.equal(resolveSupervisorMode(state), 'reflection');
     assert.deepEqual(readDisabled(cwd), [sid], 'the disabled flag must NOT be lost');
   });
 
@@ -253,7 +256,7 @@ describe('two concurrent sessions in one project', () => {
     goalStore.setMode(cwd, B, 'autopilot');
 
     assert.equal(goalStore.load(cwd, A).goal.condition, 'goal A');
-    assert.equal(goalStore.load(cwd, A).mode, 'goal');
+    assert.equal(goalStore.load(cwd, A).mode, 'reflection');
     assert.equal(goalStore.load(cwd, B).goal, undefined, "B must not see A's goal");
     assert.equal(goalStore.load(cwd, B).mode, 'autopilot');
   });

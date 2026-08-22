@@ -20,3 +20,12 @@ node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" autopilot "${ARGUMENTS}"
 - `${ARGUMENTS}` = `status` → report autopilot status.
 
 Relay the CLI output to the user.
+
+## A goal in autopilot is context, not a verified condition
+
+Autopilot never runs the judge, so it cannot check a goal. If a goal is set when
+you enable autopilot, its condition is appended to the auto-continue nudge as
+context for the agent — but it is **not** verified before the agent may stop.
+Switching to autopilot **keeps** any active goal (a goal is a session attribute,
+not a mode); it is not cleared. If you want the goal actually checked, use
+`reflection` mode instead.

@@ -100,16 +100,23 @@ const NO_SESSION_MSG =
 
 // Special-case: `mode <word>` → translate to `supervisor <word>` so the
 // parser's `name==='supervisor'` branch handles mode-set correctly.
-// `mode goal` needs its own path: `supervisor set-goal` means "goal status" to
-// the parser, so set the mode directly instead (parity with the OpenCode surface,
-// where `/supervisor set-goal` with no condition also reports status).
+// DEPRECATED `mode goal`: 'goal' is no longer a mode — a goal is an orthogonal
+// session ATTRIBUTE. Accept it as a deprecated alias that sets reflection (the
+// mode that VERIFIES a goal) and keeps any existing goal, so users, skills and
+// stale installed command files that still say `mode goal` do not hard-error.
 if (name === 'mode' && argv[1]?.toLowerCase() === 'goal') {
   if (!sid) {
     console.log(NO_SESSION_MSG);
     process.exit(0);
   }
-  goalStore.setMode(cwd, sid, 'goal');
-  console.log(`Supervisor mode set to goal for session ${sid.slice(0, 8)}… (requires an active goal condition to be set).${sessionSourceNote()}`);
+  goalStore.setMode(cwd, sid, 'reflection');
+  const st = goalStore.load(cwd, sid);
+  const hasGoal = st.goal?.status === 'active';
+  console.log(
+    `'goal' is no longer a mode — a goal is a session attribute. Mode set to reflection for session ${sid.slice(0, 8)}…` +
+    (hasGoal ? ` (existing goal kept: "${st.goal.condition}").` : `. Set a goal with 'supervisor set-goal <condition>'.`) +
+    sessionSourceNote()
+  );
   process.exit(0);
 }
 if (name === 'mode') {
@@ -168,12 +175,16 @@ try {
   }
 } catch { /* best effort */ }
 
-/** Warn and clear an active goal before a mode switch that would delete it. */
-function clearGoalIfActive(cwd, sid) {
+/** Report an active goal that a mode switch will now KEEP (not clear). A mode
+ * switch never drops a goal any more — a goal is an orthogonal attribute. */
+function noteGoalKeptOnModeSwitch(cwd, sid, mode) {
   const st = goalStore.load(cwd, sid);
   if (st.goal?.status === 'active') {
-    console.log(`⚠  Clearing active goal: "${st.goal.condition}"`);
-    goalStore.clearGoal(cwd, sid);
+    if (mode === 'autopilot') {
+      console.log(`ℹ  Goal kept as CONTEXT (autopilot does not run the judge, so it is not verified): "${st.goal.condition}"`);
+    } else {
+      console.log(`ℹ  Goal kept (reflection verifies it on each stop): "${st.goal.condition}"`);
+    }
   }
 }
 
@@ -248,7 +259,7 @@ switch (cmd.kind) {
       );
       break;
     }
-    // No session goal. Binding contract (align-supervisor-modes): goal mode
+    // No session goal. Binding contract (align-supervisor-modes): set-goal
     // with no condition and nothing set MUST attempt an LLM derivation
     // rather than silently no-op-ing — but this CLI has no LLM call wired
     // in (see the OpenCode plugin's supervisor_goal tool for the actual
@@ -289,9 +300,10 @@ switch (cmd.kind) {
   // ── mode-set ──────────────────────────────────────────────────────────────
   case 'mode-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    // Warn if switching modes with an active goal (setMode will delete it).
-    clearGoalIfActive(cwd, sid);
     goalStore.setMode(cwd, sid, cmd.mode);
+    // A mode switch KEEPS any active goal now (a goal is an attribute, not a
+    // mode) — announce that instead of silently clearing it.
+    noteGoalKeptOnModeSwitch(cwd, sid, cmd.mode);
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log(`mode: ${cmd.mode}`);
     if (cmd.mode === 'autopilot') {
@@ -308,9 +320,9 @@ switch (cmd.kind) {
   // ── autopilot-on ──────────────────────────────────────────────────────────
   case 'autopilot-on': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    // Warn if there is an active goal (setAutopilot → setMode will delete it).
-    clearGoalIfActive(cwd, sid);
     goalStore.setAutopilot(cwd, sid, true);
+    // Autopilot KEEPS any active goal as context now (it is not verified).
+    noteGoalKeptOnModeSwitch(cwd, sid, 'autopilot');
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log('mode: autopilot');
     console.log(

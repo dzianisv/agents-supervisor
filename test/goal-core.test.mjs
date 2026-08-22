@@ -11,7 +11,7 @@ import {
   resolveReflectionMaxAttempts, DEFAULT_REFLECTION_MAX_ATTEMPTS,
   resolveClaudeCodeHardCap, decideGoalTransition, RUNAWAY_CEILING,
   parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
-  DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode,
+  DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode, appendGoalContextToNudge,
   extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
 } from '../core/goal.mjs';
 
@@ -64,6 +64,19 @@ test('parseSupervisorCommand + buildGoalRequirementSection (shared logic)', () =
   assert.equal(buildGoalRequirementSection(''), '');
 });
 
+test('appendGoalContextToNudge: appends the condition, no-ops on blank (shared by both runtimes)', () => {
+  const base = 'Autopilot (1/50)\n\nContinue now.';
+  const withGoal = appendGoalContextToNudge(base, 'all tests pass');
+  assert.ok(withGoal.startsWith(base), 'the original nudge is preserved as a prefix');
+  assert.match(withGoal, /all tests pass/, 'the goal condition is appended as context');
+  assert.match(withGoal, /goal for this session/i);
+  // Blank/whitespace/nullish conditions never mutate the nudge.
+  assert.equal(appendGoalContextToNudge(base, ''), base);
+  assert.equal(appendGoalContextToNudge(base, '   '), base);
+  assert.equal(appendGoalContextToNudge(base, null), base);
+  assert.equal(appendGoalContextToNudge(base, undefined), base);
+});
+
 test('parseSupervisorCommand supports root /supervisor mode UX', () => {
   assert.deepEqual(parseSupervisorCommand('supervisor', ''), { kind: 'supervisor-status' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'status'), { kind: 'supervisor-status' });
@@ -83,20 +96,28 @@ test('goalStore persists supervisor mode and resolves legacy state', () => {
   assert.equal(DEFAULT_SUPERVISOR_MODE, 'reflection');
   assert.equal(resolveSupervisorMode({}), 'reflection');
   assert.equal(resolveSupervisorMode({ autopilot: true }), 'autopilot');
-  assert.equal(resolveSupervisorMode({ goal: { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 9e9, lastReason: '' } }), 'goal');
+  // A goal is an ATTRIBUTE now, not a mode. An active goal alone no longer
+  // resolves to a 'goal' mode — it resolves to reflection (where it is
+  // verified). A legacy persisted mode:'goal' also maps forward to reflection.
+  assert.equal(resolveSupervisorMode({ goal: { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 9e9, lastReason: '' } }), 'reflection');
+  assert.equal(resolveSupervisorMode({ mode: 'goal' }), 'reflection');
 
   goalStore.setGoal(d, 's3', 'ship it');
-  assert.equal(goalStore.load(d, 's3').mode, 'goal');
+  // Setting a goal forces reflection (the mode that verifies it), not a mode.
+  assert.equal(goalStore.load(d, 's3').mode, 'reflection');
   assert.equal(goalStore.load(d, 's3').autopilot, false);
 
   goalStore.setMode(d, 's3', 'autopilot');
   assert.equal(goalStore.load(d, 's3').mode, 'autopilot');
-  assert.equal(goalStore.load(d, 's3').goal, undefined);
+  // A mode switch NEVER drops the goal now (the :433 landmine is removed).
+  assert.equal(goalStore.load(d, 's3').goal?.condition, 'ship it');
   assert.equal(resolveSupervisorMode(goalStore.load(d, 's3')), 'autopilot');
 
   goalStore.setAutopilot(d, 's3', false);
   assert.equal(goalStore.load(d, 's3').mode, 'reflection');
   assert.equal(goalStore.load(d, 's3').autopilot, false);
+  // Still there after flipping back — only clearGoal/retire may remove it.
+  assert.equal(goalStore.load(d, 's3').goal?.condition, 'ship it');
 });
 
 // ---------------------------------------------------------------------------

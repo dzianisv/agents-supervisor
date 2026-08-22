@@ -2,9 +2,10 @@
 //
 // These behaviors used to live in a separate `solofounder` supervisor mode
 // (its own state file, its own deadline, its own continuation template). That
-// mode was folded into plain `goal` mode: everything that made it different is
-// now goal mode's default, and the CEO playbook lives in the skill prompt
-// (skills/solofounder/SKILL.md) instead of the hook. What this file pins:
+// mode was folded into a plain active GOAL: everything that made it different
+// is now the default behaviour of an active goal (verified in reflection), and
+// the CEO playbook lives in the skill prompt (skills/solofounder/SKILL.md)
+// instead of the hook. What this file pins:
 //
 //   1. solofounder is NOT a supervisor mode any more.
 //   2. The attempt budget is per HUMAN TURN — goal.attempts resets when the
@@ -39,7 +40,7 @@ const ON_STOP = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
 // ── 1. solofounder is gone as a mode, alive only as a command alias ─────────
 
 test('solofounder is no longer a supervisor mode', () => {
-  assert.deepEqual([...SUPERVISOR_MODES], ['autopilot', 'goal', 'reflection']);
+  assert.deepEqual([...SUPERVISOR_MODES], ['autopilot', 'reflection']);
   assert.equal(resolveSupervisorMode({ mode: 'solofounder' }), DEFAULT_SUPERVISOR_MODE,
     'an unknown/retired mode value must fall back to the default, not resolve');
   assert.throws(() => goalStore.setMode(mkcwd(), 's0', 'solofounder'), /Invalid supervisor mode/);
@@ -58,18 +59,28 @@ test('the retired `solofounder` command word now just arms a plain goal', () => 
   );
 });
 
-// ── 2. setMode: only goal mode keeps the goal ──────────────────────────────
+// ── 2. setMode: a mode switch NEVER drops the goal (the :433 landmine) ──────
 
-test('setMode("goal") keeps an existing goal; other modes still drop it', () => {
+test('setMode never drops the goal; "goal" is not a valid mode', () => {
   const d = mkcwd();
   goalStore.setGoal(d, 's1', 'ship the feature');
-  goalStore.setMode(d, 's1', 'goal');
-  const state = goalStore.load(d, 's1');
-  assert.equal(state.mode, 'goal');
-  assert.equal(state.goal.condition, 'ship the feature');
+  // Setting a goal forces reflection (the verifying mode) — 'goal' is not a mode.
+  assert.equal(goalStore.load(d, 's1').mode, 'reflection');
+  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
 
+  // Switching to autopilot KEEPS the goal (as context) — the old
+  // `if (mode !== 'goal') delete state.goal` landmine is gone.
   goalStore.setMode(d, 's1', 'autopilot');
-  assert.equal(goalStore.load(d, 's1').goal, undefined);
+  assert.equal(goalStore.load(d, 's1').mode, 'autopilot');
+  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
+
+  // …and back to reflection, still intact.
+  goalStore.setMode(d, 's1', 'reflection');
+  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
+
+  // 'goal' is no longer a valid low-level mode (the deprecated INPUT alias is
+  // mapped to reflection at the CLI/tool surface, not in this primitive).
+  assert.throws(() => goalStore.setMode(d, 's1', 'goal'), /Invalid supervisor mode/);
 });
 
 // ── 3. Deadline is a long backstop, not a 30-minute session cap ────────────
@@ -79,7 +90,7 @@ test('setGoal deadline is the 30-day backstop, not the old 30-minute cap', () =>
   const now = Date.now();
   const state = goalStore.setGoal(d, 's2', 'all tests pass', { now });
 
-  assert.equal(state.mode, 'goal');
+  assert.equal(state.mode, 'reflection');
   assert.equal(state.goal.status, 'active');
   assert.equal(state.goal.attempts, 0);
   assert.equal(state.goal.lastTurnKey, null, 'seeded so the first stop stamps without resetting');

@@ -83,11 +83,15 @@ test('supervisorStore persists mode and resolves legacy autopilot state', async 
 
   await supervisorStore.setGoal(d, 's1', 'ship it');
   const goalState = await supervisorStore.load(d, 's1');
-  assert.equal(goalState.mode, 'goal');
+  // Setting a goal forces reflection (the mode that verifies it) — 'goal' is
+  // no longer a mode.
+  assert.equal(goalState.mode, 'reflection');
   assert.equal(goalState.autopilot, false);
+  assert.equal(goalState.goal?.condition, 'ship it');
 
   await supervisorStore.clearGoal(d, 's1');
   assert.equal((await supervisorStore.load(d, 's1')).mode, 'reflection');
+  assert.equal((await supervisorStore.load(d, 's1')).goal, undefined);
 });
 
 test('resolveMaxAttempts: sessionOverride > config > default 16, clamped [1,100]', () => {

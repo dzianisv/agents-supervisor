@@ -357,16 +357,25 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
   // protection: exiting a mode you are not in must be a no-op with respect
   // to autopilot/goal state.
   test('supervisor_loop_exit is a no-op on autopilot state outside autopilot mode (it must not delete an active goal)', async () => {
-    // 1. The destructive primitive is real: setMode away from 'goal' drops the goal.
+    // 1. The destructive primitive is GONE: setMode away from the goal-bearing
+    //    mode no longer drops the goal (a goal is an orthogonal attribute now,
+    //    not a mode). This is the two-modes refactor's central invariant — the
+    //    old `if (mode !== 'goal') delete state.goal` landmine is removed.
     const cwd = mkdtempSync(join(tmpdir(), 'sup-autopilot-exit-'));
     try {
       goalStore.setGoal(cwd, 'ses_autopilot_exit_probe', 'ship the thing');
       assert.equal(goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition, 'ship the thing');
       goalStore.setMode(cwd, 'ses_autopilot_exit_probe', 'reflection');
       assert.equal(
-        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal,
-        undefined,
-        'setMode away from goal drops the goal — this is the primitive the deleted autopilot_exit tool used to call blindly'
+        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition,
+        'ship the thing',
+        'setMode must NEVER drop the goal — a mode switch is not a goal clear'
+      );
+      goalStore.setMode(cwd, 'ses_autopilot_exit_probe', 'autopilot');
+      assert.equal(
+        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition,
+        'ship the thing',
+        'switching to autopilot must keep the goal (as context)'
       );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -509,7 +518,7 @@ describe('resume: a paused goal is not a dead end', () => {
       const reread = goalStore.load(dir, 'ses_resume_persist');
       assert.equal(reread.goal.status, 'active');
       assert.equal(reread.goal.condition, 'ship it');
-      assert.equal(reread.mode, 'goal', 'mode must be forced back to goal on resume');
+      assert.equal(reread.mode, 'reflection', 'resume forces reflection — the mode that VERIFIES a goal (goal is no longer a mode)');
       assert.equal(reread.autopilot, false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -540,7 +549,7 @@ describe('resume: a paused goal is not a dead end', () => {
     }
   });
 
-  test('a deadline-exhausted goal resumes: deadline extended into the future, mode forced back to goal', () => {
+  test('a deadline-exhausted goal resumes: deadline extended into the future, mode forced to reflection', () => {
     const dir = tmp();
     try {
       goalStore.setGoal(dir, 'ses_resume_deadline', 'ship it', {});
@@ -561,7 +570,7 @@ describe('resume: a paused goal is not a dead end', () => {
 
       const state = goalStore.load(dir, 'ses_resume_deadline');
       assert.equal(state.goal.status, 'active');
-      assert.equal(state.mode, 'goal', 'a resumed deadline-exhausted goal must be visible to the mode===goal filter again');
+      assert.equal(state.mode, 'reflection', 'a resumed deadline-exhausted goal must be in reflection so it is VERIFIED again (goal is no longer a mode)');
       assert.equal(state.autopilot, false);
       assert.ok(
         state.goal.deadline > before,

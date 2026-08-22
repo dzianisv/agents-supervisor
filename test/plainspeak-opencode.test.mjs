@@ -200,7 +200,9 @@ describe('supervisor-impl.ts source pins', () => {
   });
 
   test('ACTIVE-GOAL suppression is present', () => {
-    assert.match(IMPL, /if \(goal \|\| mode === "goal"\) return false/);
+    // A goal is an attribute now (not a mode), so the guard keys off `goal`
+    // alone — the retired `mode === "goal"` disjunct is gone.
+    assert.match(IMPL, /if \(goal\) return false/);
     assert.match(IMPL, /if \(args\.projectGoalCondition\) return false/);
   });
 

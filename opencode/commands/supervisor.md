@@ -1,8 +1,10 @@
 ---
 description: Show supervisor status or switch supervisor modes for this session.
 ---
-Inspect and control the supervisor for this project. The primary modes are
-`reflection` (default), `goal`, and `autopilot`.
+Inspect and control the supervisor for this project. There are two modes:
+`reflection` (default) and `autopilot`. A goal is a session *attribute*, not a
+mode — set one with `set-goal` and it works in either mode (verified in
+reflection; context-only in autopilot).
 
 Do not use the `task` tool or delegate to a subagent. Call the supervisor tools
 directly in this session so the plugin-provided tools are available.

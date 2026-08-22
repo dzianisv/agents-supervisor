@@ -61,12 +61,13 @@ The single-agent **Operating loop** below is what each *doer* runs on its narrow
 
 ## Set the $1M ARR done-bar (Step 1 — before the loop)
 
-This skill runs inside the **supervisor** plugin, on its **goal mode**. There is no
-separate `solofounder` supervisor mode any more — everything that made one different
-(per-human-turn attempt budget, effectively unbounded deadline, condition injected into
-the judge as a mandatory completion requirement) is now goal mode's default. This skill
-is the prompt-level layer on top: it arms a goal whose condition is the $1M ARR
-done-bar. Goal state lives in `.agents/supervisor/Goal.md` plus the per-session store
+This skill runs inside the **supervisor** plugin, on a **goal** in reflection mode.
+A goal is a session attribute, not a mode — everything that once made a separate
+`solofounder` supervisor mode different (per-human-turn attempt budget, effectively
+unbounded deadline, condition injected into the judge as a mandatory completion
+requirement) is now what any active goal does in reflection. This skill is the
+prompt-level layer on top: it arms a goal whose condition is the $1M ARR done-bar.
+Goal state lives in `.agents/supervisor/Goal.md` plus the per-session store
 under `.supervisor/sessions/<sessionId>/state.json`. On every turn-end the hook judges the reply against that
 condition and — if unmet — forces a continuation instead of letting the agent stop.
 That hook IS the persistence motor; there is no separate `.autopilot/` engine to arm and
@@ -123,7 +124,7 @@ THIS turn, not a plan you describe — a turn that ends without it armed nothing
 Stop hook can force at most **~7 turn-continuations within a single unbroken human
 message** — Claude Code overrides the hook and lets the turn end after 8 consecutive
 `{decision:'block'}` responses (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`, default 8, hook stays
-one under it). Goal mode does not bypass this cap; it is the same Stop-hook
+one under it). An active goal does not bypass this cap; it is the same Stop-hook
 mechanism as `reflection`. For a genuinely long autonomous drive toward $1M ARR, either:
 - pair this skill with the `/loop` skill (a fresh message resets CC's per-turn counter,
   so `/loop` re-invoking the prompt on an interval is what actually spans hours/days), or
