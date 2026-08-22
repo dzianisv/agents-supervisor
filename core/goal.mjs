@@ -104,47 +104,54 @@ export function resolveSupervisorMode(state = {}) {
  * mid-task, so it is deliberately high. Hitting it is LOUD: both runtimes
  * append a reason:'runaway_ceiling' record to .supervisor/loop-exit.log.
  *
- * DERIVED from evidence, not felt (was `50`, then briefly `64` — both picked by
- * feel; see .scratch/runaway-limit-analysis.md for the full workup + source
- * URLs). Two independent directions, and they agree:
+ * THE UNIT — read this before comparing 50 to any framework number. N counts
+ * SUPERVISOR INJECTIONS: OUTER-loop re-prompts. Each injection RESTARTS a whole
+ * agent turn that itself may run dozens of tool calls. So N is NOT the same unit
+ * as the per-run step/turn caps in agent frameworks, which bound the INNER loop
+ * of ONE run: LangChain AgentExecutor.max_iterations=15; LangGraph
+ * recursion_limit=25; OpenAI Agents SDK max_turns=10; smolagents max_steps=20;
+ * CrewAI max_iter=25; Aider max_reflections=3; AutoGen v0.2
+ * max_consecutive_auto_reply=100; OpenHands max_iteration_per_run=500 (with
+ * stuck_detection on). 50 of OUR injections ≈ 50 completed agent turns ≈
+ * plausibly hundreds-to-thousands of model steps — one of the MOST PERMISSIVE
+ * limits in the ecosystem, effectively unbounded in dollars. Anyone who reads
+ * "50" and compares it to LangChain's 15 or the SDK's 10 draws the wrong
+ * conclusion: the comparable unit is a whole agent RUN, not one step.
  *
- *   INTERNAL — 192 real per-turn samples from 19 local `.supervisor` stores
- *   (~30 days). The AUTHORITATIVE per-turn counter (`attempts.count`) had
- *   p50=3, p90=3, p99≈3; NO legitimate turn was ever observed above 3. Every
- *   sample above ~16 was a doom loop that saturated whatever cap was in force
- *   (old reflection 3, old goal 16, the folkloric 50 — hit 3× — or a configured
- *   100 — once). So the region above 3 is CENSORED by the prior caps, not real
- *   work: the healthy number is ≤3 and the true legitimate tail is unobservable.
- *
- *   EXTERNAL — published defaults for the SAME unit we count (a supervisor
- *   re-injection ≈ one full agent TURN, not one inner ReAct step). Frameworks
- *   that count full turns cap at ~10: OpenAI Agents SDK max_turns=10, AutoGen
- *   v0.2 GroupChat.max_round=10; the heavyweight coding agents ship the turn cap
- *   OFF and bound cost instead (Claude Agent SDK max_turns=None; SWE-agent
- *   $3/instance). Self-correction research says the payoff is front-loaded:
- *   Self-Refine caps at ≤4 rounds, Reflexion plateaus, and Huang et al. (arXiv
- *   2310.01798) show intrinsic self-correction can DEGRADE without new external
- *   feedback — re-prompting a stuck agent past a few rounds is often
- *   net-negative. Practitioner trend is toward no-progress detection (OpenHands
- *   StuckDetector halts on 3–4 repeats) + cost budgets, with the raw iteration
- *   cap demoted to a coarse last-resort — which is exactly this valve's role.
- *
- * 20 = 2× the ~10-turn cap shipped by the two frameworks that count our exact
- * unit (one full doubling of headroom above the industry norm), and ~6–7× the
- * healthy median of 3 measured locally. It sits at the TOP of the evidence-
- * supported safety-valve band (~10–20 for a turn-counted loop; nothing above
- * ~25 has support in any framework default) — high enough to honor this repo's
- * hard rule that a low default IS the premature-stand-down bug (16 was premature
- * only as a FUNCTIONAL stop; as a pure BACKSTOP behind supervisor_loop_exit +
- * the no-progress gate + a goal deadline + `/supervisor off`, 20 is safe), low
- * enough that a doom loop burns ~20 judge calls / ~7 min instead of 64's
- * ~21 min of pure waste. It bounds only COST, never signals completion, and is
- * fully configurable — `unlimited` included, for an operator who wants no
- * backstop at all. NOTE: the evidence says a fixed iteration cap is the WRONG
- * PRIMARY stop (favor no-progress + cost budget); keeping it as a backstop here
- * is a deliberate design choice, not a claim that the count is the right stop.
+ * WHY 50, AND WHY IT IS NOT FOLKLORE (explained + sourced, not tuned). This is a
+ * BACKSTOP set well above observed reality, not an optimum:
+ *   - MEASURED (this machine, ~30 days; see .scratch/runaway-limit-analysis.md).
+ *     The authoritative per-turn counter (attempts.count) over 59 last-turn
+ *     samples across 19 `.supervisor` stores had p50=3, p90=3, p99≈3; a same-task
+ *     corroboration (133 samples) gave the same p99=3. NO legitimate turn ever
+ *     exceeded 3 injections; every sample above ~16 was a doom loop that
+ *     SATURATED whatever cap was in force (old reflection 3, old goal 16, this
+ *     50 — hit 3× — or a configured 100 — once). The region above 3 is CENSORED,
+ *     not real work. So 50 ≈ 17× the observed p99: deliberately far above reality.
+ *   - The long-horizon coding frameworks that DID tune a stop moved OFF a step
+ *     count onto a COST budget: SWE-agent per_instance_cost_limit=$3 (step cap
+ *     disabled); mini-SWE-agent step_limit=0, $3 cost_limit is the real stop;
+ *     Claude Agent SDK ships no turn cap and recommends a USD budget "for
+ *     production agents"; Anthropic's own SWE-bench scaffold has NO turn cap
+ *     ("sample until the model decides it is finished, or exceeds 200k context").
+ *     Their empirical reason: successful runs live in the TAIL — Anthropic reports
+ *     successes at ">100 turns", and arXiv 2510.16786 finds median turns-to-solve
+ *     41–58 with a tail >175 — so a LOW static cap trades tail SUCCESS for cost.
+ *     That paper recommends setting the limit at the p75 of YOUR OWN observed
+ *     distribution (+ a dynamic extension on failure) and calls fixed step limits
+ *     "a brute-force approach that lacks the adaptability needed for tasks of
+ *     varying complexity". Our p75 is 3, so any static backstop is many× p75 by
+ *     construction — which is fine for a backstop and useless as an optimum.
+ * Net: keep the injection cap HIGH and crude (a runaway backstop); let the real
+ * stops do the work — supervisor_loop_exit, the no-progress gate, a goal
+ * deadline, `/supervisor off`. The evidence says the RIGHT primary control is a
+ * per-turn COST/TOKEN budget (opencode exposes per-message `cost` + `tokens`, so
+ * a plugin could sum them) — but that is a mechanism change and the owner's call,
+ * NOT made here. 50 bounds only the COST of a never-exiting loop, never signals
+ * completion, and is fully configurable — `/supervisor retry N`, `maxAttempts:`,
+ * `SUPERVISOR_MAX_ATTEMPTS` — `unlimited` included.
  */
-export const RUNAWAY_CEILING = 20;
+export const RUNAWAY_CEILING = 50;
 
 /**
  * Sentinel for "no runaway cap". `Infinity` is the natural in-code form: every

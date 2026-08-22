@@ -10,7 +10,7 @@ Claude Code platform cap.
 ```
 ROADMAP  ████████████████████  done
  [x] 1. forensic analysis of 30d real sessions -> .scratch/runaway-limit-analysis.md
- [x] 2. RUNAWAY_CEILING 50 -> 20, evidence-derived doc comment (core/goal.mjs)
+ [x] 2. RUNAWAY_CEILING 50 kept as backstop; doc comment now EXPLAINED + SOURCED (core/goal.mjs)
  [x] 3. describeRunawayLimit descriptor: {limit,requested,unlimited,tier,cappedByPlatform,hardCap}
  [x] 4. unlimited/off/none/0 opt-out; positive ints honoured verbatim (no [1,100] clamp)
  [x] 5. config maxAttempts: in supervisor.yaml (shared sync reader, both runtimes)
@@ -19,14 +19,18 @@ ROADMAP  ████████████████████  done
  [x] 8. docs (README/AGENTS/tdd/concepts/skills/commands) + tests + sensitivity
 ```
 
-MEASUREMENT + EXTERNAL: 192 per-turn samples, 19 projects. Legit turns cap at ≤3
-injections (p50=3, p90=3); everything above ~16 is censored doom-loop saturation
-(the only samples ≥16 hit the old 50/100 caps), so the genuine tail is
-unobservable. External: frameworks that count our unit (re-injection ≈ one full
-agent turn) cap at ~10 (OpenAI Agents SDK max_turns=10, AutoGen GroupChat
-max_round=10) or ship it off + use a cost budget; self-correction is front-loaded
-(Self-Refine ≤4, Huang et al. arXiv 2310.01798). So 20 = 2× the ~10-turn norm and
-~6–7× the healthy median of 3 — evidence-derived, not feel.
+UNIT + MEASUREMENT: N counts supervisor INJECTIONS (outer-loop re-prompts), each
+≈ a whole agent turn of dozens of steps — so 50 injections ≈ 50 completed agent
+turns ≈ hundreds-to-thousands of model steps, NOT comparable to a framework's
+per-run cap (LangChain 15, OpenAI SDK max_turns=10, OpenHands 500). Measured (59
+authoritative last-turn samples, 19 projects; 133 same-task corroboration): legit
+turns cap at ≤3 injections (p50=3, p90=3, p99≈3); everything above ~16 is censored
+doom-loop saturation. So 50 ≈ 17× observed p99 — a backstop set well above reality,
+not a tuned optimum. The frameworks that tuned a stop moved to COST budgets
+(SWE-agent $3, Claude SDK, Anthropic scaffold) because successes live in the tail
+(arXiv 2510.16786 median 41–58, tail >175). REPORTED to owner (not built): a
+per-turn cost/token budget as the primary control (opencode exposes per-message
+cost+tokens); and whether no-progress threshold 2 is too twitchy vs OpenHands 3–4.
 
 ---
 

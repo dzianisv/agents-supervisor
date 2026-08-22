@@ -177,7 +177,7 @@ function driftTurnsWithText(text) {
 }
 
 // The counter is now a RUNAWAY CIRCUIT BREAKER (core/goal.mjs RUNAWAY_CEILING
-// = 20), not the intended stop — the agent ends the loop with the loop-exit
+// = 50), not the intended stop — the agent ends the loop with the loop-exit
 // sentinel (covered below). So this case pins the breaker with an EXPLICIT
 // budget instead of relying on the old default of 3.
 check('attempt cap → stops injecting after max attempts', () => {

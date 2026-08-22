@@ -104,9 +104,9 @@ test('supervisorStore persists mode and resolves legacy autopilot state', async 
   assert.equal((await supervisorStore.load(d, 's1')).goal, undefined);
 });
 
-test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (20), positive ints honoured verbatim (no clamp), unlimited opt-out', () => {
+test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (50), positive ints honoured verbatim (no clamp), unlimited opt-out', () => {
   assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING); // default = RUNAWAY_CEILING
-  assert.equal(RUNAWAY_CEILING, 20);                               // pin the derived default
+  assert.equal(RUNAWAY_CEILING, 50);                               // pin the derived default
   assert.equal(resolveRunawayLimit({ config: 8, env: {} }), 8);
   assert.equal(resolveRunawayLimit({ sessionOverride: 5, config: 8, env: {} }), 5);
   // A number the operator typed is honoured verbatim — NO upper clamp (2a).
@@ -123,7 +123,7 @@ test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (20)
 test('describeRunawayLimit: reports tier + honours/rejects/opts-out + platform cap', () => {
   assert.deepEqual(
     (({ limit, tier, unlimited, cappedByPlatform }) => ({ limit, tier, unlimited, cappedByPlatform }))(describeRunawayLimit({ env: {} })),
-    { limit: 20, tier: 'default', unlimited: false, cappedByPlatform: false });
+    { limit: 50, tier: 'default', unlimited: false, cappedByPlatform: false });
   assert.equal(describeRunawayLimit({ sessionOverride: 5, env: {} }).tier, 'retry');
   assert.equal(describeRunawayLimit({ config: 32, env: {} }).tier, 'config');
   assert.equal(describeRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '40' } }).tier, 'env');

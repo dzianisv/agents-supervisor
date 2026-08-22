@@ -1010,7 +1010,7 @@ async function main() {
   //
   // It must always reach its handler below: it is the only agent-driven stop
   // (the attempt counter is now just a runaway circuit breaker at
-  // RUNAWAY_CEILING=20), and standing down on a repeat of it would strand the
+  // RUNAWAY_CEILING=50), and standing down on a repeat of it would strand the
   // session in autopilot — or in an endless loop — forever. `AUTOPILOT_EXIT`
   // is still PARSED as an alias for `reason: 'completed'` (stale installed
   // skill copies may still emit it), but it is no longer TAUGHT anywhere —

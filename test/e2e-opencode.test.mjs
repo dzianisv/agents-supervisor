@@ -970,7 +970,7 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
       `A small finite value means the unlimited opt-out was silently clamped.`
     )
     // The override persists as the unlimited sentinel — proof it was not
-    // silently rewritten to a finite number (e.g. the default 20).
+    // silently rewritten to a finite number (e.g. the default 50).
     const state = JSON.parse(
       readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
     )

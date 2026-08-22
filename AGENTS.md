@@ -470,7 +470,7 @@ command turn.
 `resolveRunawayLimit` as the thin number accessor over it), applied by both
 runtimes: `/supervisor retry N` (session override) > config `maxAttempts` (in
 `~/.config/opencode/supervisor.yaml`) > env (`SUPERVISOR_MAX_ATTEMPTS` ??
-`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**20**) — the SAME for every
+`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**50**) — the SAME for every
 mode, no `mode` parameter. Each tier is parsed by `parseAttemptsValue`: a positive
 integer is **honoured verbatim (no upper clamp** — a number the operator typed is
 never silently rewritten), `unlimited`/`off`/`none`/`0` means **no cap**
@@ -484,20 +484,29 @@ tier, cappedByPlatform, hardCap}` — so the ceiling gate, status text, once-per
 debug line, and the `runaway_ceiling` loop-exit.log record all read the same
 resolution and cannot drift; the log record and status name the resolved limit AND
 the tier that set it, and surface `cappedByPlatform` (esp. when `unlimited` was
-requested but the platform forced it down). **20 is derived, not folklore:** two
-independent directions agree. INTERNAL — a 30-day forensic sample (192 per-turn
-samples, 19 projects): legit turns cap at ≤3 injections (p50=3, p90=3), everything
-above ~16 is censored doom-loop saturation. EXTERNAL — the frameworks that count
-our exact unit (a re-injection ≈ one full agent TURN) cap at ~10 (OpenAI Agents
-SDK `max_turns=10`, AutoGen v0.2 `GroupChat.max_round=10`) or ship the turn cap
-off and bound cost (Claude Agent SDK `max_turns=None`, SWE-agent `$3`/instance),
-and self-correction research (Self-Refine ≤4 rounds; Huang et al. arXiv 2310.01798)
-says the payoff is front-loaded. So the default is **20 = 2× the ~10-turn
-framework norm** and ~6–7× the measured healthy median of 3 — the top of the
-evidence-supported band (nothing above ~25 has framework support), errs high by
-rule not feel (`.scratch/runaway-limit-analysis.md`). The SAME evidence says a
-fixed iteration cap is the WRONG PRIMARY stop (favor no-progress + cost budgets);
-keeping it as a backstop is a deliberate design choice.
+requested but the platform forced it down). **50 is explained + sourced, not
+folklore — and the UNIT matters.** N counts supervisor INJECTIONS (outer-loop
+re-prompts); each injection restarts a whole agent turn of dozens of tool calls,
+so 50 injections ≈ 50 completed agent turns ≈ hundreds-to-thousands of model
+steps — NOT comparable to a framework's per-run cap (LangChain `max_iterations=15`,
+LangGraph `recursion_limit=25`, OpenAI Agents SDK `max_turns=10`, smolagents
+`max_steps=20`, CrewAI `max_iter=25`, Aider `max_reflections=3`, OpenHands
+`max_iteration_per_run=500`); measured against those, 50 is one of the MOST
+PERMISSIVE limits in the ecosystem, effectively unbounded in dollars. It is a
+BACKSTOP set well above observed reality, not a tuned optimum: a 30-day forensic
+sample (59 authoritative last-turn samples, 19 projects; 133-sample same-task
+corroboration) shows legit turns cap at ≤3 injections (p50=3, p90=3, p99≈3);
+everything above ~16 is censored doom-loop saturation, so 50 ≈ 17× the observed
+p99. The long-horizon coding frameworks that tuned a stop moved OFF a step count
+onto a COST budget (SWE-agent `$3`/instance; mini-SWE-agent `step_limit=0` + `$3`;
+Claude Agent SDK ships no turn cap and recommends a USD budget; Anthropic's own
+SWE-bench scaffold has no turn cap) because SUCCESSES LIVE IN THE TAIL (Anthropic
+">100 turns"; arXiv 2510.16786 median 41–58, tail >175, and recommends setting the
+limit at the p75 of your OWN distribution) — a low static cap trades tail success
+for cost (`.scratch/runaway-limit-analysis.md`). The SAME evidence says the RIGHT
+PRIMARY control is a per-turn cost/token budget (opencode exposes per-message
+`cost` + `tokens`), NOT a step count — a mechanism change deliberately left to the
+owner, not made here; the injection cap stays a crude runaway backstop.
 The old per-mode defaults (16 goal/autopilot, 3 reflection), the `[1,100]` clamp,
 and the pile of overlapping helpers (`resolveTurnMaxAttempts` /
 `resolveReflectionMaxAttempts` / `resolveMaxAttempts` / `DEFAULT_MAX_ATTEMPTS` /

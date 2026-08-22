@@ -99,92 +99,136 @@ rather than inventing a false derivation from the 50/100 doom-loop artifacts.**
 
 ---
 
-## External evidence (owner: "base reasoning on some researches and numbers")
+## External evidence (owner forwarded verified primary sources)
 
-The internal data fixes the HEALTHY number (≤3) but cannot fix the ceiling
-(censored tail). So the ceiling is anchored to published defaults for the **same
-unit we count**. Critical: a supervisor re-injection ≈ **one full agent TURN**
-(each injection spawns a fresh turn that itself runs many inner steps), NOT one
-inner ReAct step. Only frameworks that count *full turns* are comparable.
+### The unit mismatch — the correction that changes the answer
 
-**Framework defaults (verified from source / official docs):**
+An earlier pass compared our N to framework "max_turns" caps and concluded ~20.
+That was WRONG about the unit. Our N counts **supervisor INJECTIONS** — the
+OUTER loop. Each injection **restarts a whole agent turn** that itself runs the
+INNER loop of dozens of tool calls. Framework per-run caps (LangChain
+`max_iterations`, OpenAI `max_turns`, OpenHands `max_iteration_per_run`) bound
+that INNER loop of a SINGLE run. So:
 
-| Framework | Param | Default | Unit vs. ours | Source |
-|---|---|---|---|---|
-| **OpenAI Agents SDK** | `Runner.run(max_turns=)` | **10** (`None` disables) | **full turns — comparable** | github.com/openai/openai-agents-python `run_config.py` (`DEFAULT_MAX_TURNS=10`) |
-| **AutoGen v0.2** | `GroupChat.max_round` | **10** | **full rounds — comparable** | github.com/microsoft/autogen@0.2 `groupchat.py` |
-| **AutoGen v0.2** | `max_consecutive_auto_reply` | None→**100** | consecutive replies (≈turns) | `conversable_agent.py` (`MAX_CONSECUTIVE_AUTO_REPLY=100`) |
-| **AutoGen v0.4** | team `max_turns` | **None** | full turns (off) | `_base_group_chat.py` |
-| **Claude Agent SDK** | `max_turns` | **None** (uses `max_budget_usd`) | full turns (off, budget instead) | github.com/anthropics/claude-agent-sdk-python `types.py` |
-| **SWE-agent** | `per_instance_cost_limit` | **$3.00** (step cap off) | **cost budget**, not steps | github.com/SWE-agent/SWE-agent `models.py` |
-| LangChain | `AgentExecutor.max_iterations` | 15 | inner ReAct steps — NOT comparable | `langchain_classic/agents/agent.py` |
-| LangGraph | `recursion_limit` | 25 | super-steps — NOT comparable | `langchain_core/.../config.py` |
-| smolagents | `max_steps` | 20 | ReAct steps — NOT comparable | huggingface/smolagents `agents.py` |
-| OpenHands | `max_iterations` | 500 (+ `StuckDetector`) | ReAct steps — NOT comparable | All-Hands-AI/OpenHands `config_utils.py` |
-| CrewAI | `max_iter` | 20 | inner reasoning iters — NOT comparable | docs.crewai.com |
+> **50 of our injections ≈ 50 completed agent turns ≈ plausibly
+> hundreds-to-thousands of model steps.** Against the published table, 50 is one
+> of the MOST PERMISSIVE limits in the ecosystem, effectively unbounded in
+> dollars. Comparing "50" to LangChain's 15 or the SDK's 10 is a category error.
 
-**The comparable unit clusters at ~10** (OpenAI 10, AutoGen v0.2 GroupChat 10),
-or is disabled in favor of a cost/token budget (Claude SDK, SWE-agent).
+### Framework defaults — iteration / step caps (inner loop)
 
-**Empirical / stop-condition literature:**
+| Framework | Param | Default | Source |
+|---|---|---|---|
+| LangChain | `AgentExecutor.max_iterations` | **15** | `libs/langchain/langchain/agents/agent.py` |
+| LangGraph / LC Core | `recursion_limit` | **25** (`DEFAULT_RECURSION_LIMIT`) | `langchain_core/runnables/config.py` |
+| OpenAI Agents SDK | `max_turns` | **10** (`DEFAULT_MAX_TURNS`; `None` disables) | `src/agents/run_config.py` |
+| smolagents | `max_steps` | **20** (+ 1 forced-answer call) | `agents.py` |
+| CrewAI | `max_iter` | **25** | crewai docs / `agent.py` |
+| AutoGen v0.2 | `max_consecutive_auto_reply` | **100** | `conversable_agent.py` |
+| AutoGen v0.4+ | `max_tool_iterations` | **1** | `_assistant_agent.py` |
+| OpenHands | `max_iteration_per_run` | **100 → 500** across versions, `stuck_detection=True` default | `config_utils.py` |
+| Aider | `max_reflections` | **3** | aider source |
 
-- **Self-correction is front-loaded.** Self-Refine runs ≤4 refinement rounds for
-  ~20% absolute gain (arXiv 2303.17651); Reflexion's reflective trials plateau
-  (arXiv 2303.11366); Huang et al., **"LLMs Cannot Self-Correct Reasoning Yet"**
-  (arXiv 2310.01798), show intrinsic self-correction (no new external feedback)
-  can *degrade* performance — i.e. re-prompting a stuck agent past a few rounds
-  is often net-negative. That is exactly our failure mode: the no-progress gate
-  only catches BYTE-IDENTICAL replies, so a reworded doom loop runs to the ceiling.
-- **Iteration cap is explicitly a control/safety net, not the functional stop.**
-  Anthropic, *Building Effective Agents*: stopping conditions "such as a maximum
-  number of iterations" exist "to maintain control." OpenHands bolts a
-  **`StuckDetector`** (halts on 3–4 repeated action/observation or error loops)
-  on top of its counter. Industry drift is toward **cost/token budgets**
-  (SWE-agent $3; Claude SDK `max_budget_usd` + token `TaskBudget`) and
-  **no-progress detection**, with the raw iteration count demoted to a backstop.
+### Frameworks that moved to COST/BUDGET caps (the long-horizon coding ones)
+
+| Framework | Real stop | Source |
+|---|---|---|
+| SWE-agent | `per_instance_cost_limit` = **$3.00**; `per_instance_call_limit` = 0 (disabled) | `sweagent/agent/models.py` |
+| mini-SWE-agent | `step_limit` = **0 (NO LIMIT)**; `cost_limit` = **$3.00** is the real stop; `max_consecutive_format_errors` = 3 | mini-swe-agent source |
+| Claude Agent SDK | `max_turns` = no limit, `max_budget_usd` = no limit; docs: "Setting a budget is a good default for production agents" | code.claude.com/docs/en/agent-sdk/agent-loop |
+| OpenHands V1 | `max_budget_per_run` | OpenHands V1 SDK |
+| Anthropic SWE-bench scaffold | **NO turn cap** — "sample until the model decides it is finished, or exceeds 200k context" | anthropic.com/engineering/swe-bench-sonnet |
+
+### Empirical
+
+- **arXiv 2510.16786** (SWE-bench Verified, 100 tasks, 3 models): median
+  turns-to-solve for leading agents = **41–58**, tail **>175**. Token cost grows
+  **~O(n²)** in turns. Setting the limit at the **p75 of your OWN observed
+  distribution** cuts cost 24–68% with minor/no solve-rate loss; a dynamic "start
+  at p25, grant ONE extension to p50 on failure" beats any fixed number by a
+  further 12–24%. Calls static step limits *"a brute-force approach that lacks the
+  adaptability needed for tasks of varying complexity."*
+- **Anthropic SWE-bench post**: successful runs took *"more than 100 turns"*, some
+  *"hundreds of turns"* — **successes live in the TAIL**, so a low cap trades tail
+  success for cost.
+- **arXiv 2602.17037 ("Wink", >10,000 production agent trajectories)**:
+  misbehaviors in ~30% of trajectories; an asynchronous observer injecting
+  targeted course-correction resolves **90%** of single-intervention misbehaviors.
+  Recovery: infinite loops 39%. NON-recovery: *"agent ignored the course-correction
+  instructions"* **37%**, premature termination **22%**. (This validates the
+  supervisor's whole premise — an external observer nudging a stuck agent works —
+  and warns that a too-twitchy nudge that the agent ignores is the top failure mode.)
+- **OpenHands StuckDetector thresholds** (primary source): identical
+  action+observation = **4**, identical erroring action = **3**, agent monologue =
+  **3**, A/B alternating = **6**, scan window 20 events; V1 nudges ONCE per streak
+  at threshold before killing.
 
 ---
 
-## The default chosen: `RUNAWAY_CEILING = 20`
+## The default: `RUNAWAY_CEILING = 50` (kept — now explained + sourced)
 
-Internal and external agree on the HEALTHY number (≤3 injections / ≤4–5
-self-correction rounds). They also agree the ceiling is a coarse backstop, not
-the functional stop. So the ceiling is anchored to the comparable-unit norm:
+The owner's directive, and the honest reading of the evidence: **keep 50 as a
+pure runaway backstop; the number stops being folklore because it is now
+explained and sourced, not because it changed.** Three legs:
 
-> **20 = 2× the ~10-turn cap shipped by the two frameworks that count our exact
-> unit** (OpenAI Agents SDK `max_turns=10`, AutoGen v0.2 `GroupChat.max_round=10`)
-> — one full doubling of headroom above the industry norm — and **~6–7× the
-> measured healthy median of 3**. It sits at the TOP of the evidence-supported
-> safety-valve band (~10–20 for a turn-counted loop; nothing above ~25 has
-> support in any framework default).
+1. **Unit.** 50 injections ≈ 50 full agent runs ≈ hundreds-to-thousands of model
+   steps — already one of the most permissive limits in the ecosystem. There is
+   no case that 50 is "too low"; if anything it is generous.
+2. **Measured backstop, not an optimum.** Authoritative per-turn counter
+   (`attempts.count`): 59 last-turn samples / 19 stores, **p50=3, p90=3, p99≈3**;
+   133-sample same-task corroboration, same p99=3. No legit turn ever exceeded 3;
+   everything above ~16 was a doom loop saturating whatever cap existed. So
+   **50 ≈ 17× the observed p99** — deliberately far above reality. Per 2510.16786
+   our p75 is 3, so *any* static backstop is many× p75 by construction; that is
+   fine for a backstop and meaningless as a tuned optimum.
+3. **Shape matches the field.** The frameworks that actually tuned a stop moved
+   OFF a step count onto a COST budget (SWE-agent, mini-SWE-agent, Claude SDK,
+   OpenHands V1), precisely because **successes live in the tail** (Anthropic
+   ">100 turns"; 2510.16786 median 41–58, tail >175) and a low static cap trades
+   tail success for cost. Keeping the injection cap high and crude, and letting
+   `supervisor_loop_exit` + the no-progress gate + a goal deadline + `/supervisor
+   off` do the real stopping, is the correct division of labor.
 
-This answers the owner's "why 50, why not 64 or 100?" head-on: **none of
-50/64/100 has any evidentiary support** — they are all above every framework's
-turn cap and every self-correction study's productive range. 64 was the exact
-"pick a power of two off the menu" folklore he called out. 20 is the first number
-in this whole exercise tied to a *cited external anchor* (the ~10-turn norm) and
-the *measured* healthy median (3), not to a feeling or a power-of-two rule.
+Why NOT lower it (reversing the earlier 64→20 move): that move rested on a false
+unit comparison (injection ≈ one framework "turn"). Corrected, the comparison
+says the opposite — 50 injections is already far more permissive than any
+framework's per-run cap — so lowering would only bring the crude backstop closer
+to the healthy region (p99=3) for no benefit, and against the "successes live in
+the tail" lesson. 50 stays.
 
-Why not go all the way down to the framework norm of 10? Two reasons to keep one
-doubling of headroom: (1) the repo's hard rule — a low default IS the
-premature-stand-down bug — and (2) our legitimate tail is *censored*, so we
-cannot rule out a real goal turn wanting 8–15 injections. 16 was "premature" only
-as a FUNCTIONAL stop; as a pure BACKSTOP behind `supervisor_loop_exit` + the
-no-progress gate + a goal deadline + `/supervisor off`, 20 is safe. 20 bounds a
-doom loop to ~20 judge calls / ~7 min instead of 64's ~21 min of pure waste.
+**One-line summary for docs:** *N counts supervisor injections — each ≈ a whole
+agent turn of dozens of steps — so 50 ≈ 50 agent turns ≈ hundreds-to-thousands of
+model steps, one of the most permissive caps in the ecosystem; measured legit
+turns cap at ≤3 injections (p99≈3), so 50 is a backstop ~17× above reality, not a
+budget, and it is now fully configurable including `unlimited`.*
 
-**Mechanism judgement (owner's call, NOT silently redesigned):** the evidence
-says a fixed iteration cap is the WRONG *primary* stop — the field favors
-no-progress detection (OpenHands StuckDetector) + cost/token budgets (SWE-agent,
-Claude SDK) as the binding limit. This repo already matches that shape (the
-primary stop is `supervisor_loop_exit` + the no-progress gate + goal deadline;
-the count is only a backstop). If the owner wants to go further, the highest-value
-next step is a stronger no-progress detector (semantic, not byte-identical) and/or
-a per-turn cost/token budget — a mechanism change that is the owner's decision.
+---
 
-**One-line summary for docs:** *Across 192 real per-turn samples the healthy turn
-took ≤3 injections (p50=3, p90=3); the frameworks that count our unit of full
-agent turns cap at ~10 (OpenAI Agents SDK, AutoGen GroupChat) and self-correction
-research says the payoff is front-loaded, so the default is 20 = 2× that norm — a
-runaway backstop, not a budget — and it is now fully configurable, including
-`unlimited`.*
+## Reported to the owner, NOT implemented (mechanism = owner's call)
+
+1. **Per-turn COST/TOKEN budget as the primary control.** Unanimous across
+   SWE-agent, mini-SWE-agent, Claude Agent SDK, OpenHands V1. **opencode DOES
+   expose the data**: every `AssistantMessage` carries `cost: number` and
+   `tokens: {input, output, reasoning, cache:{read,write}}`
+   (`@opencode-ai/sdk` types). The supervisor already fetches the session
+   messages each idle to compute the attempt counter, so the smallest honest
+   implementation is: sum `cost` (or input+output+reasoning tokens) over the
+   assistant messages whose turnKey ≥ the last human message id (identical
+   per-turn scoping to `attempts.count`), and stand down with a
+   `reason:'cost_budget'` loop-exit.log record when the sum crosses a configured
+   budget, resolved through the SAME tier precedence as `maxAttempts`
+   (retry/config/env), default `unlimited` (off) to preserve today's behavior.
+   Caveat: `cost` can be 0 for local/free models, so a **token** budget is more
+   universally reliable than a USD budget — recommend token as the primary knob,
+   USD as an optional convenience.
+2. **No-progress threshold.** `NO_PROGRESS_REPEAT_THRESHOLD = 2` identical replies
+   (`core/evaluation.mjs`) vs OpenHands' 3–4 for the equivalent signals. My read:
+   **2 is slightly twitchy**, and Wink's finding that 37% of NON-recoveries are
+   "agent ignored the course-correction" is the relevant risk — an early, wrong
+   stand-down is cheap, but the more common failure is nudging an agent that then
+   ignores it, which a low threshold does not help. I would align to **3** (one
+   more identical repeat before standing down) to match OpenHands, but it is a
+   behavior change and left to the owner; NOT changed in this branch. Note our
+   gate is also byte-identical-only, so it is already conservative (a reworded
+   loop never trips it) — which argues the threshold number matters less than
+   making the signal semantic.
