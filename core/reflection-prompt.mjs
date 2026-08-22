@@ -19,7 +19,7 @@
 
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { extractGoalCondition, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS } from './goal.mjs'
+import { extractGoalCondition, buildGoalRequirementSection, RUNAWAY_CEILING } from './goal.mjs'
 import { DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt } from './assessment.mjs'
 import { loadParsedRubric, formatRubricMarkdown } from './rubric-loader.mjs'
 import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
@@ -173,7 +173,7 @@ export async function buildReflectionPrompt({
   if (safeContext.pushedToDefaultBranch) requirements.push('Detected direct push to default branch (must be avoided)')
   if (requirements.length === 0) requirements.push('No explicit workflow gates detected')
 
-  const effectiveCap = maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const effectiveCap = maxAttempts ?? RUNAWAY_CEILING
   const currentAttempt = attemptCount || 0
 
   // If no session goal was passed, check Goal.md for a project-level goal

@@ -31,7 +31,7 @@ The inverse problem also exists: agents loop. They re-read the same files, re-pl
 - Does not require internet access (all classification logic runs locally; the judge LLM call is the only external dependency).
 - Does not set `.model` in continuation prompts — this would violate OpenCode's session model contract.
 - Does not replace the agent's core reasoning or generate task-specific guidance; it only decides whether to re-prompt.
-- Does not guarantee task completion — it exhausts a retry budget and stops.
+- Does not guarantee task completion — the agent declares the loop over (`supervisor_loop_exit` / `SUPERVISOR_LOOP_EXIT:`); a runaway safety valve only bounds a loop that never declares an exit.
 
 ---
 

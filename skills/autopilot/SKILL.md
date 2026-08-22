@@ -5,7 +5,7 @@ description: Enable, disable, or inspect supervisor autopilot mode. Use for "/su
 
 # /supervisor:autopilot — enable continuous execution
 
-Enable or disable supervisor autopilot mode, where the supervisor auto-continues after each stop WITHOUT running the judge, until the agent outputs `SUPERVISOR_LOOP_EXIT: completed` alone on its own line or the retry budget runs out.
+Enable or disable supervisor autopilot mode, where the supervisor auto-continues after each stop WITHOUT running the judge, until the agent outputs `SUPERVISOR_LOOP_EXIT: completed` alone on its own line or the runaway safety valve trips (a last-resort breaker, not a budget you spend).
 
 ## Steps
 

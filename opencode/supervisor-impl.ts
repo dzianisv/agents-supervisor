@@ -15,7 +15,7 @@ import { execFile } from "child_process"
 // Shared goal-loop DECISION logic — single source of truth across runtimes.
 // (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
 import {
-  resolveMaxAttempts, resolveTurnMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  resolveRunawayLimit, parseSupervisorCommand, buildGoalRequirementSection,
   appendGoalContextToNudge,
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
@@ -79,7 +79,7 @@ import { appendLoopExitLog } from "../core/loop-exit.mjs"
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
 // supervisor-impl.ts lives in opencode/, so ".." reaches the repo root.
 const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents", "supervisor")
-export { resolveMaxAttempts, resolveTurnMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
+export { resolveRunawayLimit, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition, resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE }
 export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
 export {
   buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody, retireProjectGoal,
@@ -2176,7 +2176,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     currentSessionId = sid
     if (typeof args.n === "number" && Number.isFinite(args.n)) {
       await supervisorStore.setRetry(directory, sid, args.n)
-      const eff = resolveMaxAttempts({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
+      const eff = resolveRunawayLimit({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
       return `Retry budget set to ${eff} for session ${sid.slice(0, 8)}….`
     }
     const st = await supervisorStore.load(directory, sid)
@@ -2581,8 +2581,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // BOTH modes. In reflection the judge grades against it; in autopilot it
         // rides along as CONTEXT on the nudge (never verified — accepted).
         let goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
-        const effectiveMaxAttempts = resolveTurnMaxAttempts({
-          mode,
+        const runawayLimit = resolveRunawayLimit({
           sessionOverride: sup.maxAttempts,
           config: await loadConfiguredMaxAttempts(),
           // OpenCode has no platform ceiling on continuations (unlike Claude
@@ -2647,15 +2646,15 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // session.idle for the SAME turnKey. So each idle either injects and
         // strictly increases the counter, or stands down (which saturates it).
         // The counter is monotonic within a turn and bounded above by
-        // effectiveMaxAttempts, therefore the turn ends after at most
-        // effectiveMaxAttempts injections.
+        // runawayLimit, therefore the turn ends after at most
+        // runawayLimit injections.
         const currentAttemptCount = readTurnAttempts(sessionId, turnKey)
-        if (currentAttemptCount >= effectiveMaxAttempts) {
-          // Autopilot must not stay armed past its budget, or the next human
-          // turn silently resumes an unattended loop.
+        if (currentAttemptCount >= runawayLimit) {
+          // Autopilot must not stay armed past the runaway limit, or the next
+          // human turn silently resumes an unattended loop.
           if (mode === "autopilot") {
             try { await supervisorStore.setAutopilot(directory, sessionId, false) } catch { /* best effort */ }
-            await showToast(client, directory, `Autopilot budget exhausted (${effectiveMaxAttempts} attempts)`, "warning")
+            await showToast(client, directory, `Autopilot runaway limit reached (${runawayLimit} attempts) — stopped`, "warning")
           }
           // An active goal must not die silently at the cap. Mirrors
           // bin/supervisor-on-stop.mjs: goal.attempts is the SAME number as
@@ -2666,7 +2665,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           // would kill a goal the human is still driving.
           if (goal) {
             try {
-              const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMaxAttempts })
+              const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: runawayLimit })
               if (t.action === "exhausted" && t.reason === "deadline") {
                 await supervisorStore.mutate(directory, sessionId, (s) => {
                   s.mode = "reflection"; s.autopilot = false
@@ -2674,13 +2673,13 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
                 })
                 await showToast(client, directory, `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`, "warning")
               } else if (mode !== "autopilot") {
-                await showToast(client, directory, `Goal budget spent for this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
+                await showToast(client, directory, `Goal push limit reached this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
               }
             } catch (e: any) {
               debug("goal transition at attempt cap failed (non-fatal):", e?.message || e)
             }
           }
-          debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", effectiveMaxAttempts, "mode:", mode, "goal:", !!goal)
+          debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", runawayLimit, "mode:", mode, "goal:", !!goal)
           // Hitting the ceiling is strictly WORSE than an agent-declared
           // `stuck` exit (executeSupervisorLoopExit, above): it means the
           // loop never terminated on its own — only the circuit breaker did.
@@ -2692,7 +2691,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           // confused with a declared exit.
           appendLoopExitLog(directory, {
             session: sessionId, turnKey, reason: "runaway_ceiling", detail: "",
-            at: Date.now(), mode, attempts: currentAttemptCount, maxAttempts: effectiveMaxAttempts,
+            at: Date.now(), mode, attempts: currentAttemptCount, maxAttempts: runawayLimit,
           })
           return
         }
@@ -2806,11 +2805,13 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // verdict — only the agent's own supervisor_loop_exit tool call and
         // this budget check may stop the loop.
         if (mode === "autopilot") {
-          // Budget exhaustion is handled by the ONE gate above, which also
-          // disarms autopilot. Reaching here means budget remains, so this
-          // nudge is attempt N of effectiveMaxAttempts — and because the
-          // counter is now persisted, that number is TRUE across idles and
-          // across a server restart. It used to always read "1/N".
+          // Runaway-limit exhaustion is handled by the ONE gate above, which
+          // also disarms autopilot. Reaching here means the limit is not yet
+          // hit. The attempt number is tracked (persisted, so it survives a
+          // server restart) and logged, but is NEVER shown to the agent: a
+          // visible "n/N" denominator tells the agent a budget exists and
+          // invites it to pace or wrap up early, when the only thing that
+          // should stop the loop is the agent declaring it done.
           const autopilotAttempt = currentAttemptCount + 1
           // Write BEFORE prompting: if promptAsync throws we still burned the
           // attempt, which fails toward termination rather than toward a loop.
@@ -2820,11 +2821,11 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           //
           // Deliberately IDENTICAL to the Claude Code nudge
           // (bin/supervisor-on-stop.mjs) apart from the runtime-specific exit
-          // instruction. A tool-activity line used to render here and nowhere
-          // else: it told the agent its own call counts back to itself, needed
-          // an "informational only, not a verdict" disclaimer to stop it
-          // reading as progress evidence, and existed on this runtime only.
-          const baseNudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
+          // instruction. NO attempt counter is rendered (see above) — a
+          // tool-activity line used to render here and nowhere else too: it
+          // told the agent its own call counts back to itself and existed on
+          // this runtime only.
+          const baseNudge = `${FEEDBACK_MARKER} Autopilot
 
 You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
 
@@ -2848,7 +2849,7 @@ Continue now.`
           const baseNudgeWithGoal = appendGoalContextToNudge(baseNudge, nudgeGoalCondition)
           const nudge = isStatusDiagramEnabled(sup) ? appendStatusDirective(baseNudgeWithGoal) : baseNudgeWithGoal
 
-          await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${effectiveMaxAttempts})`, "info")
+          await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${runawayLimit})`, "info")
           try {
             await client.session.promptAsync({
               path: { id: sessionId },
@@ -2858,7 +2859,7 @@ Continue now.`
             debug("promptAsync failed (autopilot nudge):", e?.message || e)
             reportError(e, { plugin: "supervisor-3", op: "prompt-autopilot" })
           }
-          debug("Autopilot nudge", autopilotAttempt, "/", effectiveMaxAttempts, "for", sessionId.slice(0, 8))
+          debug("Autopilot nudge", autopilotAttempt, "/", runawayLimit, "for", sessionId.slice(0, 8))
           return
         }
 
@@ -2902,7 +2903,7 @@ Continue now.`
           agents,
           lastAssistantText,
           attemptCount: currentAttemptCount,
-          maxAttempts: effectiveMaxAttempts,
+          maxAttempts: runawayLimit,
           goalSection: effectiveGoalSection || undefined,
         })
         let supervisorPrompt: string
@@ -2951,11 +2952,11 @@ Continue now.`
             assessmentSession = data
           } catch {
             debug("Failed to create self-assessment session")
-            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+            standDownForTurn(sessionId, turnKey, runawayLimit)
             return
           }
           if (!assessmentSession?.id) {
-            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+            standDownForTurn(sessionId, turnKey, runawayLimit)
             return
           }
           judgeSessionIds.add(assessmentSession.id)
@@ -2990,7 +2991,7 @@ Continue now.`
         }
 
         if (!selfAssessment) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           return
         }
 
@@ -2999,7 +3000,7 @@ Continue now.`
         // Check if user sent a new message or aborted during assessment
         const abortTime = recentlyAbortedSessions.get(sessionId)
         if (abortTime) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           return
         }
 
@@ -3009,12 +3010,12 @@ Continue now.`
           currentMessages = Array.isArray(data) ? data : undefined
         } catch {
           debug("Session deleted during supervisor, aborting:", sessionId.slice(0, 8))
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           return
         }
         const currentUserMsgId = getLastRelevantUserMessageId(currentMessages || [])
         if (currentUserMsgId && currentUserMsgId !== initialUserMsgId) {
-          standDownForTurn(sessionId, initialUserMsgId, effectiveMaxAttempts)
+          standDownForTurn(sessionId, initialUserMsgId, runawayLimit)
           return
         }
 
@@ -3036,7 +3037,7 @@ Continue now.`
         }
 
         if (!analysis) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           await showToast(client, directory, "Supervisor analysis failed", "warning")
           return
         }
@@ -3058,7 +3059,7 @@ Continue now.`
             goal,
             complete: analysis.complete,
             now: Date.now(),
-            maxAttempts: effectiveMaxAttempts,
+            maxAttempts: runawayLimit,
             reason: analysis.reason,
           })
           if (t.action === "exhausted") {
@@ -3078,7 +3079,7 @@ Continue now.`
                 s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
               })
             }
-            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+            standDownForTurn(sessionId, turnKey, runawayLimit)
             await showToast(
               client,
               directory,
@@ -3251,13 +3252,13 @@ Continue now.`
             // continuation attempt — so there is no remaining budget worth
             // preserving, and re-running the judge after it would cost a
             // second full judge round-trip to reach the same verdict.
-            standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+            standDownForTurn(sessionId, turnKey, runawayLimit)
             debug("Supervisor injected status checkpoint correction for", statusCorrectionKey)
             return
           }
 
 
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
           debug("Supervisor complete")
           // The supervisor is standing down and the status correction did NOT
@@ -3267,7 +3268,7 @@ Continue now.`
         }
 
         if (analysis.requiresHumanAction && !analysis.shouldContinue) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
           await showToast(client, directory, `Action needed: ${hint}`, "warning")
           debug("Supervisor requires human action (no agent-actionable work remaining)")
@@ -3292,7 +3293,7 @@ Continue now.`
           feedback: analysis.rawFeedback ?? analysis.reason,
         })
         if (!analysis.shouldContinue || actionlessVerdict) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           const standDownReason = actionlessVerdict
             ? "verdict had no actionable content (empty missing, empty next_actions, blank feedback)"
             : "judge did not ask to continue (shouldContinue=false)"
@@ -3310,18 +3311,18 @@ Continue now.`
           preFeedbackMessages = Array.isArray(data) ? data : undefined
         } catch {
           debug("Session deleted before feedback injection, aborting:", sessionId.slice(0, 8))
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           return
         }
         const preFeedbackUserMsgId = getLastRelevantUserMessageId(preFeedbackMessages || [])
         if (preFeedbackUserMsgId && preFeedbackUserMsgId !== initialUserMsgId) {
-          standDownForTurn(sessionId, initialUserMsgId, effectiveMaxAttempts)
+          standDownForTurn(sessionId, initialUserMsgId, runawayLimit)
           debug("User sent new message during analysis, skipping feedback")
           return
         }
         const preFeedbackAbort = recentlyAbortedSessions.get(sessionId)
         if (preFeedbackAbort) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           debug("Session aborted during analysis, skipping feedback")
           return
         }
@@ -3329,7 +3330,7 @@ Continue now.`
         // Burn one attempt. The budget CHECK lives in the single gate at the
         // top of this handler (pre-increment, mirroring
         // bin/supervisor-on-stop.mjs); this is only the write. There used to
-        // be a second `>= effectiveMaxAttempts` check right here, which made
+        // be a second `>= runawayLimit` check right here, which made
         // the effective budget N-1 and `/supervisor retry 1` a no-op.
         //
         // Ordering invariant (see issue #57): the goal loop above runs BEFORE
@@ -3365,7 +3366,7 @@ Continue now.`
         // rendering. isActionlessVerdict above should already have stood us
         // down; this catches any future verdict shape that slips past it.
         if (!hasFeedbackBody(feedbackText)) {
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           debug("Supervisor standing down, no injection: rendered feedback had an empty body")
           await maybeInjectPlainspeak({ sessionId, turnKey, sup, mode, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
           return
@@ -3391,7 +3392,7 @@ Continue now.`
         } catch (e: any) {
           debug("promptAsync failed (feedback):", e?.message || e)
           reportError(e, { plugin: "supervisor-3", op: "prompt-feedback" })
-          standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
+          standDownForTurn(sessionId, turnKey, runawayLimit)
           return
         }
 

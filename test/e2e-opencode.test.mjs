@@ -918,32 +918,36 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
     )
   })
 
-  test("autopilot nudges repeatedly within one human turn and is capped by the same budget", { timeout: 600_000 }, async () => {
+  test("autopilot nudges repeatedly within one human turn and is capped by the same runaway limit", { timeout: 600_000 }, async () => {
     const { sessionId, injections, startIndex } = await runTurn({ budget: 3, probe: "PROBE-AUTOPILOT", autopilot: true })
 
-    assert.equal(injections, 3, `autopilot must nudge exactly 3 times for budget 3, got ${injections}`)
+    assert.equal(injections, 3, `autopilot must nudge exactly 3 times for a runaway limit of 3, got ${injections}`)
 
-    // The displayed "(n/N)" must be TRUE, not always "1/N". Before the fix the
-    // counter was in-memory and reset by the boolean gate, so every nudge
-    // rendered "Autopilot (1/3)".
-    const msgs = (await (await fetch(`${baseUrl}/session/${sessionId}/message`)).json()).slice(startIndex)
-    const headers = msgs
+    // The agent-facing nudge must NOT show a budget counter. A visible "n/N"
+    // denominator tells the agent a budget exists and invites it to pace or
+    // wrap up early — the loop's only intended stop is supervisor_loop_exit.
+    // Re-adding `(${autopilotAttempt}/${runawayLimit})` to the nudge template
+    // makes this assertion fail (sensitivity proven in the sibling
+    // nudge-no-counter unit test).
+    const injectedNudges = (await (await fetch(`${baseUrl}/session/${sessionId}/message`)).json())
+      .slice(startIndex)
       .filter((m) => m?.info?.role === "user")
       .flatMap((m) => (m.parts || []).map((p) => p?.text || ""))
-      .map((t) => /Autopilot \((\d+)\/(\d+)\)/.exec(t))
-      .filter(Boolean)
-      .map((m) => `${m[1]}/${m[2]}`)
-    assert.deepEqual(
-      headers, ["1/3", "2/3", "3/3"],
-      `autopilot headers must count up truthfully, got ${JSON.stringify(headers)}`
-    )
+      .filter((t) => t.includes(FEEDBACK_MARKER) && t.includes("Autopilot"))
+    assert.equal(injectedNudges.length, 3, `expected 3 autopilot nudges, got ${injectedNudges.length}`)
+    for (const nudge of injectedNudges) {
+      assert.doesNotMatch(
+        nudge, /Autopilot\s*\(\s*\d+\s*\/\s*\d+\s*\)/,
+        `autopilot nudge must not render an "n/N" counter, got: ${JSON.stringify(nudge.slice(0, 60))}`
+      )
+    }
 
-    // Budget exhaustion must disarm autopilot, or the next human turn silently
-    // resumes an unattended loop.
+    // Runaway-limit exhaustion must disarm autopilot, or the next human turn
+    // silently resumes an unattended loop.
     const state = JSON.parse(
       readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
     )
-    assert.notEqual(state.mode, "autopilot", "autopilot must be disarmed once its budget is spent")
+    assert.notEqual(state.mode, "autopilot", "autopilot must be disarmed once its runaway limit is spent")
   })
 })
 

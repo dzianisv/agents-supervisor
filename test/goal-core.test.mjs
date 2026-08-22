@@ -7,10 +7,9 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { statePath } from '../core/session-store.mjs';
 import {
-  goalStore, resolveMaxAttempts, resolveTurnMaxAttempts,
-  resolveReflectionMaxAttempts, DEFAULT_REFLECTION_MAX_ATTEMPTS,
+  goalStore, resolveRunawayLimit,
   resolveClaudeCodeHardCap, decideGoalTransition, RUNAWAY_CEILING,
-  parseSupervisorCommand, buildGoalRequirementSection, DEFAULT_MAX_ATTEMPTS,
+  parseSupervisorCommand, buildGoalRequirementSection,
   DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode, appendGoalContextToNudge,
   extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
 } from '../core/goal.mjs';
@@ -40,9 +39,9 @@ test('goalStore.setRetry persists override; rejects path traversal', () => {
   assert.throws(() => goalStore.save(d, '../evil', {}));
 });
 
-test('resolveMaxAttempts default is 16', () => {
-  assert.equal(resolveMaxAttempts({}), DEFAULT_MAX_ATTEMPTS);
-  assert.equal(DEFAULT_MAX_ATTEMPTS, 16);
+test('resolveRunawayLimit default is the runaway ceiling (50)', () => {
+  assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
+  assert.equal(RUNAWAY_CEILING, 50);
 });
 
 test('decideGoalTransition order matches OpenCode impl', () => {
@@ -247,71 +246,77 @@ test('concurrent real processes: 0 conditions lost across N racing goal-set call
 });
 
 // ---------------------------------------------------------------------------
-// resolveTurnMaxAttempts — THE per-turn budget rule, shared by both runtimes.
+// resolveRunawayLimit — THE runaway safety valve, shared by both runtimes.
 //
 // Why one function: the two runtimes had silently diverged. The Claude Code
 // hook used 3 for plain reflection and 16 only for goal/autopilot; the OpenCode
 // plugin used 16 for EVERYTHING. That was invisible only because OpenCode's
 // boolean "already reflected this turn" gate made its budget unreachable — the
 // moment the counter became the real stop condition, OpenCode would have run
-// 16 unattended pushes per human message.
+// 16 unattended pushes per human message. It is now ONE function, no `mode`
+// input, one high default.
 // ---------------------------------------------------------------------------
 
-// The counter is a RUNAWAY CIRCUIT BREAKER now, not the intended stop — that
-// is `supervisor_loop_exit`. So every mode shares one high default; the old
+// The counter is a RUNAWAY SAFETY VALVE now, not the intended stop — that is
+// `supervisor_loop_exit`. So every mode shares one high default; the old
 // per-mode defaults (3 for reflection, 16 for goal/autopilot) made the counter
-// decide completion, which it cannot observe, and it stood down mid-task.
-test('resolveTurnMaxAttempts: every mode defaults to the runaway ceiling', () => {
+// decide completion, which it cannot observe, and it stood down mid-task. There
+// is deliberately no `mode` input — mode never changes the limit.
+test('resolveRunawayLimit: defaults to the runaway ceiling regardless of mode context', () => {
   assert.equal(RUNAWAY_CEILING, 50);
+  // No mode input at all — one value for every situation.
+  assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
+  // Passing a stray `mode` (an ignored/unknown opt) must not change anything.
   for (const mode of ['reflection', 'goal', 'autopilot', undefined]) {
-    assert.equal(resolveTurnMaxAttempts({ mode, env: {} }), RUNAWAY_CEILING);
+    assert.equal(resolveRunawayLimit({ mode, env: {} }), RUNAWAY_CEILING);
   }
 });
 
-test('resolveTurnMaxAttempts: /supervisor retry N wins for EVERY N, in every mode', () => {
+test('resolveRunawayLimit: /supervisor retry N wins for EVERY N', () => {
   // The user-visible bug this branch fixes: retry 1 and retry 5 used to be
   // indistinguishable on OpenCode.
-  for (const mode of ['reflection', 'goal', 'autopilot']) {
-    for (let n = 1; n <= 20; n++) {
-      assert.equal(
-        resolveTurnMaxAttempts({ mode, sessionOverride: n, env: {} }), n,
-        `retry ${n} in ${mode} mode must resolve to exactly ${n}`,
-      );
-    }
+  for (let n = 1; n <= 20; n++) {
+    assert.equal(
+      resolveRunawayLimit({ sessionOverride: n, env: {} }), n,
+      `retry ${n} must resolve to exactly ${n}`,
+    );
   }
 });
 
-test('resolveTurnMaxAttempts: precedence is retry > config > mode default', () => {
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', config: 8, env: {} }), 8);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', config: 8, sessionOverride: 2, env: {} }), 2);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', config: 4, env: {} }), 4);
+test('resolveRunawayLimit: precedence is retry > config > env > ceiling', () => {
+  assert.equal(resolveRunawayLimit({ config: 8, env: {} }), 8);
+  assert.equal(resolveRunawayLimit({ config: 8, sessionOverride: 2, env: {} }), 2);
+  assert.equal(resolveRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '9' } }), 9);
+  // config outranks env; retry outranks both.
+  assert.equal(resolveRunawayLimit({ config: 4, env: { SUPERVISOR_MAX_ATTEMPTS: '9' } }), 4);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 2, config: 4, env: { SUPERVISOR_MAX_ATTEMPTS: '9' } }), 2);
 });
 
-test('resolveTurnMaxAttempts: clamps out-of-range values instead of disabling the loop', () => {
+test('resolveRunawayLimit: clamps out-of-range values instead of disabling the loop', () => {
   for (const bad of [0, -3, -1]) {
-    assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', sessionOverride: bad, env: {} }), 1);
+    assert.equal(resolveRunawayLimit({ sessionOverride: bad, env: {} }), 1);
   }
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', sessionOverride: 500, env: {} }), 100);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 500, env: {} }), 100);
 });
 
-test('resolveTurnMaxAttempts: hardCap applies last and only where a runtime has one', () => {
+test('resolveRunawayLimit: hardCap applies last and only where a runtime has one', () => {
   const cc = resolveClaudeCodeHardCap({});
   assert.equal(cc, 7);
   // Claude Code clamps; OpenCode (no hardCap) does not.
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', hardCap: cc, env: {} }), 7);
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', env: {} }), RUNAWAY_CEILING);
-  // A hardCap must never raise a smaller budget.
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', sessionOverride: 2, hardCap: cc, env: {} }), 2);
+  assert.equal(resolveRunawayLimit({ hardCap: cc, env: {} }), 7);
+  assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
+  // A hardCap must never raise a smaller value.
+  assert.equal(resolveRunawayLimit({ sessionOverride: 2, hardCap: cc, env: {} }), 2);
   // ...and never drop below 1.
-  assert.equal(resolveTurnMaxAttempts({ mode: 'goal', hardCap: 0, env: {} }), 1);
+  assert.equal(resolveRunawayLimit({ hardCap: 0, env: {} }), 1);
 });
 
-test('resolveReflectionMaxAttempts honours the env knobs BOTH runtimes have always read', () => {
-  assert.equal(resolveReflectionMaxAttempts({}), 3);
-  assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: '6' }), 6);
-  assert.equal(resolveReflectionMaxAttempts({ REFLECTION_CC_MAX_ATTEMPTS: '5' }), 5);
-  assert.equal(resolveReflectionMaxAttempts({ SUPERVISOR_MAX_ATTEMPTS: 'garbage' }), 3);
-  // An explicit env knob still overrides the runaway ceiling — it is an
-  // operator choice, like `/supervisor retry N`.
-  assert.equal(resolveTurnMaxAttempts({ mode: 'reflection', env: { SUPERVISOR_MAX_ATTEMPTS: '6' } }), 6);
+test('resolveRunawayLimit honours the env knobs BOTH runtimes have always read', () => {
+  assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
+  assert.equal(resolveRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '6' } }), 6);
+  assert.equal(resolveRunawayLimit({ env: { REFLECTION_CC_MAX_ATTEMPTS: '5' } }), 5);
+  // Garbage env value falls back to the ceiling, never disables the loop.
+  assert.equal(resolveRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: 'garbage' } }), RUNAWAY_CEILING);
+  // SUPERVISOR_MAX_ATTEMPTS wins over REFLECTION_CC_MAX_ATTEMPTS when both set.
+  assert.equal(resolveRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '6', REFLECTION_CC_MAX_ATTEMPTS: '5' } }), 6);
 });

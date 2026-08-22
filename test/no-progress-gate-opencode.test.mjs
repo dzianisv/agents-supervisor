@@ -194,7 +194,7 @@ describe('opencode no-progress gate — a declared loop exit is never swallowed'
 
   test('source pin: the pre-existing loop-exit gate (over sup.loopExit) sits BEFORE the no-progress gate', () => {
     const loopExitGateIdx = IMPL_SRC.indexOf('if (sup.loopExit) {');
-    const ceilingGateIdx = IMPL_SRC.indexOf('if (currentAttemptCount >= effectiveMaxAttempts) {');
+    const ceilingGateIdx = IMPL_SRC.indexOf('if (currentAttemptCount >= runawayLimit) {');
     const noProgressIdx = IMPL_SRC.indexOf('No-progress gate (deterministic, no LLM)');
     assert.ok(loopExitGateIdx > 0, 'loop-exit gate not found');
     assert.ok(ceilingGateIdx > loopExitGateIdx, 'ceiling gate not found after loop-exit gate');

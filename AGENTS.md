@@ -413,8 +413,9 @@ turn, so a stale one from a previous turn never suppresses a new human turn.
 
 The opencode runtime could inject **at most once per human turn**. Claude Code
 could not — the two had silently diverged, and there was no opencode-path test
-covering a second injection on one turn (`test/e2e-cc.mjs`'s "goal raises retry
-budget past the default 3" spawns `bin/supervisor-on-stop.mjs`, CC only, and
+covering a second injection on one turn (`test/e2e-cc.mjs`'s "default runaway
+limit allows a goal loop to inject well past 3" spawns
+`bin/supervisor-on-stop.mjs`, CC only, and
 that passing test is what gave the false confidence).
 
 **The mechanism.** `getLastRelevantUserMessageId` skips supervisor-injected
@@ -422,8 +423,9 @@ messages, so the turn key stays pinned to the last HUMAN message — that is wha
 makes a per-turn counter possible, and it stays. What changed is the STOP
 condition. `if (lastUserMsgId === lastReflectedId) return` (a boolean set at 22
 sites, deleted at none, including immediately after a *successful* injection)
-is gone. The remaining counter check is `attempts >= effectiveMaxAttempts`,
-checked **pre-increment** exactly as `bin/supervisor-on-stop.mjs:875` does —
+is gone. The remaining counter check is `attempts >= runawayLimit`,
+checked **pre-increment** on both runtimes (opencode
+`currentAttemptCount >= runawayLimit`, Claude Code `attempts >= runawayLimit`) —
 the old opencode check was post-increment, so the real budget was N−1 and
 `/supervisor retry 1` yielded ZERO injections. It is no longer the INTENDED
 stop (see `supervisor_loop_exit` above); it is the runaway circuit breaker that
@@ -434,7 +436,7 @@ bounds the loop when the agent never declares an exit.
 injection N+1 that must never arrive. The counter is monotonic within a turn,
 every injection path writes count+1 *before* prompting (a failed `promptAsync`
 still costs an attempt — fail toward termination), and the turn ends after at
-most `effectiveMaxAttempts` injections. That bound still holds with the breaker
+most `runawayLimit` injections. That bound still holds with the breaker
 set to `RUNAWAY_CEILING`; `supervisor_loop_exit` terminates far earlier in
 practice. The suite is also proven SENSITIVE: re-adding the one deleted
 stand-down line after a successful injection turns "3 injections" into 1.
@@ -464,14 +466,21 @@ goal/autopilot escape hatches — the only rule that does. Autopilot bypasses th
 turn gate by design, so with a real budget it burned the whole thing on its own
 command turn.
 
-**Budgets are now ONE rule** (`resolveTurnMaxAttempts`, core/goal.mjs), applied
-by both runtimes: `/supervisor retry N` > config > env
-(`SUPERVISOR_MAX_ATTEMPTS` / `REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING`
-(50) for every mode, then clamped to the runtime's platform ceiling (Claude
-Code has one, opencode does not). The old per-mode defaults (16 goal/autopilot,
-3 reflection) are gone — a low default IS the premature-stand-down bug. An
-explicit override at any of the first three tiers is a deliberate operator
-choice and still wins.
+**The runaway limit is ONE rule** (`resolveRunawayLimit`, core/goal.mjs), applied
+by both runtimes: `/supervisor retry N` (session override) > config `maxAttempts`
+> env (`SUPERVISOR_MAX_ATTEMPTS` ?? `REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING`
+(50) — the SAME for every mode, no `mode` parameter — each clamped to [1,100], then
+clamped DOWN to the runtime's platform hard cap (Claude Code passes
+`resolveClaudeCodeHardCap()` = 7; opencode passes none). The old per-mode defaults
+(16 goal/autopilot, 3 reflection) and the pile of overlapping helpers
+(`resolveTurnMaxAttempts` / `resolveReflectionMaxAttempts` / `resolveMaxAttempts` /
+`DEFAULT_MAX_ATTEMPTS` / `DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default
+IS the premature-stand-down bug, and per-mode branches were the drift surface. An
+explicit override at any of the first three tiers is a deliberate operator choice
+and still wins. The value is now a **runaway safety valve**, not a budget: it never
+signals completion, and it never leaks into the agent-facing nudge (see the
+`describe("subagent gate")`-style guard `test/nudge-no-counter.test.mjs`, which
+fails if a `(n/N)` counter reappears in either nudge template).
 
 ### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
 

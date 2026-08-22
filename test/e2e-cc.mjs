@@ -253,7 +253,7 @@ check('goal active + premature stop → goal-continue inject (mentions goal)', (
   assert.equal(verdict?.goal, 'continue');
 });
 
-check('goal raises retry budget past the default 3 (injects a 4th time)', () => {
+check('default runaway limit allows a goal loop to inject well past 3 (a 4th time)', () => {
   const { dir, tp } = mkSession(driftTurns);
   const sid = 'e2e-goal-budget';
   goalStore.setGoal(dir, sid, 'keep going');
@@ -261,7 +261,7 @@ check('goal raises retry budget past the default 3 (injects a 4th time)', () => 
   for (let i = 0; i < 4; i++) {
     // The agent must MOVE between pushes. One human message → one turn key, so
     // varying only the assistant text keeps this inside a single turn (what the
-    // budget is scoped to) while modelling an agent that answers each
+    // runaway limit is scoped to) while modelling an agent that answers each
     // injection. Replaying one frozen reply is the stuck-agent scenario the
     // no-progress gate exists to stop — covered by its own case above.
     const text = `I added the route to server.js. Next step ${i + 1}: run the tests to verify it.`;
@@ -276,7 +276,10 @@ check('goal raises retry budget past the default 3 (injects a 4th time)', () => 
     const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
     if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
   }
-  assert.equal(blocks, 4, `goal budget should allow >3 injects, got ${blocks}`);
+  // No per-mode default any more: every mode shares RUNAWAY_CEILING (clamped to
+  // CC's HARD_CAP=7), so 4 injections are well within it — the old "goal raises
+  // the budget to 16" special-case is gone but the loop still runs freely.
+  assert.equal(blocks, 4, `default runaway limit should allow >3 injects, got ${blocks}`);
 });
 
 // ── Loop exit sentinel (the CC mirror of the supervisor_loop_exit tool) ────
