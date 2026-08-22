@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as evaluation from '../core/evaluation.mjs';
 
-const { evaluateSelfAssessment, summarizeToolActivity, describeToolActivity, isTestRunnerCommand, hasLocalTestCommand } = evaluation;
+const { evaluateSelfAssessment, isTestRunnerCommand, hasLocalTestCommand } = evaluation;
 
 // ---------------------------------------------------------------------------
 // evaluateSelfAssessment — decision-table coverage.
@@ -234,6 +234,13 @@ test('legacy loop-detector symbols are absent from exports and source files', ()
     symbol('PLANNING', '_LOOP', '_WRITE_RATIO_THRESHOLD'),
     symbol('ACTION', '_LOOP', '_MIN_COMMANDS'),
     symbol('ACTION', '_LOOP', '_REPETITION_THRESHOLD'),
+    // Tool-activity telemetry. Its only surviving consumer was a line in the
+    // autopilot nudge that reported the agent's own tool-call counts back to
+    // it — noise that needed an "informational only, not a verdict"
+    // disclaimer to stay safe, and that existed on the opencode runtime only.
+    symbol('summarize', 'Tool', 'Activity'),
+    symbol('describe', 'Tool', 'Activity'),
+    symbol('tool', 'Activity', 'Note'),
   ];
 
   for (const symbol of removedSymbols) {
@@ -247,29 +254,6 @@ test('legacy loop-detector symbols are absent from exports and source files', ()
     assert.equal(evaluationSource.includes(symbol), false, `core/evaluation.mjs still references ${symbol}`);
     assert.equal(supervisorSource.includes(symbol), false, `opencode/supervisor-impl.ts still references ${symbol}`);
   }
-});
-
-test('summarizeToolActivity is pure count telemetry; describeToolActivity stays informational', () => {
-  const messages = [
-    {
-      info: { role: 'assistant' },
-      parts: Array.from({ length: 9 }, () => ({
-        type: 'tool',
-        tool: 'bash',
-        state: { input: { command: 'git status' } },
-      })),
-    },
-  ];
-
-  const stats = summarizeToolActivity(messages);
-  assert.deepEqual(stats, { readCount: 9, writeCount: 0, totalTools: 9 });
-  assert.equal('detected' in stats, false);
-  assert.deepEqual(Object.keys(stats).sort(), ['readCount', 'totalTools', 'writeCount']);
-
-  const note = describeToolActivity(stats);
-  assert.match(note, /informational only, not a verdict/i);
-  assert.doesNotMatch(note, /\bSTOP\b/i);
-  assert.doesNotMatch(note, /Planning Loop|Action Loop|detected/i);
 });
 
 // ---------------------------------------------------------------------------

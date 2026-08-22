@@ -1,10 +1,10 @@
 /**
  * no-loop-override.test.mjs — align-supervisor-modes binding architecture:
  * there is no deterministic planning/action-loop watchdog in the codebase.
- * Bounded tool-activity telemetry (core/evaluation.mjs's
- * summarizeToolActivity/describeToolActivity) must never author or substitute a
- * completion/progress verdict in either the autopilot fast-path or the
- * reflection judge path.
+ * Nothing may author or substitute a completion/progress verdict in either the
+ * autopilot fast-path or the reflection judge path. (The bounded tool-activity
+ * telemetry this test was originally written against has since been deleted
+ * outright — see summarizeToolActivity/describeToolActivity in git history.)
  *
  *   - autopilot: a STATIC nudge loop only — it never decides there is a
  *     "loop", never emits a scripted STOP verdict; only the agent's own

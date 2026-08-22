@@ -46,8 +46,8 @@ import { getLastSessionCwd, resolveSessionDirectory } from "../core/session-cont
 import {
   SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
   detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
-  pushedToDefaultBranch, hasCodeChangeEvidence, summarizeToolActivity,
-  describeToolActivity, evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
+  pushedToDefaultBranch, hasCodeChangeEvidence,
+  evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
   splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
   evaluateNoProgress,
 } from "../core/evaluation.mjs"
@@ -576,14 +576,6 @@ interface TaskContext extends WorkflowRequirements {
   detectedSignals: string[]
   recentCommands: string[]
   pushedToDefaultBranch: boolean
-  /**
-   * Neutral, factual, non-binding description of recent tool-call activity
-   * (see core/evaluation.mjs's describeToolActivity). NEVER a verdict —
-   * bounded to a recent message window, threaded into prompts purely as
-   * evidence the judge (or the autopilot nudge) MAY cite, never as
-   * something that decides or overrides completion/progress on its own.
-   */
-  toolActivityNote?: string
 }
 
 interface SelfAssessment {
@@ -1230,15 +1222,7 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
 
   const toolsSummary = commands.slice(-6).join("\n") || "(none)"
 
-  // Bounded (recent-only, not full-session) telemetry — purely descriptive,
-  // never a judgment. This is the ONLY thing autopilot's static nudge or the
-  // reflection judge prompt may cite as context about recent tool behavior;
-  // neither surface may use it to decide completion/progress or to author a
-  // scripted verdict. Bounded to a recent window of messages (not the full
-  // historical session) so the note stays factual and current.
-  const toolActivityNote = describeToolActivity(summarizeToolActivity(messages.slice(-20)))
-
-  return {
+    return {
     taskSummary,
     currentTask,
     conversationChain: conversationChain || undefined,
@@ -1254,8 +1238,7 @@ async function buildTaskContext(messages: any[], directory: string): Promise<Tas
     requiresPR,
     requiresCI,
     requiresLocalTests,
-    requiresLocalTestsEvidence,
-    toolActivityNote: toolActivityNote || undefined
+    requiresLocalTestsEvidence
   }
 }
 
@@ -2821,10 +2804,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // Binding contract: autopilot is a STATIC nudge loop only. It never
         // decides progress/completion and never emits a deterministic STOP
         // verdict — only the agent's own supervisor_loop_exit tool call and
-        // this budget check may stop the loop. Neutral, bounded tool-activity
-        // telemetry (context.toolActivityNote) may enrich the nudge as factual
-        // context, but it is never branched on to change what the nudge says
-        // or to author a judgment.
+        // this budget check may stop the loop.
         if (mode === "autopilot") {
           // Budget exhaustion is handled by the ONE gate above, which also
           // disarms autopilot. Reaching here means budget remains, so this
@@ -2837,11 +2817,17 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           writeTurnAttempts(sessionId, autopilotAttempt, turnKey)
 
           // Normal autopilot nudge — no judge, no loop verdict, just continue.
-          const activityLine = context.toolActivityNote ? `\n${context.toolActivityNote}\n` : ""
+          //
+          // Deliberately IDENTICAL to the Claude Code nudge
+          // (bin/supervisor-on-stop.mjs) apart from the runtime-specific exit
+          // instruction. A tool-activity line used to render here and nowhere
+          // else: it told the agent its own call counts back to itself, needed
+          // an "informational only, not a verdict" disclaimer to stop it
+          // reading as progress evidence, and existed on this runtime only.
           const baseNudge = `${FEEDBACK_MARKER} Autopilot (${autopilotAttempt}/${effectiveMaxAttempts})
 
 You are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.
-${activityLine}
+
 When you have genuinely completed ALL work (not just one step), call the supervisor_loop_exit tool (reason: completed) to hand control back. If this nudge is looping without progress, call it with reason: stuck.
 
 Continue now.`
@@ -3358,10 +3344,6 @@ Continue now.`
         // buildEscalatingFeedback is driven purely by the judge's own verdict
         // fields (analysis.severity/reason/missing/nextActions). There is no
         // deterministic loop-detection mechanism in this repository anymore.
-        // Tool-call telemetry (context.toolActivityNote) is already threaded
-        // upstream as non-binding evidence INTO the judge's own prompt (see
-        // buildReflectionPrompt/buildSelfAssessmentPrompt) — it never bypasses
-        // the judge to construct feedback directly.
         const feedbackText = buildEscalatingFeedback(
           analysis.severity || "MEDIUM",
           {

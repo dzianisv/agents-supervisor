@@ -111,11 +111,9 @@ export function hasFeedbackBody(text) {
  * feedback/confidence). It must never substitute a deterministic,
  * judge-independent "STOP" script (e.g. a planning-loop or action-loop
  * watchdog) for that verdict — doing so previously let a heuristic tool-call
- * ratio override genuine judge output. Deterministic tool-call telemetry may
- * still inform the judge as non-binding evidence upstream (see
- * core/evaluation.mjs's describeToolActivity, threaded into the judge prompt
- * via TaskContext.toolActivityNote) — it just never bypasses this function's
- * output.
+ * ratio override genuine judge output. The tool-call telemetry that once fed
+ * that heuristic is gone entirely (it survived only as an autopilot-nudge
+ * line that told the agent its own call counts back to itself).
  *
  * NO ATTEMPT-COUNT ESCALATION. This function used to take `attemptCount` and
  * `maxAttempts`; both were dead (`attemptCount` was never read, and the

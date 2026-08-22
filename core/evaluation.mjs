@@ -163,8 +163,7 @@ export const AGENT_ACTION_PATTERNS = [
  *   toolsSummary: string,
  *   detectedSignals: string[],
  *   recentCommands: string[],
- *   pushedToDefaultBranch: boolean,
- *   toolActivityNote?: string
+ *   pushedToDefaultBranch: boolean
  * }} TaskContext
  * @typedef {{
  *   task_summary?: string,
@@ -207,70 +206,6 @@ export const AGENT_ACTION_PATTERNS = [
  *   severity: 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH' | 'BLOCKER'
  * }} SupervisorAnalysis
  */
-
-/**
- * @param {any[]} messages
- * @returns {{ readCount: number, writeCount: number, totalTools: number }}
- */
-export function summarizeToolActivity(messages) {
-  if (!Array.isArray(messages)) {
-    return { readCount: 0, writeCount: 0, totalTools: 0 }
-  }
-  let readCount = 0
-  let writeCount = 0
-  let totalTools = 0
-
-  for (const msg of messages) {
-    if (msg.info?.role !== 'assistant') continue
-    for (const part of msg.parts || []) {
-      if (part.type !== 'tool') continue
-      totalTools++
-
-      const toolName = (part.tool || '').toString().toLowerCase()
-      const input = part.state?.input || {}
-
-      if (['edit', 'write', 'apply_patch', 'github_create_or_update_file', 'github_push_files', 'github_delete_file', 'github_create_pull_request', 'github_update_pull_request'].includes(toolName)) {
-        writeCount++
-        continue
-      }
-
-      if (toolName === 'bash') {
-        const cmd = (input.command || input.cmd || '').toString()
-        if (/^\s*(npm|yarn|pnpm)\s+(run\s+)?(build|test|lint|fmt|format)\b/i.test(cmd) || /^\s*git\s+(add|commit|push|checkout|switch|merge|rebase)\b/i.test(cmd) || /^\s*(mkdir|rm|mv|cp)\b/i.test(cmd)) {
-          writeCount++
-        } else if (/^\s*git\s+(status|log|diff|show|branch|remote|tag)\b/i.test(cmd) || /^\s*(ls|cat|head|tail|find|grep|rg|wc|file)\b/i.test(cmd)) {
-          readCount++
-        }
-        continue
-      }
-
-      if (['read', 'glob', 'grep', 'todowrite', 'task', 'webfetch', 'knowledge-graph_search', 'knowledge-graph_read', 'knowledge-graph_open'].some((name) => toolName.startsWith(name)) || toolName.startsWith('context7_')) {
-        readCount++
-      }
-    }
-  }
-
-  return { readCount, writeCount, totalTools }
-}
-
-/**
- * Neutral, factual description of recent tool-call activity — NEVER a
- * judgment or a verdict. This exists solely so autopilot's static nudge (and
- * the judge prompt, as non-binding evidence) can be enriched with bounded,
- * factual context such as "recent activity has been read-heavy." Deciding
- * what (if anything) that activity means is left entirely to the judge LLM in
- * reflection mode, or to the agent itself in autopilot mode — this function
- * only describes counts.
- * @param {{ readCount?: number, writeCount?: number, totalTools?: number }} stats
- * @returns {string} '' when there is nothing to report
- */
-export function describeToolActivity(stats) {
-  const readCount = stats?.readCount ?? 0
-  const writeCount = stats?.writeCount ?? 0
-  const totalTools = stats?.totalTools ?? 0
-  if (totalTools === 0) return ''
-  return `Recent tool activity (informational only, not a verdict): ${totalTools} tool call${totalTools === 1 ? '' : 's'} — ${writeCount} write-type, ${readCount} read-only.`
-}
 
 export function inferTaskType(text) {
   const hasResearch = /research|investigate|analyze|compare|evaluate|study/i.test(text)

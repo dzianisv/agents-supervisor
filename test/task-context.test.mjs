@@ -374,7 +374,6 @@ describe('the judge prompts carry the chain and nothing else', () => {
     taskType: 'coding',
     agentMode: 'build',
     toolsSummary: 'bash: npm test\nbash: kubectl apply',
-    toolActivityNote: 'Recent tool activity: 4 calls',
     detectedSignals: [],
   };
 
@@ -396,7 +395,7 @@ describe('the judge prompts carry the chain and nothing else', () => {
   test('tool commands / tool activity are NOT in either judge prompt', () => {
     for (const p of [buildSelfAssessmentPrompt(ctx, '', 'Deployed.', 0, undefined, 3), buildJudgePrompt(ctx, '{}', null)]) {
       assert.ok(!p.includes('kubectl apply'), 'toolsSummary leaked into a judge prompt');
-      assert.ok(!p.includes('Recent tool activity'), 'toolActivityNote leaked into a judge prompt');
+      assert.ok(!p.includes('Recent tool activity'), 'tool-activity telemetry must never reach a judge prompt');
       assert.ok(!p.includes('Tool Commands Run'));
       assert.ok(!p.includes('Tool Signals'));
     }
