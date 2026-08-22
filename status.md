@@ -10,7 +10,7 @@ Claude Code platform cap.
 ```
 ROADMAP  ████████████████████  done
  [x] 1. forensic analysis of 30d real sessions -> .scratch/runaway-limit-analysis.md
- [x] 2. RUNAWAY_CEILING 50 -> 64, derived-by-rule doc comment (core/goal.mjs)
+ [x] 2. RUNAWAY_CEILING 50 -> 20, evidence-derived doc comment (core/goal.mjs)
  [x] 3. describeRunawayLimit descriptor: {limit,requested,unlimited,tier,cappedByPlatform,hardCap}
  [x] 4. unlimited/off/none/0 opt-out; positive ints honoured verbatim (no [1,100] clamp)
  [x] 5. config maxAttempts: in supervisor.yaml (shared sync reader, both runtimes)
@@ -19,11 +19,14 @@ ROADMAP  ████████████████████  done
  [x] 8. docs (README/AGENTS/tdd/concepts/skills/commands) + tests + sensitivity
 ```
 
-MEASUREMENT: 59 last-turn samples, 19 projects. Bimodal — legit turns cap at ≤3
-injections (p50=3, p90=3); everything above is censored doom-loop saturation
-(the only samples ≥16 hit the old 50/100 caps). The genuine tail is
-unobservable, so 64 is chosen by rule (smallest power of two ≥ shipped 50 AND
-4× the retired goal cap 16), not by feel.
+MEASUREMENT + EXTERNAL: 192 per-turn samples, 19 projects. Legit turns cap at ≤3
+injections (p50=3, p90=3); everything above ~16 is censored doom-loop saturation
+(the only samples ≥16 hit the old 50/100 caps), so the genuine tail is
+unobservable. External: frameworks that count our unit (re-injection ≈ one full
+agent turn) cap at ~10 (OpenAI Agents SDK max_turns=10, AutoGen GroupChat
+max_round=10) or ship it off + use a cost budget; self-correction is front-loaded
+(Self-Refine ≤4, Huang et al. arXiv 2310.01798). So 20 = 2× the ~10-turn norm and
+~6–7× the healthy median of 3 — evidence-derived, not feel.
 
 ---
 

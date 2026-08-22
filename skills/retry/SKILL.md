@@ -26,6 +26,6 @@ node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" retry "${ARGUMENTS}"
 - An invalid value (negative, fractional, non-numeric) is rejected with a clear
   message and leaves the current limit unchanged.
 
-Default is 64 (`RUNAWAY_CEILING`), the same in every mode; on Claude Code the
+Default is 20 (`RUNAWAY_CEILING`), the same in every mode; on Claude Code the
 resolved limit is reduced to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), and
 `unlimited` cannot be honoured there — the CLI says so. Relay the CLI output.

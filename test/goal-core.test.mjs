@@ -39,9 +39,9 @@ test('goalStore.setRetry persists override; rejects path traversal', () => {
   assert.throws(() => goalStore.save(d, '../evil', {}));
 });
 
-test('resolveRunawayLimit default is the runaway ceiling (64)', () => {
+test('resolveRunawayLimit default is the runaway ceiling (20)', () => {
   assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
-  assert.equal(RUNAWAY_CEILING, 64);
+  assert.equal(RUNAWAY_CEILING, 20);
 });
 
 test('decideGoalTransition order matches OpenCode impl', () => {
@@ -263,7 +263,7 @@ test('concurrent real processes: 0 conditions lost across N racing goal-set call
 // decide completion, which it cannot observe, and it stood down mid-task. There
 // is deliberately no `mode` input — mode never changes the limit.
 test('resolveRunawayLimit: defaults to the runaway ceiling regardless of mode context', () => {
-  assert.equal(RUNAWAY_CEILING, 64);
+  assert.equal(RUNAWAY_CEILING, 20);
   // No mode input at all — one value for every situation.
   assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING);
   // Passing a stray `mode` (an ignored/unknown opt) must not change anything.

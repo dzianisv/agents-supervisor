@@ -470,7 +470,7 @@ command turn.
 `resolveRunawayLimit` as the thin number accessor over it), applied by both
 runtimes: `/supervisor retry N` (session override) > config `maxAttempts` (in
 `~/.config/opencode/supervisor.yaml`) > env (`SUPERVISOR_MAX_ATTEMPTS` ??
-`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**64**) — the SAME for every
+`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**20**) — the SAME for every
 mode, no `mode` parameter. Each tier is parsed by `parseAttemptsValue`: a positive
 integer is **honoured verbatim (no upper clamp** — a number the operator typed is
 never silently rewritten), `unlimited`/`off`/`none`/`0` means **no cap**
@@ -484,11 +484,20 @@ tier, cappedByPlatform, hardCap}` — so the ceiling gate, status text, once-per
 debug line, and the `runaway_ceiling` loop-exit.log record all read the same
 resolution and cannot drift; the log record and status name the resolved limit AND
 the tier that set it, and surface `cappedByPlatform` (esp. when `unlimited` was
-requested but the platform forced it down). **64 is derived, not folklore:** a
-30-day forensic sample (59 last-turn samples, 19 projects) is bimodal — legit
-turns cap at ≤3 injections (p50=3, p90=3), everything above is censored doom-loop
-saturation — so the default errs high by rule: the smallest power of two ≥ the
-previously shipped 50 and 4× the retired goal cap of 16 (`.scratch/runaway-limit-analysis.md`).
+requested but the platform forced it down). **20 is derived, not folklore:** two
+independent directions agree. INTERNAL — a 30-day forensic sample (192 per-turn
+samples, 19 projects): legit turns cap at ≤3 injections (p50=3, p90=3), everything
+above ~16 is censored doom-loop saturation. EXTERNAL — the frameworks that count
+our exact unit (a re-injection ≈ one full agent TURN) cap at ~10 (OpenAI Agents
+SDK `max_turns=10`, AutoGen v0.2 `GroupChat.max_round=10`) or ship the turn cap
+off and bound cost (Claude Agent SDK `max_turns=None`, SWE-agent `$3`/instance),
+and self-correction research (Self-Refine ≤4 rounds; Huang et al. arXiv 2310.01798)
+says the payoff is front-loaded. So the default is **20 = 2× the ~10-turn
+framework norm** and ~6–7× the measured healthy median of 3 — the top of the
+evidence-supported band (nothing above ~25 has framework support), errs high by
+rule not feel (`.scratch/runaway-limit-analysis.md`). The SAME evidence says a
+fixed iteration cap is the WRONG PRIMARY stop (favor no-progress + cost budgets);
+keeping it as a backstop is a deliberate design choice.
 The old per-mode defaults (16 goal/autopilot, 3 reflection), the `[1,100]` clamp,
 and the pile of overlapping helpers (`resolveTurnMaxAttempts` /
 `resolveReflectionMaxAttempts` / `resolveMaxAttempts` / `DEFAULT_MAX_ATTEMPTS` /

@@ -104,29 +104,47 @@ export function resolveSupervisorMode(state = {}) {
  * mid-task, so it is deliberately high. Hitting it is LOUD: both runtimes
  * append a reason:'runaway_ceiling' record to .supervisor/loop-exit.log.
  *
- * DERIVED, not felt (was `50`, picked by feel; see .scratch/runaway-limit-analysis.md).
- * Across 192 real per-turn attempt samples from 19 local `.supervisor` stores
- * (~30 days) the AUTHORITATIVE per-turn counter (`attempts.count`) had p50=3,
- * p90=3, p99≈3 for the common case, and NO legitimate turn was ever observed
- * above 3. Every sample above ~16 was a doom loop that saturated whatever
- * ceiling was in force (old reflection cap 3, old goal cap 16, the folkloric
- * 50 — hit 3× — or a configured 100 — hit once, one of them a live goal turn).
- * So the distribution above 3 is CENSORED by the prior caps, not real work, and
- * a runaway's "natural" length is effectively unbounded. Two consequences:
- *   (1) the legit tail is unobservable, so we err HIGH (a low default is the
- *       premature-stand-down bug this repo already shipped), and
- *   (2) a runaway saturates whatever we pick, so the exact value is arbitrary
- *       within [16,128] — we make that arbitrariness principled with a power of
- *       two and a stated rule.
- * 64 = smallest power of two that is (a) >= the previously-shipped 50 (upgrading
- * never silently narrows an operator's safety margin) and (b) 4x the retired
- * goal cap of 16 (generous headroom above the most generous legitimate regime
- * ever shipped). It bounds only the COST of a loop that never declares an exit
- * (~64 judge calls / ~21 min at ~20s/injection) — the real stop is
- * supervisor_loop_exit, the no-progress gate, a goal deadline, and
- * `/supervisor off`. Fully configurable now, `unlimited` included.
+ * DERIVED from evidence, not felt (was `50`, then briefly `64` — both picked by
+ * feel; see .scratch/runaway-limit-analysis.md for the full workup + source
+ * URLs). Two independent directions, and they agree:
+ *
+ *   INTERNAL — 192 real per-turn samples from 19 local `.supervisor` stores
+ *   (~30 days). The AUTHORITATIVE per-turn counter (`attempts.count`) had
+ *   p50=3, p90=3, p99≈3; NO legitimate turn was ever observed above 3. Every
+ *   sample above ~16 was a doom loop that saturated whatever cap was in force
+ *   (old reflection 3, old goal 16, the folkloric 50 — hit 3× — or a configured
+ *   100 — once). So the region above 3 is CENSORED by the prior caps, not real
+ *   work: the healthy number is ≤3 and the true legitimate tail is unobservable.
+ *
+ *   EXTERNAL — published defaults for the SAME unit we count (a supervisor
+ *   re-injection ≈ one full agent TURN, not one inner ReAct step). Frameworks
+ *   that count full turns cap at ~10: OpenAI Agents SDK max_turns=10, AutoGen
+ *   v0.2 GroupChat.max_round=10; the heavyweight coding agents ship the turn cap
+ *   OFF and bound cost instead (Claude Agent SDK max_turns=None; SWE-agent
+ *   $3/instance). Self-correction research says the payoff is front-loaded:
+ *   Self-Refine caps at ≤4 rounds, Reflexion plateaus, and Huang et al. (arXiv
+ *   2310.01798) show intrinsic self-correction can DEGRADE without new external
+ *   feedback — re-prompting a stuck agent past a few rounds is often
+ *   net-negative. Practitioner trend is toward no-progress detection (OpenHands
+ *   StuckDetector halts on 3–4 repeats) + cost budgets, with the raw iteration
+ *   cap demoted to a coarse last-resort — which is exactly this valve's role.
+ *
+ * 20 = 2× the ~10-turn cap shipped by the two frameworks that count our exact
+ * unit (one full doubling of headroom above the industry norm), and ~6–7× the
+ * healthy median of 3 measured locally. It sits at the TOP of the evidence-
+ * supported safety-valve band (~10–20 for a turn-counted loop; nothing above
+ * ~25 has support in any framework default) — high enough to honor this repo's
+ * hard rule that a low default IS the premature-stand-down bug (16 was premature
+ * only as a FUNCTIONAL stop; as a pure BACKSTOP behind supervisor_loop_exit +
+ * the no-progress gate + a goal deadline + `/supervisor off`, 20 is safe), low
+ * enough that a doom loop burns ~20 judge calls / ~7 min instead of 64's
+ * ~21 min of pure waste. It bounds only COST, never signals completion, and is
+ * fully configurable — `unlimited` included, for an operator who wants no
+ * backstop at all. NOTE: the evidence says a fixed iteration cap is the WRONG
+ * PRIMARY stop (favor no-progress + cost budget); keeping it as a backstop here
+ * is a deliberate design choice, not a claim that the count is the right stop.
  */
-export const RUNAWAY_CEILING = 64;
+export const RUNAWAY_CEILING = 20;
 
 /**
  * Sentinel for "no runaway cap". `Infinity` is the natural in-code form: every
