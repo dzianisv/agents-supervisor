@@ -98,6 +98,81 @@ The judge's context is `buildConversationChain`: the plain alternating `user:` /
 
 `retireProjectGoal` only deletes a file that still parses to the exact condition it judged, and writes `.supervisor/goal-achieved.log` BEFORE unlinking. `isActionlessVerdict` (empty missing + empty next_actions + blank feedback) and `hasFeedbackBody` stand the supervisor down instead of injecting — a content-free verdict was observed re-injecting byte-identically 15x at ~20s intervals. A standing goal alone never counts as actionable content. Source assertions pin both guards into `opencode/supervisor-impl.ts`.
 
+### `test/goal-lifecycle.test.mjs` → `describe("resume: ...")` — a paused goal is not a dead end
+
+A goal that gets `paused` (the agent declaring `supervisor_loop_exit` with reason
+`stuck`) or `exhausted` (the 30-day deadline backstop) used to be permanently
+inert: nothing anywhere flipped it back to `active`, and the user's only recovery
+was re-typing the whole condition from scratch — with no indication that was
+necessary. `resumeGoal()` (`core/goal.mjs`) is the explicit fix, wired through
+`bin/supervisor.mjs set-goal resume` (CLI) and the `supervisor_goal` /
+`supervisor` tools' `resume: true` arg (`opencode/supervisor-impl.ts`).
+
+**The command is `set-goal resume`, never `goal resume`.** `test/manifest.test.mjs`
+bans the literal `/supervisor goal` and `/supervisor:goal` substrings across every
+user-facing surface (see its "no user-facing surface tells anyone to type the
+retired goal command" test) — `set-goal` is the one canonical name, `goal` survives
+only as an internal parser alias. `resume`/`unpause` are recognised the same way
+`clear`/`stop`/`off`/`reset`/`none`/`cancel` already were, via a sibling
+`GOAL_RESUME_ALIASES` set next to `GOAL_CLEAR_ALIASES`.
+
+**Resumable statuses are `paused` and `exhausted`, and nothing else.** `active` is
+already running (an honest `already-active` outcome, not a fabricated success);
+`achieved`/`cleared` are terminal and immediately deleted by
+`clearGoal`/`retireProjectGoal`, so a persisted goal object in either state
+essentially never exists, but the check stays honest either way rather than
+assuming. Every non-resume outcome returns `{resumed:false, reason, status,
+condition}` so the caller can print the goal's ACTUAL current status instead of a
+silent no-op — the same discipline `/supervisor off` failing to persist taught
+this codebase (see the session-store section below).
+
+**Resume forces `mode:'goal'` back on.** `resolveSupervisorMode()` trusts an
+explicit `state.mode` over `goal.status`, and the OpenCode deadline-exhaustion
+path sets `mode:'reflection'` (`decideGoalTransition`'s `'deadline'` branch) — so
+without this, a resumed deadline-exhausted goal would stay invisible to the
+`mode==='goal'` filter both runtimes use before even looking at `state.goal`.
+
+**Resume extends a deadline that has already passed** (to `now +
+DEFAULT_MAX_GOAL_DURATION_MS`) but leaves a still-future deadline (the ordinary
+stuck-pause case) untouched. Without the extension, the very next stop-hook pass
+re-triggers `decideGoalTransition`'s `now >= goal.deadline` branch and
+re-exhausts the goal instantly — turning "resume" into a trap that looks like it
+worked and dies on the next turn.
+
+**Resume resets the attempt counter fully, not just `goal.attempts`.** It
+`delete`s the shared `state.attempts` object (not just zeroes `goal.attempts`),
+so `sessionStore.readAttempts()` reads 0 for whatever turn key comes next —
+consistent with issue #57's fix that `goal.attempts` is a MIRROR of the one
+turn-scoped counter, never a second independently-incremented tally. `lastReason`
+is cleared and `lastTurnKey` is reset to `null` (the same initial value
+`setGoal()` uses), so the very next stop treats it as a brand-new turn.
+
+**Discoverability: every pause site names the recovery command.** `lastReason` —
+the ONE field the Claude Code Stop hook can carry forward, since it has no
+passive user-visible output channel at the exact instant a goal pauses (a
+`{decision:'block'}` reply would force another continuation, defeating the
+pause) — gets `core/goal.mjs`'s `withResumeHint()` appended at both stuck-pause
+sites (`bin/supervisor-on-stop.mjs`, `opencode/supervisor-impl.ts`'s
+`executeSupervisorLoopExit`) and both deadline sites. OpenCode's deadline toasts
+and the `supervisor_loop_exit` tool's own return string get the same hint
+inline. `/supervisor status`, `bin/supervisor.mjs`'s `goal-status` case, and the
+OpenCode `supervisor`/`supervisor_goal` status text all append
+`goalResumeHintSuffix()` whenever the goal is `paused`/`exhausted` — `bin/status.mjs`
+previously printed NO goal detail at all (only `resolveSupervisorMode()`'s
+"effective mode", which reads `'goal'` identically whether the goal is actively
+pushing or dead-in-the-water paused), so that alone was a second, independent
+instance of "shown as if active" this phase fixed.
+
+**One inaccuracy in how this feature was originally described:** the third
+"pause" site named at the start of this work — an active goal standing down
+because the judge says the human must act next (`goal_paused_user_wait` in
+`bin/supervisor-on-stop.mjs`) — never actually persists any status change.
+`goal.status` stays `'active'` on disk; only a transient `verdictRecord.goal =
+'paused'` (a per-turn log line, not state) is written. There is no dead end to
+resume there — the existing "just send another message" flow already reactivates
+it, so `resumeGoal()` correctly reports `already-active` for it and changes
+nothing.
+
 ### `test/status-directive.test.mjs` — status/roadmap directive
 
 `STATUS_DIAGRAM_DIRECTIVE` leads with `STATUS_DIRECTIVE_MARKER` and `appendStatusDirectiveToSystem` is idempotent — `experimental.chat.system.transform` fires more than once per user turn on opencode 1.17.9, so a naive push duplicates the directive. `checkStatusCompliance` is deterministic and LLM-free (it runs on the complete path) and fails OPEN: unknown turn start lets any existing `status.md` count. `isStatusDiagramEnabled` is default-ON — absent/undefined mean on, only an explicit `false` disables.

@@ -22,6 +22,7 @@ import {
   readProjectGoalCondition, retireProjectGoal,
   buildGoalDerivationPrompt, parseDerivedGoalResponse,
   isStatusDiagramEnabled, isPlainspeakEnabled, goalStore,
+  withResumeHint, goalResumeHintSuffix, GOAL_RESUME_HINT,
 } from "../core/goal.mjs"
 // Plainspeak style detector. DELIBERATELY deterministic-only on this runtime:
 // only `scoreVerbosity(...).verdict === "verbose"` fires, `"suspect"` is
@@ -426,6 +427,17 @@ export const supervisorStore = {
 
   async setPlainspeak(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
     return goalStore.setPlainspeak(directory, sessionId, enabled) as SupervisorState
+  },
+
+  /**
+   * Flip a paused/exhausted goal back to active — see resumeGoal() in
+   * core/goal.mjs for the full contract (condition preserved verbatim,
+   * lastReason cleared, attempt counter reset, mode forced back to 'goal',
+   * a past deadline extended). Never a silent no-op: the returned outcome's
+   * `resumed` field tells the caller whether anything actually changed.
+   */
+  async resumeGoal(directory: string, sessionId: string, opts?: { now?: number; maxDurationMs?: number }) {
+    return goalStore.resumeGoal(directory, sessionId, opts ?? {})
   },
 
   /**
@@ -1859,7 +1871,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   // Primary supervisor tool: status, session on/off, and mode selection.
   const supervisorToggleDescription = "Inspect or change supervisor state for the current session. action=off/on disables/enables the supervisor and is INDEPENDENT of mode — when the user asks to turn the supervisor off, send action=\"off\" and leave mode empty. Use mode=autopilot or mode=reflection only to switch modes. Use action=\"status on\"/\"status off\" for the status-checkpoint directive and action=\"plain on\"/\"plain off\" for the plainspeak style nudge. Omit args for status. Legacy action=autopilot/reflection/goal/retry remains supported; prefer supervisor_goal and supervisor_retry for goal/retry."
   const executeSupervisorToggle = async (
-    args: { action?: string; mode?: string; condition?: string; clear?: boolean; n?: number } = {},
+    args: { action?: string; mode?: string; condition?: string; clear?: boolean; resume?: boolean; n?: number } = {},
     context?: any
   ) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
@@ -1956,7 +1968,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
     if (action === "goal") {
-      return executeSupervisorGoal({ condition: normalizeOptionalArg(args.condition), clear: args.clear }, context)
+      return executeSupervisorGoal({ condition: normalizeOptionalArg(args.condition), clear: args.clear, resume: args.resume }, context)
     }
     if (action === "retry") {
       return executeSupervisorRetry({ n: args.n }, context)
@@ -1972,7 +1984,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const disabled = await isSessionDisabled(sid, sessionDir)
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
-    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}` : "\ngoal: (none)"
+    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}` : "\ngoal: (none)"
     return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
   }
 
@@ -2056,11 +2068,33 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   // supervisor_goal / supervisor_retry tools — wire the supervisor-mode goal loop
   // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
   // this per-session state on the next session.idle.
-  const supervisorGoalDescription = "Set, check, or clear a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear)."
-  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean }, context?: any) => {
+  const supervisorGoalDescription = "Set, check, clear, or resume a session GOAL the agent must demonstrably meet before the supervisor lets it stop. Args: condition (the goal text; omit to check status), clear (true to clear), resume (true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, and resets the turn's attempt budget)."
+  const executeSupervisorGoal = async (args: { condition?: string; clear?: boolean; resume?: boolean }, context?: any) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
     currentSessionId = sid
+    if (args.resume) {
+      const outcome = await supervisorStore.resumeGoal(directory, sid)
+      if (!outcome.resumed) {
+        // Never a silent no-op — name the goal's ACTUAL current status so the
+        // caller can't mistake this for a successful resume.
+        if (outcome.reason === "no-goal") {
+          return `No goal is set for session ${sid.slice(0, 8)}… — nothing to resume. Set one with supervisor_goal { condition }.`
+        }
+        if (outcome.reason === "already-active") {
+          return `Goal for session ${sid.slice(0, 8)}… is already active (not paused): "${outcome.condition}". Nothing to resume.`
+        }
+        return `Goal for session ${sid.slice(0, 8)}… is ${outcome.status}, not paused — it cannot be resumed. Set a new one with supervisor_goal { condition }.`
+      }
+      // Never report success for a write that did not persist — read the
+      // state back through the same load() path a fresh reader would use,
+      // matching the off/on FAILED-verification pattern above.
+      const after = await supervisorStore.load(directory, sid)
+      if (after.goal?.status !== "active" || after.goal?.condition !== outcome.condition) {
+        return `FAILED to resume goal for session ${sid.slice(0, 8)}… — the change did not persist (status now: ${after.goal?.status ?? "(no goal)"}). Do not assume the goal is active.`
+      }
+      return `Goal resumed for session ${sid.slice(0, 8)}… (was ${outcome.previousStatus}): "${outcome.condition}". Attempt budget reset for this turn; the supervisor will keep pushing until it's met (or the retry budget runs out).`
+    }
     if (args.clear) {
       await supervisorStore.clearGoal(directory, sid)
       return `Goal cleared for session ${sid.slice(0, 8)}….`
@@ -2074,7 +2108,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     if (!condition) {
       const st = await supervisorStore.load(directory, sid)
       if (st.goal) {
-        return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}`
+        return `Goal (${st.goal.status}): ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}`
       }
       const projectCondition = await readProjectGoalForSessionId(sid)
       if (projectCondition) {
@@ -2253,7 +2287,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
       // explicit "stuck" pauses it, and even then the condition is kept so
       // the user can see and resume it.
       if (reason === "stuck" && s.goal && s.goal.status === "active") {
-        s.goal = { ...s.goal, status: "paused", lastReason: detail || "agent reported stuck" }
+        s.goal = { ...s.goal, status: "paused", lastReason: withResumeHint(detail || "agent reported stuck") }
       }
     })
 
@@ -2263,11 +2297,17 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
       try { await supervisorStore.setAutopilot(directory, sid, false) } catch { /* best effort */ }
     }
 
+    // `state` was loaded BEFORE the mutate above, so its goal.status still
+    // reflects the PRE-pause value — exactly the condition the mutate itself
+    // used to decide whether to pause. A goal that WAS active and WILL become
+    // paused is the only case that needs the recovery hint in the output the
+    // caller (and therefore the user) actually sees.
+    const goalWasPaused = reason === "stuck" && !!state.goal && state.goal.status === "active"
     debug("loop-exit recorded:", sid, "turn:", turnKey, "reason:", reason, "detail:", detail)
     return reason === "stuck"
       ? {
           title: "Supervision loop ended (stuck)",
-          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.`,
+          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.${goalWasPaused ? ` The associated goal is now paused. ${GOAL_RESUME_HINT}` : ""}`,
         }
       : {
           title: "Supervision loop ended",
@@ -2289,7 +2329,8 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
       description: supervisorGoalDescription,
       args: {
         condition: tool.schema.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
-        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal.")
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current session goal."),
+        resume: tool.schema.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
       },
       execute: executeSupervisorGoal as any
     })
@@ -2324,6 +2365,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         action: tool.schema.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
         condition: tool.schema.string().optional().describe("Goal text when action is 'goal'."),
         clear: tool.schema.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+        resume: tool.schema.boolean().optional().describe("Set true with action 'goal' to resume a paused or exhausted goal."),
         n: tool.schema.number().optional().describe("Retry budget when action is 'retry'.")
       },
       execute: executeSupervisorToggle as any
@@ -2376,6 +2418,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           action: z.string().optional().describe("status, off, or on. Legacy autopilot, reflection, goal, and retry are still accepted. Omit for status."),
           condition: z.string().optional().describe("Goal text when action is 'goal'."),
           clear: z.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
+          resume: z.boolean().optional().describe("Set true with action 'goal' to resume a paused or exhausted goal."),
           n: z.number().optional().describe("Retry budget when action is 'retry'.")
         },
         execute: executeSupervisorToggle
@@ -2393,7 +2436,8 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         description: supervisorGoalDescription,
         args: {
           condition: z.string().optional().describe("The goal the agent must meet before stopping. Omit to check status."),
-          clear: z.boolean().optional().describe("Set true to clear the current session goal.")
+          clear: z.boolean().optional().describe("Set true to clear the current session goal."),
+          resume: z.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
         },
         execute: executeSupervisorGoal
       }
@@ -2622,9 +2666,10 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
               const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: effectiveMaxAttempts })
               if (t.action === "exhausted" && t.reason === "deadline") {
                 await supervisorStore.mutate(directory, sessionId, (s) => {
-                  s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+                  s.mode = "reflection"; s.autopilot = false
+                  s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
                 })
-                await showToast(client, directory, "Goal deadline reached — paused", "warning")
+                await showToast(client, directory, `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`, "warning")
               } else if (mode !== "autopilot") {
                 await showToast(client, directory, `Goal budget spent for this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
               }
@@ -3010,7 +3055,8 @@ Continue now.`
             const deadlineHit = t.reason === "deadline"
             if (deadlineHit) {
               await supervisorStore.mutate(directory, sessionId, (s) => {
-                s.mode = "reflection"; s.autopilot = false; s.goal = t.goal
+                s.mode = "reflection"; s.autopilot = false
+                s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
               })
             }
             standDownForTurn(sessionId, turnKey, effectiveMaxAttempts)
@@ -3018,7 +3064,7 @@ Continue now.`
               client,
               directory,
               deadlineHit
-                ? `Goal deadline reached — paused`
+                ? `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`
                 : `Goal budget spent for this turn (${t.goal.attempts} attempts) — resumes on your next message`,
               "warning"
             )

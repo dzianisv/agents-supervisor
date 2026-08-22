@@ -19,5 +19,6 @@ Interpret `$ARGUMENTS`:
 - `set-goal <condition>` (legacy alias: `goal <condition>`) -> call `supervisor_goal` with the remaining text.
 - exactly `set-goal` / `goal` -> call `supervisor_goal` with no args.
 - `set-goal clear` / `goal clear` -> call `supervisor_goal` with `clear: true`.
+- `set-goal resume` / `goal resume` (also `unpause`) -> call `supervisor_goal` with `resume: true` (revives a `paused` or `exhausted` goal; a no-op with an honest message otherwise).
 - `retry N` -> call `supervisor_retry` with `n: N`.
 - otherwise -> call `set_supervisor` with `$ARGUMENTS` as guidance.
