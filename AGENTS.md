@@ -11,18 +11,27 @@ opencode supervisor plugin — reflection, goal-tracking, autopilot for opencode
 
 ## Commands
 
+**The `opencode` binary must be on PATH before running the E2E — it is
+commonly installed at `~/.opencode/bin/opencode`, which is NOT on the default
+PATH.** Without it, `test/e2e-opencode.test.mjs` throws immediately (loud,
+non-zero exit — see below) instead of silently skipping:
+
+```bash
+export PATH="$HOME/.opencode/bin:$PATH"
+```
+
 ```bash
 # Unit/integration tests (E2E is deliberately EXCLUDED — see below)
 npm test
 
-# opencode server E2E test (MUST pass before commit)
-npm run test:e2e
+# opencode server E2E test (MUST pass before commit) — needs opencode on PATH, see above
+export PATH="$HOME/.opencode/bin:$PATH" && npm run test:e2e
 
 # Both, sequentially — never concurrently
-npm run test:all
+export PATH="$HOME/.opencode/bin:$PATH" && npm run test:all
 
 # Live validation against a real `opencode serve` (evidence, not assertions)
-node --experimental-strip-types test/live-validation.mjs
+export PATH="$HOME/.opencode/bin:$PATH" && node --experimental-strip-types test/live-validation.mjs
 
 # Claude Code E2E test
 node test/e2e-cc.mjs
@@ -37,6 +46,14 @@ node evals/judge-eval.mjs
 start a real `opencode serve` alongside 30+ unit files on the same cores, and
 running the documented E2E command straight afterwards started a second one.
 `npm test` now globs `test/!(e2e-*).test.mjs`; the E2E has its own script.
+
+**A missing `opencode` binary fails loud, not quiet.** `node --test` exits 0
+for an all-skipped run — "0 tests, 0 fail" used to be structurally
+indistinguishable from a real pass, and this E2E is a mandatory pre-commit
+gate (see the INVARIANT above). `test/e2e-opencode.test.mjs` now throws at
+module load if `opencode` is not on PATH, unless `SUPERVISOR_E2E_ALLOW_SKIP=1`
+is set explicitly — always check the `ℹ tests N` line reads 20, not 0, on top
+of a green exit code.
 
 ## Structure
 
