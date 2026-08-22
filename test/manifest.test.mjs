@@ -106,6 +106,10 @@ test('every documented command name actually parses (docs cannot drift from the 
     { kind: 'goal-set', condition: 'tests pass' });
   assert.deepEqual(parseSupervisorCommand('goal', 'tests pass'),
     { kind: 'goal-set', condition: 'tests pass' });
+  // resume: a paused/exhausted goal is not a dead end — see goal-lifecycle.test.mjs
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'set-goal resume'), { kind: 'goal-resume' });
+  assert.deepEqual(parseSupervisorCommand('set-goal', 'resume'), { kind: 'goal-resume' });
+  assert.deepEqual(parseSupervisorCommand('supervisor', 'set-goal unpause'), { kind: 'goal-resume' });
 });
 
 test('marketplace.json lists supervisor with source "."', () => {

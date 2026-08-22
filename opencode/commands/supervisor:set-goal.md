@@ -10,6 +10,7 @@ directly in this session so the plugin-provided tool is available.
 Interpret `$ARGUMENTS`:
 - empty -> call `supervisor_goal` with no args (report current goal status).
 - `clear` / `stop` / `off` / `reset` / `none` / `cancel` -> call `supervisor_goal` with `clear: true`.
+- `resume` / `unpause` -> call `supervisor_goal` with `resume: true` (revives a `paused` or `exhausted` goal — keeps the same condition, clears the stale pause reason, and resets this turn's attempt budget; a no-op with an honest message if the goal is not paused/exhausted).
 - anything else -> call `supervisor_goal` with `condition: "$ARGUMENTS"` (the goal the agent must demonstrably meet, e.g. "all tests in test/auth pass and lint is clean").
 
 After the tool returns, relay its message. While a goal is active the supervisor

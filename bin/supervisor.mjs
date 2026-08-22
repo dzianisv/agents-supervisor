@@ -33,6 +33,7 @@ import {
   resolveClaudeCodeHardCap,
   writeProjectGoal,
   readProjectGoalCondition,
+  goalResumeHintSuffix,
 } from '../core/goal.mjs';
 import { resolveSessionId } from '../core/session-store.mjs';
 
@@ -203,6 +204,38 @@ switch (cmd.kind) {
     console.log(`${GOAL_LABEL} cleared for session ${sid.slice(0, 8)}….`);
     break;
   }
+  case 'goal-resume': {
+    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
+    const outcome = goalStore.resumeGoal(cwd, sid);
+    if (!outcome.resumed) {
+      // Honest, never a silent no-op — names the goal's ACTUAL current
+      // status rather than pretending the resume happened.
+      if (outcome.reason === 'no-goal') {
+        console.log(`No ${GOAL_LABEL.toLowerCase()} set for session ${sid.slice(0, 8)}… — nothing to resume. Set one with 'supervisor set-goal <condition>'.`);
+      } else if (outcome.reason === 'already-active') {
+        console.log(`${GOAL_LABEL} for session ${sid.slice(0, 8)}… is already active (not paused): "${outcome.condition}". Nothing to resume.`);
+      } else {
+        console.log(`${GOAL_LABEL} for session ${sid.slice(0, 8)}… is ${outcome.status}, not paused — it cannot be resumed. Set a new one with 'supervisor set-goal <condition>'.`);
+      }
+      break;
+    }
+    // Never report success for a write that did not persist — read the
+    // state back through the same load() path a fresh reader would use,
+    // matching the FAILED-verification pattern used by supervisor off/on.
+    const after = goalStore.load(cwd, sid);
+    if (after.goal?.status !== 'active' || after.goal?.condition !== outcome.condition) {
+      console.log(
+        `FAILED to resume ${GOAL_LABEL.toLowerCase()} for session ${sid.slice(0, 8)}… — the change did not persist ` +
+        `(status now: ${after.goal?.status ?? '(no goal)'}). Do not assume the goal is active.`
+      );
+      process.exit(1);
+    }
+    console.log(
+      `${GOAL_LABEL} resumed for session ${sid.slice(0, 8)}… (was ${outcome.previousStatus}): "${outcome.condition}".\n` +
+      `Attempt budget reset for this turn; the supervisor will keep pushing until it's met (or the retry budget runs out).`
+    );
+    break;
+  }
   case 'goal-status': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     const st = goalStore.load(cwd, sid);
@@ -210,7 +243,8 @@ switch (cmd.kind) {
       console.log(
         `${GOAL_LABEL} (${st.goal.status}): ${st.goal.condition}\n` +
         `attempts: ${st.goal.attempts}` +
-        (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '')
+        (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '') +
+        goalResumeHintSuffix(st.goal)
       );
       break;
     }

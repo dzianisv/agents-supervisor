@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled } from '../core/goal.mjs';
+import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -886,7 +886,16 @@ async function main() {
   function finishExhaustedGoal(t, baseRecord) {
     const deadlineHit = t.reason === 'deadline';
     if (deadlineHit) {
-      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
+      // Claude Code's Stop hook has no passive user-visible output channel at
+      // this exact moment (a {decision:'block'} reply would force another
+      // continuation, defeating the pause) — lastReason is the only place the
+      // recovery instruction can live, surfaced later by `/supervisor status`
+      // or `/supervisor set-goal`.
+      try {
+        sessionStore.mutate(cwd, session_id, (s) => {
+          s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || 'goal deadline reached') };
+        });
+      } catch { /* */ }
     }
     writeVerdict(session_id, { ...baseRecord, goal: deadlineHit ? 'exhausted' : 'turn_budget_spent' }, cwd);
     debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_turn_budget_spent', session_id, reason: t.reason }, cwd);
@@ -1016,7 +1025,7 @@ async function main() {
       try {
         goalStore.mutate(cwd, session_id, (st) => {
           if (st.goal && st.goal.status === 'active') {
-            st.goal = { ...st.goal, status: 'paused', lastReason: detail || 'agent reported stuck' };
+            st.goal = { ...st.goal, status: 'paused', lastReason: withResumeHint(detail || 'agent reported stuck') };
           }
         });
       } catch { /* best effort */ }
