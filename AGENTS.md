@@ -62,6 +62,54 @@ of a green exit code.
 - Tests: `test/*.test.mjs`
 - Module system: ESM (`"type": "module"`)
 
+## Two modes, and a goal is an ATTRIBUTE not a mode
+
+There are exactly TWO supervisor modes now: `autopilot` and `reflection`
+(`SUPERVISOR_MODES` in `core/goal.mjs`, `SupervisorMode` in
+`opencode/supervisor-impl.ts`). `goal` is NO LONGER a mode. A goal is an
+orthogonal session attribute — `state.goal` — that either mode may carry.
+
+- **autopilot** — NEVER runs the judge. On each idle it injects the pre-defined
+  autopilot nudge. If a goal is active, its condition is APPENDED to that nudge
+  as context via `appendGoalContextToNudge` (`core/goal.mjs`, shared by both
+  runtimes so the two nudges cannot drift). **A goal in autopilot is context,
+  NOT a verified condition** — this is a deliberate, accepted reduction in
+  guarantee (owner decision). Documented plainly in README/skills. Do not
+  "fix" it by reintroducing a judge call on the autopilot path.
+- **reflection** — judge runs as before. If a goal is active, its condition is
+  threaded into the judge prompt (the existing `buildGoalRequirementSection` /
+  `goalSection` mechanism — reused, not reinvented) so the judge grades against
+  it.
+
+**What replaced every `mode === 'goal'` check:** "a goal is set and active",
+i.e. `state.goal && state.goal.status === 'active'`. `resolveSupervisorMode`
+never returns `'goal'` (an active goal resolves to `reflection`). The turn gate
+(`core/turn-classifier.mjs` `shouldSkipReflection`) escapes for
+`mode==='autopilot' || hasActiveGoal` — `isSupervisorControlTurn` is still
+checked BEFORE those escape hatches (unchanged ordering rule).
+
+**The landmine is disarmed.** `goalStore.setMode` used to run
+`if (mode !== 'goal') delete state.goal` — under two modes that would drop a
+goal on EVERY switch to reflection. It is DELETED. A goal now dies ONLY on an
+explicit `clearGoal` or on achievement-`retireProjectGoal`. Every goal-drop
+path was audited (`clearGoal`, `retireProjectGoal`, `decideGoalTransition`
+status transitions which mutate `goal.status` but never `delete`); none fire on
+a plain mode switch. `test/goal-core.test.mjs`, `test/goal-lifecycle.test.mjs`
+and `test/session-store.test.mjs` pin it.
+
+**Migration (load-time, one place).** Persisted `mode:'goal'` in
+`state.json` or a legacy `goals/<id>.json` maps forward to `reflection` with the
+goal intact, in `normalizeLoadedState` (`core/session-store.mjs`) — the one
+owner of load/migration, wired into both `load()` return paths and
+`migrateLegacySession`. Legacy files are left in place (repo convention).
+
+**Deprecated INPUT alias.** The string `'goal'` as a *mode argument* is still
+accepted at the command surface (`bin/supervisor.mjs`, opencode
+`requestedMode==="goal"`): it maps to reflection and KEEPS any goal, with a
+"no longer a mode" notice — it never hard-errors, because stale skills and
+installed command files still say it. The low-level `goalStore.setMode` still
+THROWS on `'goal'` (the alias mapping lives at the command surface, deliberately).
+
 ## Test Coverage
 
 ### `test/supervisor-gates.test.mjs` — the two "should the supervisor run at all" gates
@@ -109,7 +157,7 @@ The judge's context is `buildConversationChain`: the plain alternating `user:` /
 
 ### `test/turn-classifier.test.mjs` — non-actionable turn gate
 
-`shouldSkipReflection` must skip "tldr" / "thanks" / "Stop. Reflect." and must NOT skip real work. False skips are the dangerous direction, so the actionable corpus is the larger half. Escape hatches (active goal, autopilot/goal mode, length ceiling, a named file/issue/identifier) are asserted individually.
+`shouldSkipReflection` must skip "tldr" / "thanks" / "Stop. Reflect." and must NOT skip real work. False skips are the dangerous direction, so the actionable corpus is the larger half. Escape hatches (active goal, autopilot mode, length ceiling, a named file/issue/identifier) are asserted individually.
 
 ### `test/goal-lifecycle.test.mjs` — achieved goals must die; empty verdicts must not loop
 
@@ -143,11 +191,13 @@ condition}` so the caller can print the goal's ACTUAL current status instead of 
 silent no-op — the same discipline `/supervisor off` failing to persist taught
 this codebase (see the session-store section below).
 
-**Resume forces `mode:'goal'` back on.** `resolveSupervisorMode()` trusts an
-explicit `state.mode` over `goal.status`, and the OpenCode deadline-exhaustion
-path sets `mode:'reflection'` (`decideGoalTransition`'s `'deadline'` branch) — so
-without this, a resumed deadline-exhausted goal would stay invisible to the
-`mode==='goal'` filter both runtimes use before even looking at `state.goal`.
+**Resume sets `mode:'reflection'` and revives the goal.** A goal is now an
+orthogonal attribute recognised in reflection regardless of any `mode==='goal'`
+filter (that filter is GONE — see the two-modes section at the top of this file).
+Resume flips `goal.status` back to `active` and forces `mode:'reflection'` (the
+mode that verifies a goal), so a resumed deadline-exhausted goal is both active
+AND in the mode that checks it. It never sets `mode:'goal'` — that value is no
+longer a mode.
 
 **Resume extends a deadline that has already passed** (to `now +
 DEFAULT_MAX_GOAL_DURATION_MS`) but leaves a still-future deadline (the ordinary
@@ -176,8 +226,10 @@ inline. `/supervisor status`, `bin/supervisor.mjs`'s `goal-status` case, and the
 OpenCode `supervisor`/`supervisor_goal` status text all append
 `goalResumeHintSuffix()` whenever the goal is `paused`/`exhausted` — `bin/status.mjs`
 previously printed NO goal detail at all (only `resolveSupervisorMode()`'s
-"effective mode", which reads `'goal'` identically whether the goal is actively
-pushing or dead-in-the-water paused), so that alone was a second, independent
+"effective mode", which — back when `'goal'` was a mode — read `'goal'`
+identically whether the goal was actively pushing or dead-in-the-water paused; it
+now resolves to `reflection` in both cases, so mode alone is even less
+informative about goal status), so that alone was a second, independent
 instance of "shown as if active" this phase fixed.
 
 **One inaccuracy in how this feature was originally described:** the third
@@ -255,12 +307,15 @@ Two things it found that unit tests could not:
   and that is what the guard reads.
 - **`autopilot_exit` silently deleted an active goal.** It was registered
   plugin-wide, so it was in every session's tool catalog; it called
-  `setAutopilot(false)` unconditionally, which routes through
+  `setAutopilot(false)` unconditionally, which routed through
   `setMode("reflection")` → `delete state.goal`. It was made a no-op outside
   autopilot mode as an interim fix, then deleted outright once
   `supervisor_loop_exit` fully replaced it (see the stop-mechanism section
   above) — two tools for one job was the drift risk, not just the goal-delete
-  bug.
+  bug. **As of the two-modes refactor the underlying primitive is gone too:**
+  `setMode` no longer deletes the goal under any mode (a goal is an attribute,
+  not a mode), so even a resurrected unconditional `setAutopilot(false)` could
+  not drop a goal now. See the two-modes section at the top.
 
 Both are pinned in `test/goal-lifecycle.test.mjs`.
 
@@ -338,9 +393,11 @@ ever `delete state.goal` — that footgun was hit for real in live validation vi
 the predecessor `autopilot_exit` TOOL (opencode/supervisor-impl.ts), which is
 now DELETED. It was a second tool for the same job as `supervisor_loop_exit`,
 registered plugin-wide (so it sat in every session's tool catalog including
-goal-mode ones), and it called `setAutopilot(false)` unconditionally — which
-routes through `setMode("reflection")` → `delete state.goal` — silently
-destroying an active user goal with no warning. `supervisor_loop_exit` only
+sessions carrying a goal), and it called `setAutopilot(false)` unconditionally —
+which back then routed through `setMode("reflection")` → `delete state.goal` —
+silently destroying an active user goal with no warning. As of the two-modes
+refactor `setMode` no longer deletes the goal at all (a goal is an attribute,
+not a mode), so that exact route is dead code now. `supervisor_loop_exit` only
 touches autopilot state when the session is actually in `autopilot` mode, and
 never deletes a goal outright; `test/goal-lifecycle.test.mjs` and
 `test/loop-exit.test.mjs` pin both.

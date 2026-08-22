@@ -127,15 +127,18 @@ Whole plugin off: remove the plugin entry from `opencode.json`, or launch with `
 
 ## Supervisor modes (both runtimes)
 
-The supervisor has three public modes, available on both Claude Code and OpenCode:
+The supervisor has **two** public modes, available on both Claude Code and OpenCode:
 
 | Mode | Command | Behavior |
 |---|---|---|
-| `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
-| `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met. The retry budget bounds one human turn, then resets when you speak again. |
-| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or budget exhaustion. |
+| `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. If a goal is set, the judge grades against the goal too. |
+| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or budget exhaustion. If a goal is set, its condition rides along as context on the nudge — **but autopilot never verifies it** (see below). |
 
 The effective default mode is `reflection`.
+
+**A goal is not a mode.** A goal is an orthogonal session *attribute* — you can set
+one in either mode (see "Goals" below). It changes what each mode does with it, not
+which mode you are in.
 
 ## Where the supervisor does NOT run (OpenCode)
 
@@ -166,16 +169,25 @@ The `off`/`on` action always wins over any `mode` argument sent in the same
 call, and the tool reports an explicit `FAILED …` string rather than a success
 message if the change did not persist.
 
-## Goal mode (both runtimes)
+## Goals (both runtimes)
 
 Beyond catching premature stops, you can point the supervisor at a **goal** it must
 demonstrably meet before it lets the agent stop — it keeps re-prompting until the
-goal's met.
+goal's met. A goal is a session **attribute**, not a mode: setting one puts the
+session in `reflection` (the mode that verifies it) and keeps it there.
 
 ```
 /supervisor:set-goal all tests in test/auth pass and the PR is open with green CI
-/supervisor:retry 24           # set this turn's retry budget (1–100, default 16)
+/supervisor:retry 24           # set this turn's retry budget (1–100)
 ```
+
+> **In autopilot, a goal is context, not a verified condition.** Autopilot never
+> runs the judge, so it cannot check a goal — when a goal is set in autopilot its
+> condition is merely appended to the auto-continue nudge as context for the agent.
+> If you want the goal actually *checked* before the agent may stop, use
+> `reflection` mode (the default, and where `set-goal` leaves you). This is a
+> deliberate trade: autopilot trades the goal guarantee for never paying for a
+> judge round-trip.
 
 **The retry budget is per human turn, not per session.** It bounds how many times
 the supervisor may re-prompt inside one unbroken turn; the moment you send another
@@ -194,7 +206,7 @@ the old deadline had already passed). `/supervisor:status` (and the OpenCode
 with the reason and the resume hint — never silently as if it were still active.
 
 This used to be a separate `solofounder` mode. It isn't any more — those semantics
-are goal mode's default, and `solofounder` survives only as a skill
+are the default when a goal is set, and `solofounder` survives only as a skill
 (`skills/solofounder/`) that arms a goal with a revenue done-bar.
 
 The command is deliberately named `/supervisor:set-goal` on **both** runtimes,
@@ -206,8 +218,10 @@ pattern/rubric injection; `/supervisor:set-goal` is this plugin's judge-driven
 equivalent, sharing state and retry budget with the rest of the supervisor.
 
 Internal identifiers keep the `goal` name (`core/goal.mjs`, the `supervisor_goal`
-tool, the `goal` mode value, the on-disk state schema) — those are never typed by
-a human, so renaming them would only add migration risk.
+tool, the on-disk state schema) — those are never typed by a human, so renaming
+them would only add migration risk. The retired `goal` *mode* value is still
+accepted as a deprecated input alias (it maps to `reflection` and keeps the goal)
+so stale skills and installed command files do not hard-error.
 
 Beyond the per-session goal above, a project-level goal can also persist across
 sessions — see "Project goals (`Goal.md`)" below.

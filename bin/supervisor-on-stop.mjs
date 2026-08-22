@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
+import { goalStore, resolveTurnMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -844,17 +844,19 @@ async function main() {
     hardCap: HARD_CAP,
   });
 
-  // Project-level goal: in reflection mode, read the project goal
-  // (.agents/supervisor/Goal.md, or the lower-case goal.md written by the
-  // OpenCode-side LLM auto-derivation feature — see core/goal.mjs's
-  // readProjectGoalCondition for the shared precedence rule).
+  // Project-level goal: when there is no active SESSION goal, fall back to
+  // the project goal (.agents/supervisor/Goal.md, or the lower-case goal.md
+  // written by the OpenCode-side LLM auto-derivation feature — see
+  // core/goal.mjs's readProjectGoalCondition for the shared precedence rule).
+  // A goal is an ATTRIBUTE now, not a mode; `!goal` (no session goal) is the
+  // only gate — there is no `mode==='goal'` to exclude.
   let projectGoalSection = '';
   // The exact project condition injected into THIS judgement. Load-bearing
   // for goal retirement: only a file that still holds the condition we
   // actually judged may be deleted (see retireProjectGoal in core/goal.mjs).
   let injectedProjectGoalCondition = '';
   const effectiveMode = resolveSupervisorMode(goalState);
-  if (effectiveMode !== 'goal' && !goal) {
+  if (!goal) {
     const cond = readProjectGoalCondition(cwd);
     if (cond) {
       injectedProjectGoalCondition = cond;
@@ -1051,9 +1053,15 @@ async function main() {
     process.exit(0);
   }
 
-  // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
-  // until the agent emits SUPERVISOR_LOOP_EXIT or the attempt budget runs out.
-  if (mode === 'autopilot' && !goal) {
+  // 4a. Autopilot fast-path: skip the judge ENTIRELY; inject a "continue"
+  // nudge until the agent emits SUPERVISOR_LOOP_EXIT or the attempt budget
+  // runs out. Autopilot NEVER runs the judge — even with an active goal. A
+  // goal in autopilot is CONTEXT appended to the nudge, NOT a verified
+  // condition (this is a deliberate, accepted reduction in guarantee: use
+  // reflection mode if you want the goal actually checked). The old gate was
+  // `mode === 'autopilot' && !goal`, which forced the judge whenever a goal
+  // was set; that override is intentionally removed.
+  if (mode === 'autopilot') {
     // NOTE: the exit signal (SUPERVISOR_LOOP_EXIT, with a parse-only legacy
     // AUTOPILOT_EXIT alias for stale installed skill copies) is handled
     // in 4a-0 above, for ALL modes, via the single shared parser.
@@ -1065,10 +1073,15 @@ async function main() {
     // both runtimes. Gated by the same default-on `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
     const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
-    const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
+    // If a goal is set (session goal, else the project Goal.md), append it to
+    // the nudge as working context — shared with the OpenCode runtime via the
+    // ONE helper so the two nudges cannot drift.
+    const nudgeGoalCondition = goal ? goal.condition : injectedProjectGoalCondition;
+    const nudgeWithGoal = appendGoalContextToNudge(baseNudge, nudgeGoalCondition);
+    const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(nudgeWithGoal) : nudgeWithGoal;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
-    debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt }, cwd);
+    debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt, goal: !!nudgeGoalCondition }, cwd);
     process.exit(0);
   }
 

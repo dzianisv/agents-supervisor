@@ -25,9 +25,9 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 
 ## Goal Loop
 
-> User-facing name is `/supervisor:set-goal` on **both** runtimes. Claude Code has a native `/goal` command a bare-named skill would shadow; OpenCode doesn't, but one name across runtimes beats a per-runtime split (the split silently reappeared once already — see `command-surface.md`). Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `goal` mode value.
+> User-facing name is `/supervisor:set-goal` on **both** runtimes. Claude Code has a native `/goal` command a bare-named skill would shadow; OpenCode doesn't, but one name across runtimes beats a per-runtime split (the split silently reappeared once already — see `command-surface.md`). Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `supervisor_goal` tool. NOTE: `goal` is NO LONGER a supervisor mode — a goal is an orthogonal session attribute (`state.goal`) carried by either the `reflection` or `autopilot` mode. The string `'goal'` survives only as a deprecated INPUT alias for `reflection` (kept so stale skills/commands don't hard-error).
 
-- A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop.
+- A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop. It is an attribute, not a mode: setting one puts the session in `reflection` (the mode that verifies it). In `reflection` the judge grades against it; in `autopilot` its condition rides along as CONTEXT on the nudge but is NEVER verified (accepted trade-off — autopilot never runs the judge).
 - Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
 - Goal state is stored under `.supervisor/goals/<sessionId>.json` (per-session). A separate project-level goal persists across sessions in `.agents/supervisor/Goal.md` (manually set, takes precedence) or lower-case `.agents/supervisor/goal.md` (see `writeProjectGoal`/`readProjectGoalCondition` in `core/goal.mjs`), with every write also appended to `goal-history.jsonl` so concurrent writers never silently lose a condition.
 - On OpenCode, `/supervisor:set-goal` invoked with no condition and no existing session/project goal makes a bounded LLM call (`deriveGoalWithLLM`/`buildGoalDerivationPrompt` in `core/goal.mjs` + `opencode/supervisor-impl.ts`) to derive a concise, falsifiable goal from the task context, persisting it to `goal.md` only on success (`parseDerivedGoalResponse` requires `falsifiable: true` and rejects prompt-injection artifacts). If derivation fails or is invalid, no default is fabricated — the goal is left unset with an explicit request to set it manually.
@@ -39,7 +39,7 @@ Arrays and scalars replace wholesale during merge. Objects merge recursively. `/
 ## Autopilot
 
 - Autopilot is available on both Claude Code and OpenCode.
-- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the attempt-budget check, never by any loop check.
+- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the attempt-budget check, never by any loop check. If a goal is active, its condition is appended to that nudge as context (via `appendGoalContextToNudge`), but autopilot never verifies it.
 - Autopilot stops when the agent declares `supervisor_loop_exit` (OpenCode tool call) / outputs `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the retry budget exhausts. Those are the ONLY two ways autopilot stops. (`core/loop-exit.mjs` keeps a parse-only legacy alias for stale installed skill copies — not taught here or anywhere else shipped.)
 - Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
 

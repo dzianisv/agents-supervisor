@@ -16,6 +16,7 @@ import { execFile } from "child_process"
 // (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
 import {
   resolveMaxAttempts, resolveTurnMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  appendGoalContextToNudge,
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
   writeProjectGoal, GOAL_CONDITION_MAX_LEN,
@@ -290,7 +291,7 @@ export interface SupervisorGoal {
   lastTurnKey?: string | null
 }
 
-export type SupervisorMode = "autopilot" | "goal" | "reflection"
+export type SupervisorMode = "autopilot" | "reflection"
 
 export interface SupervisorState {
   maxAttempts?: number       // /supervisor:retry override (optional)
@@ -432,9 +433,10 @@ export const supervisorStore = {
   /**
    * Flip a paused/exhausted goal back to active — see resumeGoal() in
    * core/goal.mjs for the full contract (condition preserved verbatim,
-   * lastReason cleared, attempt counter reset, mode forced back to 'goal',
-   * a past deadline extended). Never a silent no-op: the returned outcome's
-   * `resumed` field tells the caller whether anything actually changed.
+   * lastReason cleared, attempt counter reset, mode forced to 'reflection'
+   * so the goal is actually verified, a past deadline extended). Never a
+   * silent no-op: the returned outcome's `resumed` field tells the caller
+   * whether anything actually changed.
    */
   async resumeGoal(directory: string, sessionId: string, opts?: { now?: number; maxDurationMs?: number }) {
     return goalStore.resumeGoal(directory, sessionId, opts ?? {})
@@ -1345,9 +1347,10 @@ async function analyzeSelfAssessmentWithLLM(
 }
 
 /**
- * LLM goal-derivation for `goal` mode invoked with no explicit condition and
- * no existing session/project goal. Binding contract (align-supervisor-modes):
- * goal mode is not allowed to fabricate a static default — on ANY failure
+ * LLM goal-derivation for a `set-goal` request invoked with no explicit
+ * condition and no existing session/project goal. Binding contract
+ * (align-supervisor-modes): goal derivation is not allowed to fabricate a
+ * static default — on ANY failure
  * (no model available, session/network error, unparseable response, or a
  * response that fails strict falsifiability/injection validation via
  * core/goal.mjs's parseDerivedGoalResponse) this returns null and the caller
@@ -1684,7 +1687,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       if (mode === "autopilot" || sup.autopilot === true) return false
       // An active goal (session-scoped or project-scoped) means the turn is
       // still under a standing objective. Style is not the priority.
-      if (goal || mode === "goal") return false
+      if (goal) return false
       if (args.projectGoalCondition) return false
       // One rewrite per turn, ever.
       if (sup.lastPlainTurnKey === turnKey) return false
@@ -1934,6 +1937,19 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       await supervisorStore.setMode(directory, sid, "reflection")
       return `Supervisor mode set to reflection for session ${sid.slice(0, 8)}…. The supervisor will run the normal completion judge on idle.`
     }
+    // DEPRECATED: 'goal' is no longer a mode — a goal is an orthogonal session
+    // attribute. Accept it as an alias that sets reflection (the mode that
+    // VERIFIES a goal) and keeps any existing goal, so stale skills/commands
+    // that still pass mode:"goal" do not hard-error.
+    if (requestedMode === "goal") {
+      await supervisorStore.setMode(directory, sid, "reflection")
+      const st = await supervisorStore.load(directory, sid)
+      const hasGoal = st?.goal?.status === "active"
+      return `'goal' is no longer a mode — a goal is a session attribute. Mode set to reflection for session ${sid.slice(0, 8)}…` +
+        (hasGoal
+          ? ` (existing goal kept and will be verified: "${st.goal?.condition}").`
+          : `. Set a goal with supervisor_goal { condition: "…" }.`)
+    }
     // Filler-tolerant, same as the enable-axis above: the runtime may send
     // `action: ""`/"null" for a request that only carried a mode.
     const action = requestedAction || "status"
@@ -2114,7 +2130,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
       if (projectCondition) {
         return `No session goal set, but a project-level goal exists (.agents/supervisor/Goal.md or goal.md): "${projectCondition}". Reflection mode will already enforce it; call supervisor_goal with an explicit condition to set a session-level goal instead.`
       }
-      // Binding contract (align-supervisor-modes): goal mode invoked with no
+      // Binding contract (align-supervisor-modes): a set-goal request with no
       // condition AND no existing session/project goal MUST attempt an LLM
       // derivation rather than silently no-op-ing. On any failure/invalid
       // result, do NOT fabricate a default — ask the user to set one.
@@ -2131,7 +2147,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   /**
-   * Derive a concise, falsifiable goal via LLM when goal mode is invoked
+   * Derive a concise, falsifiable goal via LLM when a set-goal request is made
    * with no condition and nothing is set yet (see deriveGoalWithLLM above
    * for the model cascade / ephemeral-session plumbing, and
    * core/goal.mjs's buildGoalDerivationPrompt / parseDerivedGoalResponse for
@@ -2278,14 +2294,16 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
 
     await supervisorStore.mutate(directory, sid, (s) => {
       s.loopExit = { turnKey, reason, detail, at }
-      // NEVER `delete s.goal` here. setAutopilot(false) routes through
-      // setMode("reflection"), which drops the goal — the exact footgun that
-      // was found live in the now-deleted predecessor exit tool (it called
+      // NEVER `delete s.goal` here. Historically setAutopilot(false) routed
+      // through setMode("reflection"), which used to drop the goal — the exact
+      // footgun found live in the now-deleted predecessor exit tool (it called
       // setAutopilot(false) unconditionally and silently destroyed an active
-      // goal; see AGENTS.md's stop-mechanism section). A goal is a long-lived
-      // user intent; "this turn's loop is over" says nothing about it. Only an
-      // explicit "stuck" pauses it, and even then the condition is kept so
-      // the user can see and resume it.
+      // goal; see AGENTS.md's stop-mechanism section). setMode no longer drops
+      // a goal (a goal is an orthogonal attribute, not a mode), but we still
+      // write the enable/mode state directly here so this path can never
+      // regress into dropping it. A goal is a long-lived user intent; "this
+      // turn's loop is over" says nothing about it. Only an explicit "stuck"
+      // pauses it, and even then the condition is kept so the user can resume.
       if (reason === "stuck" && s.goal && s.goal.status === "active") {
         s.goal = { ...s.goal, status: "paused", lastReason: withResumeHint(detail || "agent reported stuck") }
       }
@@ -2571,13 +2589,15 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         const turnKey = lastUserMsgId
 
         // Supervisor goal/retry state, loaded BEFORE the budget gate: the gate
-        // needs the mode (goal/autopilot get the higher budget) and the
-        // `/supervisor retry N` override. Cheap — one small local JSON read —
-        // and it lets an already-spent turn bail before paying for
-        // buildTaskContext and the judge round-trip.
+        // needs the mode and the `/supervisor retry N` override. Cheap — one
+        // small local JSON read — and it lets an already-spent turn bail before
+        // paying for buildTaskContext and the judge round-trip.
         const sup = await supervisorStore.load(directory, sessionId)
         const mode = resolveSupervisorMode(sup) as SupervisorMode
-        let goal = mode === "goal" && sup.goal && sup.goal.status === "active" ? sup.goal : null
+        // A goal is an orthogonal attribute now, NOT a mode: it is recognised in
+        // BOTH modes. In reflection the judge grades against it; in autopilot it
+        // rides along as CONTEXT on the nudge (never verified — accepted).
+        let goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
         const effectiveMaxAttempts = resolveTurnMaxAttempts({
           mode,
           sessionOverride: sup.maxAttempts,
@@ -2830,7 +2850,17 @@ Continue now.`
           // off` silences the directive on BOTH runtimes. Before this, the
           // opencode nudge appended it unconditionally and the toggle was a
           // half-truth.
-          const nudge = isStatusDiagramEnabled(sup) ? appendStatusDirective(baseNudge) : baseNudge
+          //
+          // A goal rides along as CONTEXT here (never verified — autopilot has
+          // no judge; accepted reduction in guarantee). Prefer the session
+          // goal; fall back to a project-level goal so autopilot honours the
+          // same standing objective reflection would. appendGoalContextToNudge
+          // is a no-op when there is no goal, so this is safe unconditionally.
+          const nudgeGoalCondition = goal
+            ? goal.condition
+            : resolveProjectGoalForSession(messages || [], directory)
+          const baseNudgeWithGoal = appendGoalContextToNudge(baseNudge, nudgeGoalCondition)
+          const nudge = isStatusDiagramEnabled(sup) ? appendStatusDirective(baseNudgeWithGoal) : baseNudgeWithGoal
 
           await showToast(client, directory, `Autopilot continuing (${autopilotAttempt}/${effectiveMaxAttempts})`, "info")
           try {
@@ -2860,7 +2890,10 @@ Continue now.`
         // the condition we actually judged (see retireProjectGoal's safety
         // rule in core/goal.mjs).
         let injectedProjectGoalCondition = ""
-        if (mode === "reflection" && !goal) {
+        // Only autopilot returns before here, so this path is reflection; a
+        // session goal (if any) already populated goalSection above, so only
+        // fall back to the project goal when there is no session goal.
+        if (!goal) {
           const cond = resolveProjectGoalForSession(messages || [], directory)
           if (cond) {
             injectedProjectGoalCondition = cond
@@ -3105,7 +3138,10 @@ Continue now.`
             // "continue": DO NOT persist the attempts++ here. Stash it and only
             // write it after a continuation is actually injected (post-promptAsync
             // success). Any early-return below leaves goal.attempts unchanged.
-            pendingGoalContinue = { ...sup, mode: "goal", autopilot: false, goal: t.goal }
+            // Only `.goal` is later persisted (see pendingGoalContinue use), so
+            // `mode` here is inert bookkeeping — keep it as the current mode
+            // (reflection; a goal is no longer a mode).
+            pendingGoalContinue = { ...sup, mode: "reflection", autopilot: false, goal: t.goal }
           }
         }
 

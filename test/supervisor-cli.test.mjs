@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { statePath } from '../core/session-store.mjs';
+import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPERVISOR = path.join(HERE, '..', 'bin', 'supervisor.mjs');
@@ -266,25 +267,29 @@ test('supervisor-goal.mjs shim: node bin/supervisor-goal.mjs goal "x" sets a goa
   assert.ok(state?.goal?.condition?.includes('ship it via shim'), 'goal condition should be persisted');
 });
 
-// ── 12. autopilot-on with active goal → warning printed, mode becomes autopilot ──
+// ── 12. autopilot-on with active goal → goal KEPT as context, mode autopilot ──
 
-test('autopilot on with active goal → prints goal-clear warning; mode becomes autopilot', () => {
+test('autopilot on with active goal → goal is KEPT as context; mode becomes autopilot', () => {
   const tmp = mktmp();
   const sid = 'cli-test-ap-goal-warn';
   writeSession(tmp, sid);
 
-  // Set an active goal first
+  // Set an active goal first (forces reflection — the verifying mode)
   runSupervisor(tmp, ['goal', 'ship it']);
 
-  // Now switch to autopilot — should warn about goal being cleared
+  // Now switch to autopilot — a mode switch NEVER drops a goal any more. The
+  // goal is kept as CONTEXT (autopilot does not run the judge, so it is not
+  // verified — an accepted reduction in guarantee).
   const { stdout } = runSupervisor(tmp, ['autopilot', 'on']);
-  assert.match(stdout, /⚠.*Clearing active goal.*ship it/i);
+  assert.match(stdout, /Goal kept as CONTEXT/i);
+  assert.match(stdout, /ship it/i);
   assert.match(stdout, /mode:\s*autopilot/i);
 
-  // State should be autopilot, no goal
+  // State should be autopilot WITH the goal still intact.
   const state = loadGoalState(tmp, sid);
   assert.equal(state?.mode, 'autopilot');
-  assert.equal(state?.goal, undefined);
+  assert.equal(state?.goal?.condition, 'ship it');
+  assert.equal(state?.goal?.status, 'active');
 });
 
 // ── Autopilot hook tests (via supervisor-on-stop.mjs) ───────────────────────────────────
@@ -381,4 +386,60 @@ test('autopilot mode + AUTOPILOT_EXIT mentioned inline mid-sentence → supervis
   const state = loadGoalState(tmp, sid);
   const mode = state?.mode ?? (state?.autopilot ? 'autopilot' : 'reflection');
   assert.equal(mode, 'autopilot', 'autopilot should still be active when token only appears inline');
+});
+
+// ── TWO-MODES CONTRACTS ─────────────────────────────────────────────────────
+// A goal is an orthogonal ATTRIBUTE now, not a mode. These pin the new
+// behaviour on the Claude Code runtime.
+
+test('two-modes: autopilot + active goal → nudge CONTAINS the goal condition and the judge is NOT invoked', () => {
+  const tmp = mktmp();
+  const sid = 'cli-two-modes-ap-goal';
+  writeSession(tmp, sid);
+
+  // Set a goal (forces reflection), then switch to autopilot — the goal is
+  // KEPT as context (the mode switch no longer drops it).
+  runSupervisor(tmp, ['goal', 'all integration tests are green']);
+  runSupervisor(tmp, ['autopilot', 'on']);
+  const st = loadGoalState(tmp, sid);
+  assert.equal(st?.mode, 'autopilot');
+  assert.equal(st?.goal?.condition, 'all integration tests are green');
+
+  const turns = [
+    { type: 'user', message: { role: 'user', content: 'keep building' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'still working' }] } },
+  ];
+  const tp = mkTranscript(tmp, turns);
+  const { code, stdout } = runOnStop({ session_id: sid, cwd: tmp, transcript_path: tp, last_assistant_message: 'still working' });
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block');
+  // Autopilot nudge (no judge) that carries the goal condition as context.
+  assert.match(out.reason, /Autopilot/i, 'must be the autopilot nudge, not a judge feedback message');
+  assert.match(out.reason, /all integration tests are green/, 'the goal condition must be appended to the nudge as context');
+
+  // Judge NOT invoked: the assessment path is the only writer of health.json,
+  // and it runs strictly AFTER the autopilot fast-path returns.
+  assert.equal(
+    fs.existsSync(path.join(tmp, '.supervisor', 'health.json')),
+    false,
+    'autopilot must never run the judge (no health.json signal)'
+  );
+});
+
+test('two-modes: `mode goal` is a DEPRECATED alias → sets reflection, keeps the goal, does not hard-error', () => {
+  const tmp = mktmp();
+  const sid = 'cli-two-modes-deprecated';
+  writeSession(tmp, sid);
+
+  runSupervisor(tmp, ['goal', 'ship the release']);
+  // Deprecated: 'goal' is no longer a mode. Must not error; maps to reflection.
+  const { stdout, status } = runSupervisor(tmp, ['mode', 'goal']);
+  assert.equal(status, 0, 'must not hard-error on the deprecated mode word');
+  assert.match(stdout, /no longer a mode/i);
+  assert.match(stdout, /reflection/i);
+
+  const state = loadGoalState(tmp, sid);
+  assert.equal(state?.mode, 'reflection');
+  assert.equal(state?.goal?.condition, 'ship the release', 'the deprecated alias must KEEP the goal');
 });

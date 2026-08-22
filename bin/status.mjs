@@ -66,12 +66,12 @@ if (cur) {
     line('effective mode', effectiveMode);
     // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
     line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
-    // Goal detail — reported HONESTLY, not just as "effective mode: goal".
-    // resolveSupervisorMode() reads state.mode regardless of goal.status, so
-    // a paused or exhausted goal used to be invisible here: 'effective mode'
-    // alone reads 'goal' either way, which looks exactly like an actively
-    // pushing goal. A goal that stopped and left no visible trace is a dead
-    // end nobody is told about — see AGENTS.md's goal-resume section.
+    // Goal detail — reported HONESTLY as a fact SEPARATE from the mode. A goal
+    // is an orthogonal attribute now (not a mode), so 'effective mode' is only
+    // ever 'autopilot' or 'reflection' and never reveals goal state on its own.
+    // resolveSupervisorMode() ignores goal.status, so a paused or exhausted
+    // goal must be surfaced explicitly here or it becomes a dead end nobody is
+    // told about — see AGENTS.md's goal-resume section.
     if (goalState.goal) {
       const g = goalState.goal;
       line('goal status', g.status);

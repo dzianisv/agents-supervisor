@@ -130,8 +130,14 @@ describe('shouldSkipReflection', () => {
     assert.equal(shouldSkipReflection({ text: 'tldr', mode: 'autopilot' }).skip, false);
   });
 
-  test('ESCAPE HATCH: goal mode is never skipped', () => {
-    assert.equal(shouldSkipReflection({ text: 'tldr', mode: 'goal' }).skip, false);
+  test('an active goal keeps supervising regardless of mode (goal is an attribute, not a mode)', () => {
+    // Under the two-mode model a goal is an ORTHOGONAL attribute. The escape
+    // hatch is driven by hasActiveGoal, not by any 'goal' mode value — a bare
+    // mode:'goal' string is NOT itself an escape (it is a retired mode).
+    assert.equal(shouldSkipReflection({ text: 'tldr', mode: 'goal' }).skip, true);
+    // …but an active goal escapes in either real mode.
+    assert.equal(shouldSkipReflection({ text: 'tldr', mode: 'reflection', hasActiveGoal: true }).skip, false);
+    assert.equal(shouldSkipReflection({ text: 'tldr', mode: 'autopilot', hasActiveGoal: true }).skip, false);
   });
 
   test('reflection mode with no goal follows the classifier', () => {

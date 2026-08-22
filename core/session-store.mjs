@@ -227,6 +227,28 @@ function readJsonSync(file) {
 }
 
 /**
+ * Forward-migrate a persisted state's `mode` field to the TWO-mode model.
+ *
+ * 'goal' is no longer a supervisor mode — a goal is an orthogonal ATTRIBUTE
+ * of the session (`state.goal`). ~20 sessions on disk (and legacy
+ * goals/<id>.json files) still carry `mode:'goal'`; a session that loads with
+ * it must NOT break and must NOT lose its goal. Map it to 'reflection' (the
+ * mode that actually verifies a goal) and leave `state.goal` completely
+ * untouched. This is the ONE place that owns load/migration, so both the
+ * new-layout read path and the legacy-fold path go through it.
+ *
+ * Pure: returns the same object (mutated in place) or a shallow copy is not
+ * needed — callers pass a freshly-parsed object. Any non-'goal' mode, and an
+ * absent mode, are left exactly as-is.
+ */
+export function normalizeLoadedState(state) {
+  if (state && typeof state === 'object' && state.mode === 'goal') {
+    state.mode = 'reflection';
+  }
+  return state;
+}
+
+/**
  * Fold the four legacy per-session files into one new-layout state object.
  * Returns null when the session has no legacy footprint at all.
  *
@@ -261,6 +283,10 @@ export function readLegacyState(cwd, sessionId) {
 function migrateLegacySession(cwd, sessionId) {
   const legacy = readLegacyState(cwd, sessionId);
   if (!legacy) return null;
+  // Normalise the retired `mode:'goal'` → 'reflection' BEFORE persisting the
+  // migrated file, so the on-disk copy is written once in the new shape (the
+  // goal object itself is preserved verbatim).
+  normalizeLoadedState(legacy);
   try {
     atomicWriteFileSync(statePath(cwd, sessionId), JSON.stringify(legacy, null, 2));
   } catch { /* keep serving the in-memory legacy value */ }
@@ -290,9 +316,9 @@ export const sessionStore = {
     let p;
     try { p = statePath(cwd, sessionId); } catch { return {}; }
     const current = readJsonSync(p);
-    if (current && typeof current === 'object') return current;
+    if (current && typeof current === 'object') return normalizeLoadedState(current);
     try {
-      return migrateLegacySession(cwd, sessionId) ?? {};
+      return normalizeLoadedState(migrateLegacySession(cwd, sessionId) ?? {});
     } catch {
       return {};
     }

@@ -169,7 +169,9 @@ describe("integration: supervisor goal loop", () => {
     // Read state file
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
-    assert.equal(state.mode, "goal")
+    // Setting a goal forces reflection (the verifying mode) — 'goal' is no
+    // longer a mode; the goal is an orthogonal attribute.
+    assert.equal(state.mode, "reflection")
     assert.equal(state.goal.condition, "all tests pass")
     assert.equal(state.goal.status, "active")
     assert.equal(state.goal.attempts, 0)
@@ -218,16 +220,78 @@ describe("integration: supervisor goal loop", () => {
     assert.ok(result.includes("active"), `Expected 'active' in status, got: ${result}`)
   })
 
-  test("session.idle with active goal injects goal into judge prompt", async () => {
-    const messages = makeMessages()
-    const { client, getEphemeralPrompts } = createMockClient(messages)
+  test("deprecated mode:'goal' via the supervisor tool → sets reflection, keeps the goal, no hard error", async () => {
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin["tool.execute.before"]({ tool: "supervisor_goal", sessionID: SESSION_ID })
 
-    // Write goal state directly (same pattern as no-model-switch test)
+    // Set a goal first.
+    await plugin.tool.supervisor_goal.execute({ condition: "all tests pass" })
+
+    // 'goal' is no longer a mode — the supervisor tool must accept it as a
+    // deprecated alias that maps to reflection and KEEPS the goal.
+    const result = await plugin.tool.supervisor.execute({ mode: "goal" }, { sessionID: SESSION_ID })
+    assert.match(result, /no longer a mode/i, `Expected deprecation notice, got: ${result}`)
+    assert.match(result, /reflection/i)
+
+    const state = sessionStore.load(tmpDir, SESSION_ID)
+    assert.equal(state.mode, "reflection")
+    assert.equal(state.goal?.condition, "all tests pass", "the deprecated alias must KEEP the goal")
+    assert.equal(state.goal?.status, "active")
+  })
+
+  test("autopilot + active goal → nudge CONTAINS the goal condition and the judge is NOT invoked", async () => {
+    const messages = makeMessages()
+    const { client, getEphemeralPrompts, getActiveSessionPrompts } = createMockClient(messages)
+
+    // autopilot + an active goal: the goal rides along as CONTEXT (never
+    // verified — autopilot runs no judge; accepted reduction in guarantee).
     ensureSessionDir(tmpDir, SESSION_ID)
     writeFileSync(
       statePath(tmpDir, SESSION_ID),
       JSON.stringify({
-        mode: "goal",
+        mode: "autopilot",
+        autopilot: true,
+        goal: {
+          condition: "all integration tests are green",
+          status: "active",
+          attempts: 0,
+          tokenBaseline: 0,
+          startedAt: Date.now() - 10000,
+          deadline: Date.now() + 3600000,
+          lastReason: "",
+          lastTurnKey: LAST_USER_MSG_ID
+        }
+      })
+    )
+
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    await new Promise(r => setTimeout(r, 5000))
+
+    // The judge runs in an EPHEMERAL session; autopilot must never spawn one.
+    assert.equal(getEphemeralPrompts().length, 0, "autopilot must NOT invoke the judge (no ephemeral session)")
+
+    // The autopilot nudge is injected into the ACTIVE session and carries the
+    // goal condition as context.
+    const activePrompts = getActiveSessionPrompts()
+    assert.ok(activePrompts.length > 0, "autopilot must inject a continuation nudge")
+    const nudge = activePrompts[activePrompts.length - 1]?.body?.parts?.[0]?.text || ""
+    assert.match(nudge, /Autopilot/i, "must be the autopilot nudge")
+    assert.match(nudge, /all integration tests are green/, "the goal condition must be appended to the nudge as context")
+  })
+
+  test("session.idle with active goal in reflection injects goal into judge prompt", async () => {
+    const messages = makeMessages()
+    const { client, getEphemeralPrompts } = createMockClient(messages)
+
+    // Canonical two-modes state: reflection + an active goal (a goal is an
+    // orthogonal attribute now, not a mode). The judge must grade against it.
+    ensureSessionDir(tmpDir, SESSION_ID)
+    writeFileSync(
+      statePath(tmpDir, SESSION_ID),
+      JSON.stringify({
+        mode: "reflection",
         autopilot: false,
         goal: {
           condition: "all tests pass",
@@ -314,7 +378,9 @@ describe("integration: supervisor goal loop", () => {
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active at the per-turn cap, got: ${state.goal.status}`)
-    assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
+    // Loaded mode is reflection: the seeded legacy mode:"goal" is migrated
+    // forward on load, and the goal is recognised as an attribute regardless.
+    assert.equal(state.mode, "reflection", `Mode must be reflection (goal is an attribute now), got: ${state.mode}`)
 
     // No continuation should have been injected to the active session
     const activePrompts = getActiveSessionPrompts()
@@ -359,7 +425,7 @@ describe("integration: supervisor goal loop", () => {
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active after the per-turn reset, got: ${state.goal.status}`)
-    assert.equal(state.mode, "goal", `Mode must stay goal, got: ${state.mode}`)
+    assert.equal(state.mode, "reflection", `Mode must be reflection (goal is an attribute now), got: ${state.mode}`)
     assert.equal(
       state.goal.lastTurnKey,
       LAST_USER_MSG_ID,

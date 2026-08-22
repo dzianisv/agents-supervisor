@@ -114,7 +114,7 @@ describe("statusDirective opt-out reaches the reflection path", () => {
       "opencode runtime must pass isStatusDiagramEnabled into buildEscalatingFeedback"
     )
     assert.ok(
-      /isStatusDiagramEnabled\(sup\)\s*\?\s*appendStatusDirective\(baseNudge\)/.test(oc),
+      /isStatusDiagramEnabled\(sup\)\s*\?\s*appendStatusDirective\(baseNudgeWithGoal\)/.test(oc),
       "opencode autopilot nudge must honour the same toggle the CC nudge does"
     )
   })
