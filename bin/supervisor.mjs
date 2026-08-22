@@ -262,7 +262,7 @@ switch (cmd.kind) {
     console.log(`mode: ${cmd.mode}`);
     if (cmd.mode === 'autopilot') {
       console.log(
-        `Autopilot on — supervisor will auto-continue without judge until you output AUTOPILOT_EXIT or budget runs out.\n` +
+        `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line) or budget runs out.\n` +
         `Budget: ${budget} attempts.`
       );
     } else if (cmd.mode === 'reflection') {
@@ -280,7 +280,7 @@ switch (cmd.kind) {
     const budget = resolveMaxAttempts({ sessionOverride: goalStore.load(cwd, sid).maxAttempts });
     console.log('mode: autopilot');
     console.log(
-      `Autopilot on — supervisor will auto-continue without judge until you output AUTOPILOT_EXIT or budget runs out.\n` +
+      `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line) or budget runs out.\n` +
       `Budget: ${budget} attempts.`
     );
     break;

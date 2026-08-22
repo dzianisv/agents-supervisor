@@ -17,7 +17,7 @@ This is the **default** mode. Use it to return from `autopilot` or `goal` mode. 
 |---|---|---|
 | **reflection** (default) | `/supervisor:reflection` | Judge runs patterns/antipatterns; injects `Goal.md` if present |
 | **goal** | `/supervisor:set-goal <condition>` | Keeps pushing until the specific condition is met |
-| **autopilot** | `/supervisor:autopilot` | Skips judge entirely; always continues until `AUTOPILOT_EXIT` |
+| **autopilot** | `/supervisor:autopilot` | Skips judge entirely; always continues until `SUPERVISOR_LOOP_EXIT: completed` |
 
 Note: `/supervisor:off` and `/supervisor:on` are **not** modes — they enable/disable the supervisor for the current session only.
 

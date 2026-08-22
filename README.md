@@ -75,7 +75,7 @@ Inside any Claude Code session, use any of these commands:
 - `/supervisor:train` — learn from your sessions (updates your local patterns)
 - `/supervisor:set-goal <condition>` — set a mandatory completion condition; agent continues until the goal is met (budget resets each human turn)
 - `/supervisor:retry N` — set the per-turn retry budget (1–100, default 16)
-- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `AUTOPILOT_EXIT` or budget exhaustion
+- `/supervisor:autopilot` — skip the judge, auto-continue on every idle until `SUPERVISOR_LOOP_EXIT: completed` or budget exhaustion
 - `/supervisor:reflection` — return to default completion-judge mode
 - `/supervisor:on` — re-enable for this session
 - `/supervisor:off` — disable for this session
@@ -130,7 +130,7 @@ The supervisor has three public modes, available on both Claude Code and OpenCod
 |---|---|---|
 | `reflection` | `/supervisor:reflection` | Default. Runs the normal completion judge on idle. |
 | `goal` | `/supervisor:set-goal <condition>` | Adds a mandatory completion condition and keeps pushing until it is met. The retry budget bounds one human turn, then resets when you speak again. |
-| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until `AUTOPILOT_EXIT` is called or budget exhaustion. |
+| `autopilot` | `/supervisor:autopilot` | Skips the judge and continues on every idle until the agent declares `supervisor_loop_exit` (OpenCode tool) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or budget exhaustion. |
 
 The effective default mode is `reflection`.
 
@@ -250,12 +250,12 @@ prescriptive nudge to keep working.
 
 For web app / OpenCode API, call tools directly:
 - `supervisor_autopilot` — toggle on/off (`enabled: true | false`)
-- `autopilot_exit` — the agent calls this when work is genuinely complete
+- `supervisor_loop_exit` — the agent calls this with `reason: 'completed'` when work is genuinely complete
 
 **Autopilot semantics:**
 - Agent continues on every idle **unconditionally** (no judge evaluation)
 - Judge is **bypassed entirely** — no latency from scoring/reflection
-- Agent must call `AUTOPILOT_EXIT` to signal work is complete
+- Agent must call `supervisor_loop_exit` (OpenCode) / output `SUPERVISOR_LOOP_EXIT: completed` alone on its own line (Claude Code) to signal work is complete
 - Or the supervisor stops if the retry budget exhausts (default 16, configurable via `/supervisor:retry N`)
 - Safety rails still apply: attempt budget, destructive-action flagging
 
@@ -265,7 +265,7 @@ For web app / OpenCode API, call tools directly:
 |---|---|---|
 | Judge evaluation | Yes (self-assessment + optional cross-model) | No (skipped entirely) |
 | Continuation trigger | Judge says "not done" | Every idle (unconditional) |
-| Stop condition | Goal met (or 30-day deadline) | Agent calls `autopilot_exit` or budget exhausted |
+| Stop condition | Goal met (or 30-day deadline) | Agent calls `supervisor_loop_exit` / outputs `SUPERVISOR_LOOP_EXIT: completed`, or budget exhausted |
 | Latency per cycle | 5–15s (judge round-trip) | <1s (direct nudge) |
 
 **Safety rails still apply** — even in autopilot mode:

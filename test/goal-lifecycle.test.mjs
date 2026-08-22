@@ -343,13 +343,17 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     );
   });
 
-  // Live-validation finding (test/live-validation.mjs scenario 9): `autopilot_exit`
-  // is registered plugin-wide, so it is in the tool catalog of EVERY session,
-  // including goal-mode ones. It used to call setAutopilot(false)
-  // unconditionally, which routes through setMode('reflection') ->
-  // `delete state.goal` — so one stray tool call destroyed the user's active
-  // goal, silently. Exiting a mode you are not in must be a no-op.
-  test('autopilot_exit is a no-op outside autopilot mode (it must not delete an active goal)', async () => {
+  // Live-validation finding (test/live-validation.mjs scenario 9): the
+  // predecessor `autopilot_exit` tool was registered plugin-wide, so it was
+  // in the tool catalog of EVERY session, including goal-mode ones. It used
+  // to call setAutopilot(false) unconditionally, which routes through
+  // setMode('reflection') -> `delete state.goal` — so one stray tool call
+  // destroyed the user's active goal, silently. That tool is now DELETED
+  // (opencode/supervisor-impl.ts) — `supervisor_loop_exit` is the one
+  // remaining exit signal, and this pins that it inherited the same
+  // protection: exiting a mode you are not in must be a no-op with respect
+  // to autopilot/goal state.
+  test('supervisor_loop_exit is a no-op on autopilot state outside autopilot mode (it must not delete an active goal)', async () => {
     // 1. The destructive primitive is real: setMode away from 'goal' drops the goal.
     const cwd = mkdtempSync(join(tmpdir(), 'sup-autopilot-exit-'));
     try {
@@ -359,24 +363,33 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
       assert.equal(
         goalStore.load(cwd, 'ses_autopilot_exit_probe').goal,
         undefined,
-        'setMode away from goal drops the goal — this is the primitive autopilot_exit used to call blindly'
+        'setMode away from goal drops the goal — this is the primitive the deleted autopilot_exit tool used to call blindly'
       );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
 
-    // 2. …so the tool must check the mode first.
+    // 2. The predecessor tool must be gone entirely — one signal, not two.
     const raw = await readFile(join(ROOT, 'opencode', 'supervisor-impl.ts'), 'utf-8');
     const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
-    const exitFn = src.slice(src.indexOf('const executeAutopilotExit'), src.indexOf('let setSupervisorTool'));
-    assert.ok(exitFn.length > 0, 'could not locate executeAutopilotExit');
     assert.ok(
-      /resolveSupervisorMode\(state\) === "autopilot"/.test(exitFn),
-      'autopilot_exit must only change state when autopilot is actually on'
+      !/\bexecuteAutopilotExit\b/.test(src) && !/\bautopilot_exit\b/.test(src),
+      'the predecessor autopilot_exit tool must be fully removed, not left dead alongside supervisor_loop_exit'
+    );
+
+    // 3. …so the surviving `supervisor_loop_exit` tool must check the mode
+    // before touching autopilot state, and must never delete the goal.
+    const exitFn = src.slice(src.indexOf('const executeSupervisorLoopExit'), src.indexOf('let setSupervisorTool'));
+    assert.ok(exitFn.length > 0, 'could not locate executeSupervisorLoopExit');
+    const setAutopilotCalls = exitFn.match(/setAutopilot\(directory, sid, false\)/g) || [];
+    assert.equal(setAutopilotCalls.length, 1, 'expected exactly one setAutopilot(false) call in supervisor_loop_exit');
+    assert.ok(
+      /if \(mode === "autopilot"\)\s*\{[\s\S]*?setAutopilot\(directory, sid, false\)/.test(exitFn),
+      'supervisor_loop_exit must only call setAutopilot(false) inside a mode === "autopilot" check'
     );
     assert.ok(
-      !/^\s*await supervisorStore\.setAutopilot\(directory, sid, false\)\s*$/m.test(exitFn.replace(/if \([^)]*\) \{[\s\S]*/, '')),
-      'autopilot_exit must not call setAutopilot unconditionally'
+      !/delete\s+s(tate)?\.goal/.test(exitFn),
+      'supervisor_loop_exit must never delete the goal outright — this is the exact footgun the deleted tool caused'
     );
   });
 

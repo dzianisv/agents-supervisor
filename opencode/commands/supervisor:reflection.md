@@ -17,7 +17,7 @@ After it returns, relay the response. Add context for the user:
 - **goal**: set with `/supervisor:set-goal <condition>`; keeps pushing until that
   specific condition is met.
 - **autopilot**: set with `/supervisor:autopilot on`; skips the judge and always
-  continues until the agent calls `autopilot_exit`.
+  continues until the agent calls `supervisor_loop_exit`.
 
 `/supervisor:on` / `/supervisor:off` are **not** modes — they enable/disable the
 supervisor for the current session only.

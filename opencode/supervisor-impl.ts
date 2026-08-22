@@ -635,7 +635,7 @@ const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "superviso
 // Last-resort fallback when no model is configured. Uses a free opencode model
 // to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
 const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
-const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "autopilot_exit", "supervisor_loop_exit", "set_supervisor"])
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_autopilot", "supervisor_loop_exit", "set_supervisor"])
 
 export function trackSessionScopedToolSession(
   currentSessionId: string | null,
@@ -1901,7 +1901,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
 
     if (requestedMode === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
-      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     if (requestedMode === "reflection") {
       await supervisorStore.setMode(directory, sid, "reflection")
@@ -1934,7 +1934,7 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     }
     if (action === "autopilot") {
       await supervisorStore.setMode(directory, sid, "autopilot")
-      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Supervisor mode set to autopilot for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     if (action === "reflection") {
       await supervisorStore.setMode(directory, sid, "reflection")
@@ -2136,14 +2136,14 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
   }
 
   // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
-  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call autopilot_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
+  const supervisorAutopilotDescription = "Toggle autopilot mode. In autopilot mode, the supervisor automatically continues the session after each idle, without running the judge evaluation. The agent must call supervisor_loop_exit to stop. Usage: call with enabled=true to start autopilot, enabled=false to stop."
   const executeSupervisorAutopilot = async (args: { enabled: boolean }, context?: any) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then toggle autopilot."
     currentSessionId = sid
     await supervisorStore.setAutopilot(directory, sid, args.enabled)
     if (args.enabled) {
-      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call autopilot_exit when work is complete.`
+      return `Autopilot enabled for session ${sid.slice(0, 8)}…. The supervisor will automatically continue after each idle without judge evaluation. Call supervisor_loop_exit when work is complete.`
     }
     return `Autopilot disabled for session ${sid.slice(0, 8)}….`
   }
@@ -2235,9 +2235,11 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
     await supervisorStore.mutate(directory, sid, (s) => {
       s.loopExit = { turnKey, reason, detail, at }
       // NEVER `delete s.goal` here. setAutopilot(false) routes through
-      // setMode("reflection"), which drops the goal — the exact footgun
-      // documented on autopilot_exit below. A goal is a long-lived user
-      // intent; "this turn's loop is over" says nothing about it. Only an
+      // setMode("reflection"), which drops the goal — the exact footgun that
+      // was found live in the now-deleted predecessor exit tool (it called
+      // setAutopilot(false) unconditionally and silently destroyed an active
+      // goal; see AGENTS.md's stop-mechanism section). A goal is a long-lived
+      // user intent; "this turn's loop is over" says nothing about it. Only an
       // explicit "stuck" pauses it, and even then the condition is kept so
       // the user can see and resume it.
       if (reason === "stuck" && s.goal && s.goal.status === "active") {
@@ -2263,44 +2265,6 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         }
   }
 
-  // autopilot_exit tool — signal that autopilot work is complete
-  const autopilotExitDescription = `Use this tool when autopilot work is complete and you are ready to hand control back to build mode.
-Call this tool:
-- After finishing the autonomous implementation task
-- When you are ready to provide a final concise summary
-Do NOT call this tool:
-- Before implementation work is complete
-- If you still need to run more tools to finish the task`
-  const executeAutopilotExit = async (_args?: any, context?: any) => {
-    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
-    if (sid) {
-      currentSessionId = sid
-      // Only touch the mode if autopilot is actually on.
-      //
-      // This tool is registered plugin-wide, so it sits in the tool catalog of
-      // EVERY session, including goal-mode ones. Unconditionally calling
-      // setAutopilot(false) routes through setMode("reflection"), which does
-      // `delete state.goal` (core/goal.mjs) — so a model that calls
-      // autopilot_exit while a goal is active silently destroys the user's
-      // goal, with no warning and no log line. Hit for real while building
-      // test/live-validation.mjs scenario 9. Exiting a mode you are not in is
-      // a no-op, not a state reset.
-      const state = await supervisorStore.load(directory, sid)
-      if (resolveSupervisorMode(state) === "autopilot") {
-        // Thin wrapper over the loop-exit logic (which also disarms
-        // autopilot), so the two tools cannot diverge.
-        await executeSupervisorLoopExit({ reason: "completed", detail: "autopilot_exit" }, context)
-      } else {
-        debug("autopilot_exit called while not in autopilot mode — no state change for", sid)
-        return {
-          title: "Not in autopilot",
-          output: "Autopilot is not active for this session — nothing to exit. Supervisor state left unchanged.",
-        }
-      }
-    }
-    return { title: "Exited autopilot", output: "Autopilot completed." }
-  }
-
   let setSupervisorTool: any = null
   let supervisorToggleTool: any = null
   let supervisorTrainTool: any = null
@@ -2308,7 +2272,6 @@ Do NOT call this tool:
   let supervisorRetryTool: any = null
   let supervisorAutopilotTool: any = null
   let supervisorAutoreviewTool: any = null
-  let autopilotExitTool: any = null
   let supervisorLoopExitTool: any = null
   try {
     const { tool } = await import("@opencode-ai/plugin/tool")
@@ -2368,11 +2331,6 @@ Do NOT call this tool:
         enabled: tool.schema.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
       },
       execute: executeSupervisorAutoreview as any
-    })
-    autopilotExitTool = tool({
-      description: autopilotExitDescription,
-      args: {},
-      execute: executeAutopilotExit as any
     })
     supervisorLoopExitTool = tool({
       description: supervisorLoopExitDescription,
@@ -2450,11 +2408,6 @@ Do NOT call this tool:
         },
         execute: executeSupervisorAutoreview
       }
-      autopilotExitTool = {
-        description: autopilotExitDescription,
-        args: {},
-        execute: executeAutopilotExit
-      }
       supervisorLoopExitTool = {
         description: supervisorLoopExitDescription,
         args: {
@@ -2478,7 +2431,6 @@ Do NOT call this tool:
       supervisorRetryTool = { description: supervisorRetryDescription, args: {}, execute: executeSupervisorRetry }
       supervisorAutopilotTool = { description: supervisorAutopilotDescription, args: {}, execute: executeSupervisorAutopilot }
       supervisorAutoreviewTool = { description: supervisorAutoreviewDescription, args: {}, execute: executeSupervisorAutoreview }
-      autopilotExitTool = { description: autopilotExitDescription, args: {}, execute: executeAutopilotExit }
       supervisorLoopExitTool = { description: supervisorLoopExitDescription, args: {}, execute: executeSupervisorLoopExit }
     }
   }
@@ -3421,7 +3373,7 @@ Call the tool now. Do not explain, just execute the tool call.`
         reportError(e, { plugin: "supervisor-3", op: "status-directive-system" })
       }
     },
-    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || autopilotExitTool) ? {
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorAutopilotTool || supervisorLoopExitTool) ? {
       ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
       ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
       ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
@@ -3429,7 +3381,6 @@ Call the tool now. Do not explain, just execute the tool call.`
       ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
       ...(supervisorAutopilotTool ? { supervisor_autopilot: supervisorAutopilotTool } : {}),
       ...(supervisorAutoreviewTool ? { supervisor_autoreview: supervisorAutoreviewTool } : {}),
-      ...(autopilotExitTool ? { autopilot_exit: autopilotExitTool } : {}),
       ...(supervisorLoopExitTool ? { supervisor_loop_exit: supervisorLoopExitTool } : {}),
     } : undefined,
     event: async ({ event }: { event: { type: string; properties?: any } }) => {

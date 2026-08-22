@@ -505,15 +505,20 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     // Uses the suite-level fixture `model` — no cooldown needed since the
     // fixture is local and instantaneous (no remote rate limiting to avoid).
 
-    // Proves the real `autopilot_exit` tool (opencode/supervisor-impl.ts,
-    // executeAutopilotExit) round-trips end to end: enabling autopilot makes
-    // the tool available to the model; a plain, non-"/supervisor"
+    // Proves the real `supervisor_loop_exit` tool (opencode/supervisor-impl.ts,
+    // executeSupervisorLoopExit) round-trips end to end: enabling autopilot
+    // makes the tool available to the model; a plain, non-"/supervisor"
     // continuation-style message (standing in for the nudge the plugin's own
     // session.idle handler injects) causes the fixture to call it, the real
     // server executes it, and supervisorStore records autopilot as disabled
     // for the session — the concrete mechanism by which "the agent must call
-    // autopilot_exit to stop" (see the tool's own description string) works.
-    test("autopilot_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
+    // supervisor_loop_exit when work is complete" (see the autopilot tool
+    // description string) works. The predecessor `autopilot_exit` tool has
+    // been deleted (a second tool for the same job that unconditionally
+    // called setAutopilot(false), silently destroying an active goal — see
+    // AGENTS.md's stop-mechanism section); this test covers the same
+    // end-to-end behavior against its replacement.
+    test("supervisor_loop_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
       const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
       assert.equal(createRes.status, 200)
       const session = await createRes.json()
@@ -522,33 +527,37 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       assert.ok(JSON.stringify(enableRes).toLowerCase().includes("autopilot"))
 
       // Plain continuation nudge — no "/supervisor" prefix, tools available.
-      // The fixture routes this to autopilot_exit (see
+      // The fixture routes this to supervisor_loop_exit (see
       // test/helpers/opencode-fixture-llm.mjs), exactly as a real model is
       // instructed to once "genuinely completed ALL work" (see the
-      // autopilotExitDescription / continuation-nudge prompt text in
+      // supervisorLoopExitDescription / continuation-nudge prompt text in
       // opencode/supervisor-impl.ts).
       const exitRes = await sendMessage(baseUrl, session.id, "Continue with the next step.", 120_000, { model })
       const exitContent = JSON.stringify(exitRes).toLowerCase()
       assert.ok(
-        exitContent.includes("exit") || exitContent.includes("autopilot completed"),
-        `Expected autopilot_exit tool round-trip to be reflected in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
+        exitContent.includes("supervisor_loop_exit") && exitContent.includes("supervision loop ended"),
+        `Expected supervisor_loop_exit tool round-trip to be reflected in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
+      )
+      assert.ok(
+        !exitContent.includes("autopilot_exit"),
+        `The deleted autopilot_exit tool must never appear in a tool round-trip. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
       )
 
       // Confirm the mode was actually flipped off server-side (not merely
       // that the tool call text was echoed) by checking status afterward.
-      // executeAutopilotExit -> supervisorStore.setAutopilot(..., false) ->
-      // setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
+      // executeSupervisorLoopExit -> supervisorStore.setAutopilot(..., false)
+      // -> setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
       // (core/goal.mjs), so the status report's "mode:" line must read
       // "reflection", never "autopilot".
       const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 120_000, { model })
       const statusContent = JSON.stringify(statusRes).toLowerCase()
       assert.ok(
         statusContent.includes("mode: reflection"),
-        `Expected mode: reflection after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+        `Expected mode: reflection after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
       )
       assert.ok(
         !statusContent.includes("mode: autopilot"),
-        `Expected autopilot to be disabled after autopilot_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
+        `Expected autopilot to be disabled after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
       )
     })
 
@@ -633,7 +642,7 @@ const ACTIONLESS = -1
  * deterministically.
  *
  * The final `text` branch is deliberately NOT the shipped fixture's fallback,
- * which calls `autopilot_exit` whenever that tool is offered — and it is
+ * which calls `supervisor_loop_exit` whenever that tool is offered — and it is
  * offered plugin-wide, on every session, so the shipped fallback would end an
  * autopilot loop on nudge 1 and silently defeat the autopilot cap test.
  */

@@ -965,7 +965,9 @@ async function main() {
   // (the attempt counter is now just a runaway circuit breaker at
   // RUNAWAY_CEILING=50), and standing down on a repeat of it would strand the
   // session in autopilot — or in an endless loop — forever. `AUTOPILOT_EXIT`
-  // is still honoured, as an alias for `reason: 'completed'`.
+  // is still PARSED as an alias for `reason: 'completed'` (stale installed
+  // skill copies may still emit it), but it is no longer TAUGHT anywhere —
+  // see core/loop-exit.mjs.
   const loopExit = parseLoopExitSentinel(ctx.final_assistant_text);
   const autopilotExiting = !!loopExit;
   let priorReplyHash = null;
@@ -1034,9 +1036,10 @@ async function main() {
   }
 
   // 4a. Autopilot fast-path: skip the judge entirely; inject a "continue" nudge
-  // until the agent emits AUTOPILOT_EXIT or the attempt budget runs out.
+  // until the agent emits SUPERVISOR_LOOP_EXIT or the attempt budget runs out.
   if (mode === 'autopilot' && !goal) {
-    // NOTE: the exit signal (AUTOPILOT_EXIT / SUPERVISOR_LOOP_EXIT) is handled
+    // NOTE: the exit signal (SUPERVISOR_LOOP_EXIT, with a parse-only legacy
+    // AUTOPILOT_EXIT alias for stale installed skill copies) is handled
     // in 4a-0 above, for ALL modes, via the single shared parser.
     const baseVerdict = { session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION };
     const nextAttempt = attempts + 1;
@@ -1045,7 +1048,7 @@ async function main() {
     // the status/roadmap directive rides along with EVERY continuation, on
     // both runtimes. Gated by the same default-on `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
-    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead. The legacy \`AUTOPILOT_EXIT\` is still accepted.\n\nContinue now.`;
+    const baseNudge = `${FEEDBACK_MARKER} Autopilot (${nextAttempt}/${effectiveMax})\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
     const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(baseNudge) : baseNudge;
     writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));

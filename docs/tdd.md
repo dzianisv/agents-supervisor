@@ -172,7 +172,7 @@ never touching the live session.
 breaker; failing to take the lock degrades to last-writer-wins rather than
 blocking a turn.
 
-Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent calls the `autopilot_exit` tool or the attempt budget exhausts.
+Goal mode sets `maxAttempts=16`. Autopilot mode stores `{ autopilot: true }` in the same state file. Autopilot exits when the agent declares the loop over — the `supervisor_loop_exit` tool on OpenCode, the `SUPERVISOR_LOOP_EXIT: completed` text sentinel on Claude Code (Stop hooks have no tool registry) — or the attempt budget exhausts.
 
 ---
 

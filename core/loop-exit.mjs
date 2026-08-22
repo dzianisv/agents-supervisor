@@ -24,6 +24,15 @@ export const LOOP_EXIT_SENTINEL = 'SUPERVISOR_LOOP_EXIT';
  * Backwards-compatible alias. `AUTOPILOT_EXIT` alone on a line predates the
  * sentinel and existing tests/sessions depend on it; it means
  * `reason: 'completed'`.
+ *
+ * PARSE-ONLY: this alias is deliberately no longer TAUGHT anywhere (no nudge,
+ * skill, README, or tool description mentions it) — `SUPERVISOR_LOOP_EXIT` /
+ * `supervisor_loop_exit` is the one signal agents and users are shown. The
+ * regex stays because shipped skills/*.md get copied into a user's
+ * ~/.config and installed copies have lagged shipped fixes before (the 0.3.1
+ * manifest-bump incident); a stale on-disk skill that still teaches the old
+ * token must keep working. Do not remove without a migration story for
+ * already-installed copies.
  */
 const AUTOPILOT_EXIT_RE = /(^|\n)[ \t]*AUTOPILOT_EXIT[ \t]*(\n|$)/;
 
