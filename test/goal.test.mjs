@@ -7,6 +7,7 @@ import {
   resolveSupervisorMode, supervisorStore, SupervisorPlugin,
   trackSessionScopedToolSession,
 } from '../opencode/supervisor-impl.ts';
+import { describeRunawayLimit, RUNAWAY_CEILING } from '../core/goal.mjs';
 import * as runtimeSupervisor from '../opencode/supervisor.ts';
 import { tmpdir } from 'node:os';
 import fs from 'node:fs';
@@ -52,6 +53,15 @@ test('parseSupervisorCommand: goal set/status/clear (+aliases) and retry', () =>
   }
   assert.deepEqual(parseSupervisorCommand('retry', '24'), { kind: 'retry-set', n: 24 });
   assert.deepEqual(parseSupervisorCommand('retry', ''), { kind: 'retry-status' });
+  assert.deepEqual(parseSupervisorCommand('retry', 'status'), { kind: 'retry-status' });
+  // Unlimited opt-out spellings all canonicalise to the string sentinel.
+  for (const u of ['unlimited', 'off', 'none', 'infinite', '0']) {
+    assert.deepEqual(parseSupervisorCommand('retry', u), { kind: 'retry-set', n: 'unlimited' }, u);
+  }
+  // Out-of-range / garbage is rejected LOUDLY, never silently rewritten (2a).
+  for (const bad of ['-5', '3.5', 'abc', '5x']) {
+    assert.deepEqual(parseSupervisorCommand('retry', bad), { kind: 'retry-invalid', raw: bad }, bad);
+  }
 });
 
 test('parseSupervisorCommand: root supervisor supports mode UX', () => {
@@ -94,13 +104,37 @@ test('supervisorStore persists mode and resolves legacy autopilot state', async 
   assert.equal((await supervisorStore.load(d, 's1')).goal, undefined);
 });
 
-test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (50), clamped [1,100]', () => {
-  assert.equal(resolveRunawayLimit({ env: {} }), 50);              // default = RUNAWAY_CEILING
+test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (64), positive ints honoured verbatim (no clamp), unlimited opt-out', () => {
+  assert.equal(resolveRunawayLimit({ env: {} }), RUNAWAY_CEILING); // default = RUNAWAY_CEILING
+  assert.equal(RUNAWAY_CEILING, 64);                               // pin the derived default
   assert.equal(resolveRunawayLimit({ config: 8, env: {} }), 8);
   assert.equal(resolveRunawayLimit({ sessionOverride: 5, config: 8, env: {} }), 5);
-  assert.equal(resolveRunawayLimit({ sessionOverride: 999, env: {} }), 100); // clamp high
-  assert.equal(resolveRunawayLimit({ sessionOverride: 0, env: {} }), 1);     // clamp low
-  assert.equal(resolveRunawayLimit({ sessionOverride: NaN, env: {} }), 50);  // non-finite → default
+  // A number the operator typed is honoured verbatim — NO upper clamp (2a).
+  assert.equal(resolveRunawayLimit({ sessionOverride: 999, env: {} }), 999);
+  // 0 / unlimited spellings = no cap (Infinity), NOT "1 attempt".
+  assert.equal(resolveRunawayLimit({ sessionOverride: 0, env: {} }), Infinity);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 'unlimited', env: {} }), Infinity);
+  // Invalid values fall THROUGH to the next tier rather than disabling the loop.
+  assert.equal(resolveRunawayLimit({ sessionOverride: NaN, env: {} }), RUNAWAY_CEILING);
+  assert.equal(resolveRunawayLimit({ sessionOverride: -5, env: {} }), RUNAWAY_CEILING);
+  assert.equal(resolveRunawayLimit({ sessionOverride: 3.5, config: 12, env: {} }), 12);
+});
+
+test('describeRunawayLimit: reports tier + honours/rejects/opts-out + platform cap', () => {
+  assert.deepEqual(
+    (({ limit, tier, unlimited, cappedByPlatform }) => ({ limit, tier, unlimited, cappedByPlatform }))(describeRunawayLimit({ env: {} })),
+    { limit: 64, tier: 'default', unlimited: false, cappedByPlatform: false });
+  assert.equal(describeRunawayLimit({ sessionOverride: 5, env: {} }).tier, 'retry');
+  assert.equal(describeRunawayLimit({ config: 32, env: {} }).tier, 'config');
+  assert.equal(describeRunawayLimit({ env: { SUPERVISOR_MAX_ATTEMPTS: '40' } }).tier, 'env');
+  // unlimited requested but a platform hardCap physically can't honour it → capped, and it SAYS so.
+  const cc = describeRunawayLimit({ sessionOverride: 'unlimited', hardCap: 7, env: {} });
+  assert.equal(cc.limit, 7);
+  assert.equal(cc.cappedByPlatform, true);
+  assert.equal(cc.unlimited, true);
+  assert.equal(cc.requested, Infinity);
+  // finite-but-too-high also capped by the platform.
+  assert.equal(describeRunawayLimit({ sessionOverride: 100, hardCap: 7, env: {} }).cappedByPlatform, true);
 });
 
 test('decideGoalTransition: exhausted > achieved > continue', () => {

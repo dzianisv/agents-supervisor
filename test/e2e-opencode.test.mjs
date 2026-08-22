@@ -789,6 +789,40 @@ async function settleInjections(baseUrl, sessionId, { quietMs = 15_000, timeoutM
   throw new Error(`injections never settled (last=${last}) within ${timeoutMs}ms`)
 }
 
+/**
+ * Wait until the injection count REACHES `target`, then return it.
+ *
+ * Used only by the `unlimited` test, where the stop is the JUDGE (at a known
+ * injection number), not a finite runaway cap. `settleInjections`' fixed quiet
+ * window cannot prove "reached N": a single inter-injection gap wider than the
+ * window makes it declare "settled" mid-loop and undercount — harmless for a
+ * finite budget (the loop has already stopped), fatal here where the loop is
+ * still running. This instead polls until the count climbs to `target`, and a
+ * `stallMs` guard throws if it plateaus below it — which is EXACTLY the failure
+ * a finite cap (e.g. the reverted `unlimited → 1`) produces, so the test stays
+ * sensitive: a capped loop stalls under target and this throws.
+ */
+async function waitForInjectionCount(baseUrl, sessionId, target, { fromIndex = 0, timeoutMs = 480_000, stallMs = 60_000 } = {}) {
+  let count = await countInjections(baseUrl, sessionId, fromIndex)
+  let lastChange = Date.now()
+  const deadline = Date.now() + timeoutMs
+  while (count < target && Date.now() < deadline) {
+    await sleep(500)
+    const n = await countInjections(baseUrl, sessionId, fromIndex)
+    if (n !== count) {
+      count = n
+      lastChange = Date.now()
+    } else if (Date.now() - lastChange >= stallMs) {
+      throw new Error(
+        `injections stalled at ${count} (< target ${target}) for ${stallMs}ms — ` +
+        `the loop was capped below the unlimited target instead of running to the judge's completion`
+      )
+    }
+  }
+  if (count < target) throw new Error(`injections reached only ${count} of target ${target} within ${timeoutMs}ms`)
+  return count
+}
+
 describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH", timeout: 1_800_000 }, () => {
   let server
   let baseUrl
@@ -835,7 +869,7 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
    * Drive one human turn on a fresh session with a given retry budget and
    * return how many times the supervisor injected.
    */
-  async function runTurn({ budget, probe, complete = Infinity, autopilot = false }) {
+  async function runTurn({ budget, probe, complete = Infinity, autopilot = false, waitTarget = null, stopAfterTarget = false, waitStallMs = 60_000 }) {
     completeAfter.set(probe, complete)
     const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
 
@@ -855,7 +889,18 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
     const startIndex = (await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()).length
 
     await sendMessage(baseUrl, session.id, actionableTask(probe), 180_000, { model })
-    const injections = await settleInjections(baseUrl, session.id, { fromIndex: startIndex })
+    // `waitTarget` proves the loop CLIMBS to a target injection count before we
+    // judge it stopped — a finite cap would stall below it. `stopAfterTarget`
+    // is for the UNLIMITED case: the loop never stops on its own (no ceiling,
+    // judge never completes), so once it has proven it ran past `waitTarget` we
+    // end the turn ourselves with `/supervisor off` (the disabled gate, which
+    // plain-returns on every subsequent idle) rather than waiting forever.
+    if (waitTarget != null) await waitForInjectionCount(baseUrl, session.id, waitTarget, { fromIndex: startIndex, stallMs: waitStallMs })
+    if (stopAfterTarget) await sendMessage(baseUrl, session.id, "/supervisor off", 120_000, { model })
+    const injections = await settleInjections(baseUrl, session.id, {
+      fromIndex: startIndex,
+      quietMs: waitTarget != null ? 25_000 : 15_000,
+    })
     return { sessionId: session.id, injections, startIndex }
   }
 
@@ -896,6 +941,53 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
       one.injections, five.injections,
       "retry 1 and retry 5 were identical — this is the user-visible bug: the budget had no effect"
     )
+  })
+
+  test("/supervisor retry unlimited never stands down on COUNT — no finite ceiling caps the loop", { timeout: 900_000 }, async () => {
+    // The opt-out: with `unlimited` the runaway ceiling must NEVER fire. Here
+    // the judge NEVER returns complete (complete: Infinity), so the ONLY thing
+    // that could stop the loop on a count is a finite cap — exactly what
+    // `unlimited` must not impose. We prove the injection count climbs to a
+    // TARGET (8) that is far past every finite value a regression would clamp
+    // to: the reverted `0 → 1`, the retired reflection cap 3, the retired goal
+    // cap 16 is higher but a bug clamping there would still be caught by the
+    // `maxAttempts` assertion below. Since the loop would otherwise run
+    // forever, once it has proven it ran past the target we end the turn with
+    // `/supervisor off` rather than waiting for a stop that never comes.
+    //
+    // SENSITIVITY: revert parseAttemptsValue's `0/unlimited → Infinity` and the
+    // opt-out collapses to the old `0 → 1` clamp, so this turn stands down after
+    // ONE injection; `waitForInjectionCount` then stalls at 1 (< target 8) and
+    // throws, failing the test.
+    const TARGET = 8
+    const { sessionId, injections } = await runTurn({
+      budget: "unlimited", probe: "PROBE-UNLIMITED", complete: Infinity,
+      waitTarget: TARGET, stopAfterTarget: true, waitStallMs: 120_000,
+    })
+    assert.ok(
+      injections >= TARGET,
+      `unlimited must not cap the loop below ${TARGET}: got only ${injections}. ` +
+      `A small finite value means the unlimited opt-out was silently clamped.`
+    )
+    // The override persists as the unlimited sentinel — proof it was not
+    // silently rewritten to a finite number (e.g. the default 64).
+    const state = JSON.parse(
+      readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
+    )
+    assert.equal(state.maxAttempts, "unlimited", "the session override must persist as the unlimited sentinel")
+    assert.ok(
+      (state.attempts?.count ?? 0) >= TARGET,
+      `persisted counter should reflect the ${TARGET}+ injections, got ${JSON.stringify(state.attempts)}`
+    )
+    // Under unlimited the runaway CEILING must never fire — a runaway_ceiling
+    // record here would mean a finite cap was applied after all.
+    const loopLog = join(server.projectDir, ".supervisor", "loop-exit.log")
+    if (existsSync(loopLog)) {
+      const ceilingForSession = readFileSync(loopLog, "utf-8").trim().split("\n").filter(Boolean)
+        .map((l) => { try { return JSON.parse(l) } catch { return {} } })
+        .some((r) => r.reason === "runaway_ceiling" && r.session === sessionId)
+      assert.equal(ceilingForSession, false, "unlimited must never write a runaway_ceiling record")
+    }
   })
 
   test("a complete verdict ends the turn early, without consuming the budget", { timeout: 600_000 }, async () => {

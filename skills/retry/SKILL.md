@@ -18,7 +18,14 @@ node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" retry "${ARGUMENTS}"
 ```
 
 - `${ARGUMENTS}` empty → reports the current limit.
-- `${ARGUMENTS}` = a number `N` (1–100) → sets this session's runaway limit to N.
+- `${ARGUMENTS}` = a positive integer `N` → sets this session's runaway limit to
+  N, honoured verbatim (no upper clamp).
+- `${ARGUMENTS}` = `unlimited` (or `off` / `none` / `0`) → removes the cap
+  entirely; the loop then stops only on `supervisor_loop_exit`, the no-progress
+  gate, a goal deadline, or `/supervisor off`.
+- An invalid value (negative, fractional, non-numeric) is rejected with a clear
+  message and leaves the current limit unchanged.
 
-Default is 50 (`RUNAWAY_CEILING`), the same in every mode; on Claude Code it is
-clamped to 7. Relay the CLI output.
+Default is 64 (`RUNAWAY_CEILING`), the same in every mode; on Claude Code the
+resolved limit is reduced to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), and
+`unlimited` cannot be honoured there — the CLI says so. Relay the CLI output.

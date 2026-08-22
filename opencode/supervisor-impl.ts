@@ -15,7 +15,8 @@ import { execFile } from "child_process"
 // Shared goal-loop DECISION logic — single source of truth across runtimes.
 // (The per-session store stays runtime-specific: async fs here, sync in core for CC.)
 import {
-  resolveRunawayLimit, parseSupervisorCommand, buildGoalRequirementSection,
+  resolveRunawayLimit, describeRunawayLimit, formatRunawayLimit, parseAttemptsValue,
+  readConfiguredMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
   appendGoalContextToNudge,
   decideGoalTransition, DEFAULT_MAX_GOAL_DURATION_MS,
   resolveSupervisorMode, DEFAULT_SUPERVISOR_MODE,
@@ -214,26 +215,16 @@ async function reportError(err: unknown, context?: Record<string, string>): Prom
 }
 
 /**
- * Read the top-level `maxAttempts:` integer from ~/.config/opencode/supervisor.yaml.
- * Returns undefined if the file is missing, the key is absent, or the value is invalid.
+ * Read the top-level `maxAttempts:` value from ~/.config/opencode/supervisor.yaml.
+ * Accepts a positive integer OR an `unlimited`/`off`/`none`/`0` opt-out (→
+ * Infinity); returns undefined if the file is missing, the key is absent, or the
+ * value is invalid (an invalid value is warned to the debug log and the resolver
+ * falls through to the next tier — the file-surface form of "reject, don't
+ * silently rewrite"). Delegates to core's shared reader so the yaml surface is
+ * parsed identically on Claude Code and OpenCode (ONE parser, one spelling).
  */
 async function loadConfiguredMaxAttempts(): Promise<number | undefined> {
-  try {
-    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
-    for (const rawLine of content.split(/\r?\n/)) {
-      const line = rawLine.trim()
-      if (!line || line.startsWith("#")) continue
-      const match = line.match(/^maxAttempts\s*:\s*(\S+)/)
-      if (match) {
-        const raw = match[1].trim()
-        if (/^\d+$/.test(raw)) {
-          const value = parseInt(raw, 10)
-          if (Number.isFinite(value)) return value
-        }
-      }
-    }
-  } catch {}
-  return undefined
+  return readConfiguredMaxAttempts((msg) => debug(msg), SUPERVISOR_CONFIG_PATH)
 }
 
 /**
@@ -294,7 +285,7 @@ export interface SupervisorGoal {
 export type SupervisorMode = "autopilot" | "reflection"
 
 export interface SupervisorState {
-  maxAttempts?: number       // /supervisor:retry override (optional)
+  maxAttempts?: number | "unlimited"  // /supervisor:retry override; "unlimited" = no runaway cap
   goal?: SupervisorGoal
   mode?: SupervisorMode
   autopilot?: boolean        // autopilot mode: skip judge, always continue
@@ -410,7 +401,7 @@ export const supervisorStore = {
     return goalStore.setMode(directory, sessionId, mode) as SupervisorState
   },
 
-  async setRetry(directory: string, sessionId: string, n: number): Promise<SupervisorState> {
+  async setRetry(directory: string, sessionId: string, n: number | "unlimited"): Promise<SupervisorState> {
     return goalStore.setRetry(directory, sessionId, n) as SupervisorState
   },
 
@@ -1544,6 +1535,13 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
    */
   const statusCorrectionSent = new Map<string, string>()
   /**
+   * sessionId -> the turnKey we already emitted the "runaway limit is
+   * UNLIMITED" debug line for. opencode raises several session.idle events per
+   * human turn, so this dedupes the visibility notice to once per turn — an
+   * unbounded session must be visible in the log without spamming it.
+   */
+  const unlimitedNoticeTurn = new Map<string, string>()
+  /**
    * sessionId -> the project directory that session is working in.
    *
    * A pure read-through cache in front of the DURABLE copy persisted in
@@ -1984,7 +1982,15 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     const st = await supervisorStore.load(directory, sid)
     const mode = resolveSupervisorMode(st)
     const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}` : "\ngoal: (none)"
-    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
+    // Resolve the ACTUAL runaway limit in effect (retry > config > env >
+    // default), so status shows the real bound — including `unlimited` — not
+    // just whether a session override happens to be set. OpenCode has no
+    // platform cap, so `cappedByPlatform` never fires here.
+    const runaway = describeRunawayLimit({ sessionOverride: st.maxAttempts, config: await loadConfiguredMaxAttempts() })
+    const runawayText = runaway.unlimited
+      ? `\nrunaway limit: unlimited — no attempt cap (tier: ${runaway.tier}). The loop is bounded only by supervisor_loop_exit, the no-progress gate, a goal deadline, and /supervisor off.`
+      : `\nrunaway limit: ${runaway.limit} injections/turn (tier: ${runaway.tier}) — a safety valve, not a budget; the real stop is supervisor_loop_exit.`
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nmode: ${mode}\nretry: ${st.maxAttempts ?? "(default)"}${runawayText}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
   }
 
   // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
@@ -2169,18 +2175,29 @@ export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
     await supervisorStore.setGoal(directory, sid, derived.condition, {})
     return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}. Supervisor will keep pushing until it's met (or the retry budget runs out). Scoped to THIS session only — it is deliberately NOT written to .agents/supervisor/goal.md; use /supervisor:set-goal <condition> if you want a goal that persists across sessions.`
   }
-  const supervisorRetryDescription = "Set or check the supervisor retry budget (max continuation attempts) for this session. Args: n (1–100; omit to check current)."
+  const supervisorRetryDescription = "Set or check the supervisor per-turn runaway safety valve for this session. Args: n — a positive integer (honoured verbatim, no upper clamp), or 0 for UNLIMITED (no cap; the loop then stops only on supervisor_loop_exit, the no-progress gate, a goal deadline, or /supervisor off). Omit to check current. It is a runaway valve, not a budget the agent should pace against."
   const executeSupervisorRetry = async (args: { n?: number }, context?: any) => {
     const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
     if (!sid) return "No active session yet — wait for the first session.idle, then set retry."
     currentSessionId = sid
-    if (typeof args.n === "number" && Number.isFinite(args.n)) {
-      await supervisorStore.setRetry(directory, sid, args.n)
-      const eff = resolveRunawayLimit({ sessionOverride: Math.max(1, Math.min(100, Math.floor(args.n))) })
-      return `Retry budget set to ${eff} for session ${sid.slice(0, 8)}….`
+    if (typeof args.n === "number") {
+      // Honour or reject — never silently rewrite the number the operator typed
+      // (2a). parseAttemptsValue → positive int (verbatim), Infinity (0/unlimited
+      // opt-out), or null (negative / fractional / NaN → reject with the range).
+      const parsed = parseAttemptsValue(args.n)
+      if (parsed === null) {
+        return `Rejected retry value ${args.n}: use a positive integer, or 0 for unlimited (no cap). The value was NOT changed for session ${sid.slice(0, 8)}….`
+      }
+      const stored = parsed === Infinity ? "unlimited" : parsed
+      await supervisorStore.setRetry(directory, sid, stored)
+      const eff = describeRunawayLimit({ sessionOverride: stored })
+      return eff.unlimited
+        ? `Runaway safety valve set to UNLIMITED for session ${sid.slice(0, 8)}… — no attempt cap. The loop now stops only on supervisor_loop_exit, the no-progress gate, a goal deadline, or /supervisor off.`
+        : `Runaway safety valve set to ${eff.limit} injections/turn for session ${sid.slice(0, 8)}…. It is a safety valve, not a budget — the real stop is supervisor_loop_exit.`
     }
     const st = await supervisorStore.load(directory, sid)
-    return `Retry budget (session override): ${st.maxAttempts ?? "(default)"}.`
+    const eff = describeRunawayLimit({ sessionOverride: st.maxAttempts, config: await loadConfiguredMaxAttempts() })
+    return `Runaway safety valve (session override): ${st.maxAttempts ?? "(default)"}; in effect: ${formatRunawayLimit(eff.limit)} (tier: ${eff.tier}).`
   }
 
   // supervisor_autopilot tool — toggle autopilot mode (skip judge, always continue)
@@ -2338,7 +2355,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
     supervisorRetryTool = tool({
       description: supervisorRetryDescription,
       args: {
-        n: tool.schema.number().optional().describe("Retry budget (1–100). Omit to check current.")
+        n: tool.schema.number().optional().describe("Runaway safety valve: a positive integer (honoured verbatim, no upper clamp), or 0 for UNLIMITED (no cap). Omit to check current.")
       },
       execute: executeSupervisorRetry as any
     })
@@ -2367,7 +2384,7 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         condition: tool.schema.string().optional().describe("Goal text when action is 'goal'."),
         clear: tool.schema.boolean().optional().describe("Set true with action 'goal' to clear the current goal."),
         resume: tool.schema.boolean().optional().describe("Set true with action 'goal' to resume a paused or exhausted goal."),
-        n: tool.schema.number().optional().describe("Retry budget when action is 'retry'.")
+        n: tool.schema.number().optional().describe("Runaway valve when action is 'retry': a positive integer, or 0 for unlimited (no cap).")
       },
       execute: executeSupervisorToggle as any
     })
@@ -2581,12 +2598,27 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // BOTH modes. In reflection the judge grades against it; in autopilot it
         // rides along as CONTEXT on the nudge (never verified — accepted).
         let goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
-        const runawayLimit = resolveRunawayLimit({
+        // ONE resolver (core/goal.mjs), as a DESCRIPTOR so the ceiling gate, the
+        // once-per-turn visibility line, and the loop-exit.log record all read
+        // the same resolution. OpenCode has no platform ceiling on continuations
+        // (unlike Claude Code's Stop-hook block cap — see resolveClaudeCodeHardCap),
+        // so `unlimited` here is truly unbounded by the counter: the loop then
+        // stops ONLY on supervisor_loop_exit, the no-progress gate, a goal
+        // deadline, or `/supervisor off`.
+        const runaway = describeRunawayLimit({
           sessionOverride: sup.maxAttempts,
           config: await loadConfiguredMaxAttempts(),
-          // OpenCode has no platform ceiling on continuations (unlike Claude
-          // Code's Stop-hook block cap) — see resolveClaudeCodeHardCap.
         })
+        const runawayLimit = runaway.limit
+        // An unbounded session must never be a surprise: log it once per human
+        // turn (keyed to the turn so a multi-idle turn does not spam the log).
+        if (runaway.unlimited && unlimitedNoticeTurn.get(sessionId) !== turnKey) {
+          unlimitedNoticeTurn.set(sessionId, turnKey)
+          debug(
+            "runaway limit: UNLIMITED (tier:", runaway.tier + ") for", sessionId.slice(0, 8),
+            "— bounded ONLY by supervisor_loop_exit, the no-progress gate, a goal deadline, and /supervisor off"
+          )
+        }
 
         // ── Agent-declared loop exit ─────────────────────────────────────
         //
@@ -2648,8 +2680,19 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
         // The counter is monotonic within a turn and bounded above by
         // runawayLimit, therefore the turn ends after at most
         // runawayLimit injections.
+        //
+        // UNLIMITED: `runawayLimit` is Infinity, so this branch must never
+        // fire. The `Number.isFinite` guard is not redundant with `count >=
+        // Infinity` (which is already false for any finite count): a
+        // stand-down path saturates the counter to `runawayLimit` via
+        // standDownForTurn, so under unlimited the counter itself can become
+        // Infinity, and `Infinity >= Infinity` is TRUE. Without the guard a
+        // stray later idle in the same turn would then fire the runaway branch
+        // — logging a bogus `runaway_ceiling` and running goal side-effects —
+        // for a session the operator explicitly asked NOT to cap. The runaway
+        // CEILING firing under `unlimited` is a contradiction in terms.
         const currentAttemptCount = readTurnAttempts(sessionId, turnKey)
-        if (currentAttemptCount >= runawayLimit) {
+        if (Number.isFinite(runawayLimit) && currentAttemptCount >= runawayLimit) {
           // Autopilot must not stay armed past the runaway limit, or the next
           // human turn silently resumes an unattended loop.
           if (mode === "autopilot") {
@@ -2692,6 +2735,10 @@ Pass a short "detail" saying why. Both args are optional; reason defaults to "co
           appendLoopExitLog(directory, {
             session: sessionId, turnKey, reason: "runaway_ceiling", detail: "",
             at: Date.now(), mode, attempts: currentAttemptCount, maxAttempts: runawayLimit,
+            // Name the resolved limit AND the tier that set it, so a forensic
+            // reader can tell whether the operator chose this (retry/config/env)
+            // or it is the shipped default.
+            limit: formatRunawayLimit(runawayLimit), limitTier: runaway.tier,
           })
           return
         }

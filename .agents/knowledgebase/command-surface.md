@@ -52,7 +52,7 @@ Both Claude Code and OpenCode expose the same 8 colon subcommands (naming differ
 2. `/supervisor:on` — enable supervisor
 3. `/supervisor:off` — disable supervisor
 4. `/supervisor:set-goal <condition>` (both runtimes) — set a mandatory completion condition
-5. `/supervisor:retry N` — set the retry budget
+5. `/supervisor:retry N` — tune the runaway safety valve (positive int, or `unlimited`/`0` for no cap; default 64)
 6. `/supervisor:train` — mine and learn from your sessions
 7. `/supervisor:autopilot` — skip judge, auto-continue until `supervisor_loop_exit`/`SUPERVISOR_LOOP_EXIT: completed` or budget
 8. `/supervisor:reflection` — return to default completion-judge mode

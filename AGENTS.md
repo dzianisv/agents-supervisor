@@ -466,21 +466,39 @@ goal/autopilot escape hatches — the only rule that does. Autopilot bypasses th
 turn gate by design, so with a real budget it burned the whole thing on its own
 command turn.
 
-**The runaway limit is ONE rule** (`resolveRunawayLimit`, core/goal.mjs), applied
-by both runtimes: `/supervisor retry N` (session override) > config `maxAttempts`
-> env (`SUPERVISOR_MAX_ATTEMPTS` ?? `REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING`
-(50) — the SAME for every mode, no `mode` parameter — each clamped to [1,100], then
-clamped DOWN to the runtime's platform hard cap (Claude Code passes
-`resolveClaudeCodeHardCap()` = 7; opencode passes none). The old per-mode defaults
-(16 goal/autopilot, 3 reflection) and the pile of overlapping helpers
-(`resolveTurnMaxAttempts` / `resolveReflectionMaxAttempts` / `resolveMaxAttempts` /
-`DEFAULT_MAX_ATTEMPTS` / `DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default
-IS the premature-stand-down bug, and per-mode branches were the drift surface. An
-explicit override at any of the first three tiers is a deliberate operator choice
-and still wins. The value is now a **runaway safety valve**, not a budget: it never
-signals completion, and it never leaks into the agent-facing nudge (see the
-`describe("subagent gate")`-style guard `test/nudge-no-counter.test.mjs`, which
-fails if a `(n/N)` counter reappears in either nudge template).
+**The runaway limit is ONE rule** (`describeRunawayLimit`, core/goal.mjs, with
+`resolveRunawayLimit` as the thin number accessor over it), applied by both
+runtimes: `/supervisor retry N` (session override) > config `maxAttempts` (in
+`~/.config/opencode/supervisor.yaml`) > env (`SUPERVISOR_MAX_ATTEMPTS` ??
+`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**64**) — the SAME for every
+mode, no `mode` parameter. Each tier is parsed by `parseAttemptsValue`: a positive
+integer is **honoured verbatim (no upper clamp** — a number the operator typed is
+never silently rewritten), `unlimited`/`off`/`none`/`0` means **no cap**
+(`Infinity`; every gate is `attempts >= limit` and `x >= Infinity` is always
+false), and a negative/fractional/garbage value is invalid — rejected LOUDLY at
+the CLI/tool, warn-and-fall-through in the config file. The resolved value is then
+reduced to the runtime's platform hard cap (Claude Code passes
+`resolveClaudeCodeHardCap()` = 7 and CANNOT honour `unlimited`; opencode passes
+none). `describeRunawayLimit` returns a DESCRIPTOR — `{limit, requested, unlimited,
+tier, cappedByPlatform, hardCap}` — so the ceiling gate, status text, once-per-turn
+debug line, and the `runaway_ceiling` loop-exit.log record all read the same
+resolution and cannot drift; the log record and status name the resolved limit AND
+the tier that set it, and surface `cappedByPlatform` (esp. when `unlimited` was
+requested but the platform forced it down). **64 is derived, not folklore:** a
+30-day forensic sample (59 last-turn samples, 19 projects) is bimodal — legit
+turns cap at ≤3 injections (p50=3, p90=3), everything above is censored doom-loop
+saturation — so the default errs high by rule: the smallest power of two ≥ the
+previously shipped 50 and 4× the retired goal cap of 16 (`.scratch/runaway-limit-analysis.md`).
+The old per-mode defaults (16 goal/autopilot, 3 reflection), the `[1,100]` clamp,
+and the pile of overlapping helpers (`resolveTurnMaxAttempts` /
+`resolveReflectionMaxAttempts` / `resolveMaxAttempts` / `DEFAULT_MAX_ATTEMPTS` /
+`DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default IS the
+premature-stand-down bug, per-mode branches were the drift surface, and a silent
+clamp rewrote the operator. An explicit override at any of the first three tiers
+is a deliberate operator choice and still wins. The value is a **runaway safety
+valve**, not a budget: it never signals completion, and it never leaks into the
+agent-facing nudge (see the guard `test/nudge-no-counter.test.mjs`, which fails if
+a `(n/N)` counter reappears in either nudge template).
 
 ### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
 

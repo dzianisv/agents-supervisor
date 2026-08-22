@@ -1,5 +1,32 @@
 # status
 
+## Track F — configurable runaway limit (RUNAWAY_CEILING now derived + tunable)
+
+Task: `RUNAWAY_CEILING = 50` was picked by feel. Derive the default from real
+data, make it genuinely configurable (incl. an explicit `unlimited` opt-out),
+stop silently rewriting the operator, and surface — never silently apply — the
+Claude Code platform cap.
+
+```
+ROADMAP  ████████████████████  done
+ [x] 1. forensic analysis of 30d real sessions -> .scratch/runaway-limit-analysis.md
+ [x] 2. RUNAWAY_CEILING 50 -> 64, derived-by-rule doc comment (core/goal.mjs)
+ [x] 3. describeRunawayLimit descriptor: {limit,requested,unlimited,tier,cappedByPlatform,hardCap}
+ [x] 4. unlimited/off/none/0 opt-out; positive ints honoured verbatim (no [1,100] clamp)
+ [x] 5. config maxAttempts: in supervisor.yaml (shared sync reader, both runtimes)
+ [x] 6. CC platform cap surfaced in status + debug (never silently pretended)
+ [x] 7. loop-exit.log runaway_ceiling record names resolved limit + tier
+ [x] 8. docs (README/AGENTS/tdd/concepts/skills/commands) + tests + sensitivity
+```
+
+MEASUREMENT: 59 last-turn samples, 19 projects. Bimodal — legit turns cap at ≤3
+injections (p50=3, p90=3); everything above is censored doom-loop saturation
+(the only samples ≥16 hit the old 50/100 caps). The genuine tail is
+unobservable, so 64 is chosen by rule (smallest power of two ≥ shipped 50 AND
+4× the retired goal cap 16), not by feel.
+
+---
+
 ## Track E — agent-declared loop exit (replaces static retry counter)
 
 Task: static per-turn retry budget (3 reflection / 16 goal) stood the

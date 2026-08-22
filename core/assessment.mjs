@@ -137,7 +137,7 @@ export function buildSelfAssessmentPrompt(
   const effectiveCap = maxAttempts ?? RUNAWAY_CEILING
   const currentAttempt = attemptCount || 0
   const attemptSection = currentAttempt > 0
-    ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${effectiveCap} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
+    ? `\n## Supervisor History\n- This is supervisor attempt ${currentAttempt + 1}/${Number.isFinite(effectiveCap) ? effectiveCap : 'unlimited'} for this task.\n- Previous supervisors found the task incomplete.\n- If you are repeating the same actions without progress, set "stuck": true and explain what is blocking you.\n`
     : ''
 
   return `SELF-ASSESS SUPERVISOR

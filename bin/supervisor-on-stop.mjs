@@ -34,7 +34,7 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, resolveRunawayLimit, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint } from '../core/goal.mjs';
+import { goalStore, describeRunawayLimit, readConfiguredMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint, formatRunawayLimit } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
 import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
@@ -829,19 +829,38 @@ async function main() {
   }
 
   // ONE runaway-limit rule, shared with the OpenCode plugin (core/goal.mjs
-  // resolveRunawayLimit): `/supervisor retry N` > config > env > RUNAWAY_CEILING
-  // for EVERY mode, then clamped to CC's platform ceiling. There is no per-mode
-  // default — the limit is a runaway safety valve, not a budget.
+  // describeRunawayLimit): `/supervisor retry N` > config (supervisor.yaml) >
+  // env > RUNAWAY_CEILING for EVERY mode, then reduced to CC's platform
+  // ceiling. There is no per-mode default — the limit is a runaway safety
+  // valve, not a budget.
   //
   // HARD_CAP is that platform ceiling — see its definition for the full
   // rationale. It intentionally tightens the runaway limit during any single
   // unbroken turn: CC's own override already made anything beyond ~8
   // unreachable in practice, so this just makes our own exhaustion bookkeeping
   // fire deterministically instead of being silently pre-empted by CC.
-  const runawayLimit = resolveRunawayLimit({
+  //
+  // Claude Code CANNOT honour `unlimited`: the Stop hook is physically capped
+  // by the platform at HARD_CAP. So when the resolved limit is reduced by the
+  // platform cap — and ESPECIALLY when the operator asked for unlimited — say
+  // so out loud in the debug log rather than silently pretending we honoured
+  // it. Same config file the OpenCode side reads (shared sync reader), so the
+  // `unlimited`/`maxAttempts:` spelling is identical on both runtimes.
+  const runaway = describeRunawayLimit({
     sessionOverride: goalState?.maxAttempts,
+    config: readConfiguredMaxAttempts((m) => debug({ msg: 'config', detail: m }, cwd)),
     hardCap: HARD_CAP,
   });
+  const runawayLimit = runaway.limit;
+  if (runaway.cappedByPlatform) {
+    debug({
+      msg: 'runaway_limit_platform_capped',
+      requested: runaway.unlimited ? 'unlimited' : runaway.requested,
+      tier: runaway.tier,
+      enforced: runawayLimit,
+      note: `Claude Code caps the Stop hook at ${HARD_CAP} (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1); the requested runaway limit cannot be honoured in full on this runtime`,
+    }, cwd);
+  }
 
   // Project-level goal: when there is no active SESSION goal, fall back to
   // the project goal (.agents/supervisor/Goal.md, or the lower-case goal.md
@@ -929,6 +948,13 @@ async function main() {
     appendLoopExitLog(cwd, {
       session: session_id, turnKey, reason: 'runaway_ceiling', detail: '',
       at: Date.now(), mode, attempts, maxAttempts: runawayLimit,
+      // Name the resolved limit + the tier that set it (retry/config/env/
+      // default) so a forensic reader can tell whether the operator chose this
+      // bound, and flag when Claude Code's platform cap forced it down below
+      // what was requested (including a requested `unlimited`).
+      limit: formatRunawayLimit(runawayLimit), limitTier: runaway.tier,
+      requested: runaway.unlimited ? 'unlimited' : runaway.requested,
+      cappedByPlatform: runaway.cappedByPlatform, platformHardCap: runaway.hardCap,
     });
     debug({ msg: 'attempt_cap_reached', session_id, attempts, max: runawayLimit, goal: !!goal, mode }, cwd);
     process.exit(0);

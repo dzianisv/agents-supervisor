@@ -28,7 +28,9 @@ import { fileURLToPath } from 'node:url';
 import {
   goalStore,
   parseSupervisorCommand,
-  resolveRunawayLimit,
+  describeRunawayLimit,
+  formatRunawayLimit,
+  readConfiguredMaxAttempts,
   resolveSupervisorMode,
   resolveClaudeCodeHardCap,
   writeProjectGoal,
@@ -188,6 +190,31 @@ function noteGoalKeptOnModeSwitch(cwd, sid, mode) {
   }
 }
 
+// This CLI is the Claude Code control surface, so the runaway valve it reports
+// is resolved through the SAME shared resolver as the Stop hook (retry > config
+// (supervisor.yaml) > env > default), then reduced to CC's platform ceiling.
+// Returns the descriptor so callers can render `unlimited` and the platform-cap
+// note honestly instead of printing a number CC cannot actually honour.
+function ccRunaway(sid) {
+  const override = sid ? goalStore.load(cwd, sid).maxAttempts : undefined;
+  return describeRunawayLimit({
+    sessionOverride: override,
+    config: readConfiguredMaxAttempts(() => {}),
+    hardCap: resolveClaudeCodeHardCap(),
+  });
+}
+
+// One-line human summary of a runaway descriptor for CLI output — Infinity-safe,
+// and it says out loud when Claude Code's platform cap forced the number down
+// below what was requested (including a requested `unlimited`, which CC cannot
+// honour).
+function runawayLine(desc) {
+  const capNote = desc.cappedByPlatform
+    ? ` (requested ${desc.unlimited ? 'unlimited' : desc.requested}, but Claude Code caps its Stop hook at ${desc.hardCap} = CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1, so unlimited cannot be honoured on this runtime)`
+    : '';
+  return `Runaway safety valve: ${formatRunawayLimit(desc.limit)} injections per human turn${capNote} (tune with 'supervisor retry <N|unlimited>').`;
+}
+
 switch (cmd.kind) {
   // ── goal ──────────────────────────────────────────────────────────────────
   case 'goal-set': {
@@ -200,11 +227,11 @@ switch (cmd.kind) {
     // The Stop hook clamps the runaway safety valve to one under Claude Code's
     // own block-override threshold, so the effective valve here on CC is the
     // clamped number.
-    const runawayLimit = resolveRunawayLimit({ sessionOverride: override, hardCap: resolveClaudeCodeHardCap() });
+    const desc = describeRunawayLimit({ sessionOverride: override, config: readConfiguredMaxAttempts(() => {}), hardCap: resolveClaudeCodeHardCap() });
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
       `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met, or until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
-      `A runaway safety valve force-stops the loop after ${runawayLimit} injections in one human turn (clamped here on Claude Code by CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) — it resets each time you speak, so the goal is never permanently exhausted mid-session. Tune it with 'supervisor retry N'.\n` +
+      `${runawayLine(desc)} It resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
       `Also saved to .agents/supervisor/Goal.md for reflection mode.`
     );
     break;
@@ -286,16 +313,45 @@ switch (cmd.kind) {
   // ── retry ─────────────────────────────────────────────────────────────────
   case 'retry-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
+    // cmd.n is a positive integer or the string 'unlimited' (0/off/none →
+    // 'unlimited' upstream). Persist as-is; the store/resolver understand both.
     goalStore.setRetry(cwd, sid, cmd.n);
-    console.log(`Runaway safety valve set to ${resolveRunawayLimit({ sessionOverride: cmd.n })} injections per human turn for session ${sid.slice(0, 8)}….`);
+    const desc = ccRunaway(sid);
+    if (desc.unlimited && !desc.cappedByPlatform) {
+      console.log(
+        `Runaway safety valve set to UNLIMITED for session ${sid.slice(0, 8)}… — no attempt cap. ` +
+        `The loop now stops only on SUPERVISOR_LOOP_EXIT, the no-progress gate, a goal deadline, or 'supervisor off'.`
+      );
+    } else if (desc.cappedByPlatform) {
+      console.log(
+        `Runaway safety valve set to ${cmd.n} for session ${sid.slice(0, 8)}…, but Claude Code caps its Stop hook at ` +
+        `${desc.hardCap} (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1), so the effective valve on this runtime is ${desc.limit} injections per human turn. ` +
+        `${desc.unlimited ? 'Unlimited cannot be honoured on Claude Code.' : ''}`.trim()
+      );
+    } else {
+      console.log(`Runaway safety valve set to ${desc.limit} injections per human turn for session ${sid.slice(0, 8)}….`);
+    }
+    break;
+  }
+  case 'retry-invalid': {
+    // A number the operator explicitly typed is never silently rewritten (2a):
+    // reject loudly and name the accepted range instead of clamping.
+    console.log(
+      `✗ Invalid retry value "${cmd.raw}". Use a positive integer (honoured verbatim, no upper clamp), ` +
+      `or one of unlimited/off/none/0 to remove the cap entirely. The runaway valve was NOT changed.`
+    );
+    process.exit(1);
     break;
   }
   case 'retry-status': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
     const st = goalStore.load(cwd, sid);
+    const desc = ccRunaway(sid);
     console.log(
-      `Runaway safety valve (session override): ${st.maxAttempts ?? `default (${resolveRunawayLimit({})})`} injections per human turn ` +
-      `— the loop's real stop is SUPERVISOR_LOOP_EXIT, not this number.`
+      `Runaway safety valve (session override): ${st.maxAttempts != null ? formatRunawayLimit(st.maxAttempts) : '(none — using default/config/env)'}; ` +
+      `in effect: ${formatRunawayLimit(desc.limit)} injections per human turn (tier: ${desc.tier})` +
+      `${desc.cappedByPlatform ? ` — reduced from ${desc.unlimited ? 'unlimited' : desc.requested} by Claude Code's Stop-hook cap of ${desc.hardCap}` : ''}.\n` +
+      `The loop's real stop is SUPERVISOR_LOOP_EXIT, not this number.`
     );
     break;
   }
@@ -307,12 +363,12 @@ switch (cmd.kind) {
     // A mode switch KEEPS any active goal now (a goal is an attribute, not a
     // mode) — announce that instead of silently clearing it.
     noteGoalKeptOnModeSwitch(cwd, sid, cmd.mode);
-    const runawayLimit = resolveRunawayLimit({ sessionOverride: goalStore.load(cwd, sid).maxAttempts, hardCap: resolveClaudeCodeHardCap() });
+    const desc = ccRunaway(sid);
     console.log(`mode: ${cmd.mode}`);
     if (cmd.mode === 'autopilot') {
       console.log(
         `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
-        `Runaway safety valve: ${runawayLimit} injections per human turn (tune with 'supervisor retry N').`
+        `${runawayLine(desc)}`
       );
     } else if (cmd.mode === 'reflection') {
       console.log('Supervisor back to reflection mode (judge runs on each stop).');
@@ -326,11 +382,11 @@ switch (cmd.kind) {
     goalStore.setAutopilot(cwd, sid, true);
     // Autopilot KEEPS any active goal as context now (it is not verified).
     noteGoalKeptOnModeSwitch(cwd, sid, 'autopilot');
-    const runawayLimit = resolveRunawayLimit({ sessionOverride: goalStore.load(cwd, sid).maxAttempts, hardCap: resolveClaudeCodeHardCap() });
+    const desc = ccRunaway(sid);
     console.log('mode: autopilot');
     console.log(
       `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
-      `Runaway safety valve: ${runawayLimit} injections per human turn (tune with 'supervisor retry N').`
+      `${runawayLine(desc)}`
     );
     break;
   }
