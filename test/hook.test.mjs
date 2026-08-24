@@ -42,11 +42,26 @@ test('endsWithTrailingQuestion: false for statements, non-strings, and empty inp
   assert.equal(endsWithTrailingQuestion(42), false);
 });
 
-test('sanitizeCwd rejects relative / traversal paths', () => {
+// CONTRACT: sanitizeCwd is TOTAL — it returns null for a bad cwd, it never
+// throws. It used to throw HERE and return null in bin/plainspeak-on-stop.mjs
+// under the same name; core/transcript.mjs now owns the single copy. Null is
+// the contract a caller actually reads (plainspeak's `if (!cwd) exit(0)`);
+// nothing ever caught the throw, it just unwound into the process-level
+// unhandledRejection backstop.
+test('sanitizeCwd returns null (never throws) for relative / traversal / non-string paths', () => {
   const d = mkcwd();
   assert.equal(sanitizeCwd(d), d);
-  assert.throws(() => sanitizeCwd('rel/path'));
-  assert.throws(() => sanitizeCwd(`${d}/../foo`));
+  assert.equal(sanitizeCwd('rel/path'), null);
+  assert.equal(sanitizeCwd(`${d}/../foo`), null);
+  assert.equal(sanitizeCwd(undefined), null);
+  assert.equal(sanitizeCwd(42), null);
+});
+
+test('sanitizeCwd is the same function in both Stop hooks', async () => {
+  const plainspeak = await import('../bin/plainspeak-on-stop.mjs');
+  const core = await import('../core/transcript.mjs');
+  assert.equal(sanitizeCwd, core.sanitizeCwd, 'supervisor hook must not define its own copy');
+  assert.equal(plainspeak.sanitizeCwd, core.sanitizeCwd, 'plainspeak hook must not define its own copy');
 });
 
 test('attempt counter: round-trips and is monotonic', () => {
