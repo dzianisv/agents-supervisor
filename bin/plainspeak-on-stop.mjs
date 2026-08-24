@@ -11,6 +11,10 @@
  * runtime dependency on that file's shape and can be lifted into another repo
  * on its own. It DOES import core/goal.mjs — the same shared state module
  * supervisor uses — because detecting supervisor's state is this file's job.
+ * It also imports core/transcript.mjs, which owns the Stop-hook primitives
+ * both hooks need (sanitizeCwd, readTranscriptTail, endsWithTrailingQuestion,
+ * the turn-key scan, readStdin, the debug logger) — shared through core/, not
+ * through the other bin/ script, so the self-containment above still holds.
  *
  * Safety rails (see AGENTS.md task brief for the exact spec):
  *   - Coexistence with supervisor: never fight it. See supervisorGoalActive
@@ -26,8 +30,14 @@ import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import { scoreVerbosity, buildStylePrompt, buildRewriteDirective, STYLE_RULES } from '../core/verbosity.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER } from '../core/evaluation.mjs';
 import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
+// THE shared Stop-hook primitives — see core/transcript.mjs. These used to be
+// private copies here and in bin/supervisor-on-stop.mjs; sanitizeCwd's two
+// copies had already drifted apart on their failure mode.
+import {
+  sanitizeCwd, readTranscriptTail, endsWithTrailingQuestion, readStdin,
+  createDebugLogger, computeTurnKeyFromTranscript,
+} from '../core/transcript.mjs';
 
 export const PLAINSPEAK_MARKER = '## Plainspeak:';
 
@@ -36,8 +46,6 @@ const SUPERVISOR_STATE_DIR = '.supervisor';
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 const LLM_TIMEOUT_MS = 15_000;
 const LLM_MAX_TOKENS = 300;
-const TRANSCRIPT_MAX_BYTES = 200_000;
-const TRANSCRIPT_MAX_ENTRIES = 50;
 const FLUSH_POLL_MS = 100;
 const FLUSH_POLL_MAX = 5; // shorter than supervisor's own poll: plainspeak prefers payload.last_assistant_message and rarely needs this path
 const SUPERVISOR_RACE_POLL_MS = 150;
@@ -48,20 +56,16 @@ const SUPERVISOR_FRESH_EPSILON_MS = 2000; // clock/mtime-granularity slop
 process.on('uncaughtException', () => { try { process.exit(0); } catch { /* */ } });
 process.on('unhandledRejection', () => { try { process.exit(0); } catch { /* */ } });
 
-function debug(obj, cwd) {
-  if (process.env.PLAINSPEAK_DEBUG !== '1') return;
-  try {
-    const dir = path.join(cwd ?? process.cwd(), STATE_DIR);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, 'debug.log'), JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
-  } catch { /* best effort */ }
-}
+// Silent on write failure by design: this hook must never add noise to a
+// delivered reply. PLAINSPEAK_DEBUG is read per call, not at module load.
+const debug = createDebugLogger({
+  stateDir: STATE_DIR,
+  isEnabled: () => process.env.PLAINSPEAK_DEBUG === '1',
+});
 
-export function sanitizeCwd(cwd) {
-  if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) return null;
-  const resolved = path.resolve(cwd);
-  return resolved === cwd ? resolved : null;
-}
+// Re-exported so this file's public API is unchanged now that
+// core/transcript.mjs owns the implementation.
+export { sanitizeCwd, endsWithTrailingQuestion, readTranscriptTail };
 
 export function isDisabled(cwd) {
   if (process.env.PLAINSPEAK_DISABLED === '1') return true;
@@ -73,72 +77,6 @@ export function isDisabled(cwd) {
   }
 }
 
-/** Mirrors supervisor-on-stop.mjs's readTranscriptTail — kept local (see file header). */
-export function readTranscriptTail(filePath, maxBytes = TRANSCRIPT_MAX_BYTES) {
-  let stat;
-  try {
-    stat = fs.statSync(filePath);
-  } catch {
-    return [];
-  }
-  const fileSize = stat.size;
-  const readSize = Math.min(maxBytes, fileSize);
-  const offset = fileSize - readSize;
-  let buffer;
-  let fd;
-  try {
-    buffer = Buffer.alloc(readSize);
-    fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buffer, 0, readSize, offset);
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
-    }
-  }
-  const rawText = buffer.toString('utf8');
-  const lines = rawText.split('\n');
-  const startIdx = offset === 0 ? 0 : 1;
-  const filtered = [];
-  for (let i = startIdx; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const t = entry?.type;
-    if (t === 'user' || t === 'assistant') {
-      if (t === 'user') {
-        const content = entry?.message?.content;
-        if (Array.isArray(content) && content.every((c) => c?.type === 'tool_result')) continue;
-      }
-      filtered.push(entry);
-    }
-  }
-  return filtered.slice(-TRANSCRIPT_MAX_ENTRIES);
-}
-
-export function endsWithTrailingQuestion(text) {
-  if (typeof text !== 'string') return false;
-  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  if (lines.length === 0) return false;
-  return lines[lines.length - 1].endsWith('?');
-}
-
-function textOfUserEntry(entry) {
-  const content = entry?.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const block = content.find((c) => c?.type === 'text' && typeof c.text === 'string');
-    if (block) return block.text;
-  }
-  return null;
-}
-
 /**
  * Fingerprint of the last genuine (non-injected) user message, truncated to
  * 300 chars — used to scope the one-rewrite-per-turn cap to the current human
@@ -148,17 +86,7 @@ function textOfUserEntry(entry) {
  * must treat null as "unknown" and never fire (see main()).
  */
 export function computeTurnKey(transcriptTail) {
-  const entries = Array.isArray(transcriptTail) ? transcriptTail : [];
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry?.type !== 'user') continue;
-    const text = textOfUserEntry(entry);
-    if (!text) continue;
-    if (text.includes(SELF_ASSESSMENT_MARKER) || text.includes(FEEDBACK_MARKER) || text.includes(PLAINSPEAK_MARKER)) continue;
-    const trimmed = text.trim();
-    if (trimmed) return trimmed.slice(0, 300);
-  }
-  return null;
+  return computeTurnKeyFromTranscript(transcriptTail, { extraMarkers: [PLAINSPEAK_MARKER] });
 }
 
 export function extractFinalAssistantText(payload, transcriptTail) {
@@ -310,16 +238,6 @@ export function shouldCallLlm(scored) {
   if (process.env.PLAINSPEAK_STRICT_TERSE_EXIT === '1') return false;
   const floor = STYLE_RULES?.thresholds?.shortReplyWords ?? 40;
   return (scored?.stats?.proseWords ?? 0) >= floor;
-}
-
-async function readStdin() {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => chunks.push(chunk));
-    process.stdin.on('end', () => resolve(chunks.join('')));
-    process.stdin.on('error', reject);
-  });
 }
 
 async function main() {

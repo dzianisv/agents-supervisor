@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
   FEEDBACK_MARKER,
-  isNonHumanUserMessage, isNonHumanUserText, hashReply, evaluateNoProgress,
+  isNonHumanUserText, hashReply, evaluateNoProgress,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
   hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
@@ -43,6 +43,13 @@ import {
 } from '../core/task-context.mjs';
 import { shouldSkipReflection } from '../core/turn-classifier.mjs';
 import { parseLoopExitSentinel, appendLoopExitLog } from '../core/loop-exit.mjs';
+// THE shared Stop-hook primitives — see core/transcript.mjs. These used to be
+// private copies here and in bin/plainspeak-on-stop.mjs; sanitizeCwd's two
+// copies had already drifted apart on their failure mode.
+import {
+  sanitizeCwd, readTranscriptTail, endsWithTrailingQuestion, readStdin,
+  createDebugLogger, computeTurnKeyFromMessages,
+} from '../core/transcript.mjs';
 
 // Plugin's own shipped .agents/supervisor dir — fallback defaults when a
 // project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
@@ -51,8 +58,6 @@ const defaultsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..'
 
 const STATE_DIR = '.supervisor';
 const DEBUG_ENABLED = (process.env.SUPERVISOR_DEBUG ?? process.env.REFLECTION_CC_DEBUG) === '1';
-const TRANSCRIPT_MAX_BYTES = 200_000;
-const TRANSCRIPT_MAX_ENTRIES = 50;
 const ASSESSMENT_MODEL = process.env.SUPERVISOR_MODEL ?? process.env.REFLECTION_CC_MODEL ?? 'claude-opus-4-8';
 const ASSESSMENT_TIMEOUT_MS = 20_000;
 // CC allows only 8 consecutive Stop-hook {decision:'block'} responses within
@@ -95,79 +100,30 @@ function _debugRaw(obj) {
   }
 }
 
-export function debug(obj, cwd) {
-  if (!DEBUG_ENABLED) return;
-  const dir = path.join(cwd ?? process.cwd(), STATE_DIR);
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n';
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, 'debug.log'), line);
-  } catch (err) {
-    process.stderr.write(`[on-stop.mjs] debug write failed: ${err}\n`);
-  }
-}
+export const debug = createDebugLogger({
+  stateDir: STATE_DIR,
+  isEnabled: () => DEBUG_ENABLED,
+  onError: (err, line) => process.stderr.write(`[on-stop.mjs] debug write failed: ${err}\n`),
+});
 
-export function sanitizeCwd(cwd) {
-  if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) {
-    throw new Error('supervisor: invalid cwd');
-  }
-  const resolved = path.resolve(cwd);
-  if (resolved !== cwd) throw new Error('supervisor: invalid cwd');
-  return resolved;
-}
+// Re-exported so the hook's public API (see file header) is unchanged now that
+// core/transcript.mjs owns the implementation.
+export { sanitizeCwd, endsWithTrailingQuestion, readTranscriptTail };
 
 export function loopGuard(stopPayload) {
   return stopPayload?.stop_hook_active === true;
 }
 
 /**
- * True when the agent's final message is a genuine question to the user
- * (its last non-empty line ends in '?'). Forcing a continuation over an open
- * question recreates the "ignore the human" pattern this supervisor exists
- * to catch — a trailing question means the correct status is
- * waiting_for_user, so callers should skip the judge entirely.
- */
-export function endsWithTrailingQuestion(text) {
-  if (typeof text !== 'string') return false;
-  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  if (lines.length === 0) return false;
-  return lines[lines.length - 1].endsWith('?');
-}
-
-/**
- * Fingerprint of the last genuine (non-supervisor-injected) user message —
- * mirrors opencode's getLastRelevantUserMessageId/getMessageSignature. CC's
- * normalized messages carry no message IDs/timestamps, so the key is a
- * truncated text fingerprint of the real user turn. Used to scope the
- * per-attempt counter to the CURRENT human turn: a new real message means a
- * new turn_key, which resets the counter, while an autonomous
- * (goal/autopilot) loop that never sees new human input keeps the same
- * turn_key across many Stop events. Returns null when no genuine user
- * message is found (e.g. empty/unreadable transcript) — callers must treat
- * null as "unknown" and skip turn-key-based reset/dedup rather than forcing
- * a reset.
+ * Fingerprint of the last genuine (non-supervisor-injected) user message.
+ * Implementation lives in core/transcript.mjs — shared with the plainspeak
+ * Stop hook, which scans the raw transcript shape instead of the normalized
+ * one. Returns null when no genuine user message is found; callers must treat
+ * null as "unknown" and skip turn-key-based reset/dedup.
  * @param {Array} normalizedMessages
  * @returns {string|null}
  */
-export function computeTurnKey(normalizedMessages) {
-  const messages = Array.isArray(normalizedMessages) ? normalizedMessages : [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.info?.role !== 'user') continue;
-    // Machine-injected user records are not human turns. This covers BOTH
-    // this supervisor's own markers AND foreign Stop hooks (`isMeta:true` /
-    // `Stop hook feedback:`) — the latter used to flip the turn key on every
-    // Stop event, resetting readAttempts to 0 forever.
-    if (isNonHumanUserMessage(msg)) continue;
-    for (const part of msg.parts ?? []) {
-      if (part?.type !== 'text' || typeof part.text !== 'string') continue;
-      if (isNonHumanUserText(part.text)) continue;
-      const trimmed = part.text.trim();
-      if (trimmed) return trimmed.slice(0, 300);
-    }
-  }
-  return null;
-}
+export const computeTurnKey = computeTurnKeyFromMessages;
 
 export function readAttempts(session_id, cwd, turnKey) {
   // Backed by .supervisor/sessions/<session_id>/state.json (core/session-store.mjs),
@@ -213,54 +169,6 @@ export function writeHealthSignal(cwd, obj) {
   } catch {
     /* best-effort observability only */
   }
-}
-
-export function readTranscriptTail(filePath, maxBytes = TRANSCRIPT_MAX_BYTES) {
-  let stat;
-  try {
-    stat = fs.statSync(filePath);
-  } catch {
-    return [];
-  }
-  const fileSize = stat.size;
-  const readSize = Math.min(maxBytes, fileSize);
-  const offset = fileSize - readSize;
-  let buffer;
-  let fd;
-  try {
-    buffer = Buffer.alloc(readSize);
-    fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buffer, 0, readSize, offset);
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
-    }
-  }
-  const rawText = buffer.toString('utf8');
-  const lines = rawText.split('\n');
-  const startIdx = offset === 0 ? 0 : 1;
-  const filtered = [];
-  for (let i = startIdx; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const t = entry?.type;
-    if (t === 'user' || t === 'assistant') {
-      if (t === 'user') {
-        const content = entry?.message?.content;
-        if (Array.isArray(content) && content.every((c) => c?.type === 'tool_result')) continue;
-      }
-      filtered.push(entry);
-    }
-  }
-  return filtered.slice(-TRANSCRIPT_MAX_ENTRIES);
 }
 
 export function buildStopContext(stopPayload, transcriptTail) {
@@ -710,16 +618,6 @@ export function buildFakeAssessment(taskContext, category) {
   };
 }
 
-async function readStdin() {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => chunks.push(chunk));
-    process.stdin.on('end', () => resolve(chunks.join('')));
-    process.stdin.on('error', reject);
-  });
-}
-
 async function main() {
   const input = await readStdin();
   let payload;
@@ -727,6 +625,20 @@ async function main() {
     payload = JSON.parse(input);
   } catch (err) {
     debug({ msg: 'stdin_parse_error', error: String(err) }, process.cwd());
+    process.exit(0);
+  }
+
+  // 0. Resolve and validate cwd FIRST, before any code that logs. `debug()`
+  // writes `<cwd>/.supervisor/debug.log`, so handing it the RAW `payload.cwd`
+  // — a value that came straight off stdin — writes the log wherever that
+  // string points, which is precisely what sanitizeCwd exists to prevent.
+  // sanitizeCwd is TOTAL and returns null on a bad cwd (see core/transcript.mjs
+  // for why null beat the throw this file used to use). Fail open, explicitly
+  // and visibly, instead of unwinding into the process-level rejection
+  // backstop where a bad input is indistinguishable from a real crash.
+  const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
+  if (!cwd) {
+    debug({ msg: 'invalid_cwd', session_id: payload?.session_id, cwd: payload?.cwd }, process.cwd());
     process.exit(0);
   }
 
@@ -741,11 +653,10 @@ async function main() {
   // capped at min(runawayLimit, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP), is now the
   // sole continuation gate.
   if (loopGuard(payload)) {
-    debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, payload.cwd);
+    debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, cwd);
   }
 
   const { session_id, transcript_path } = payload;
-  const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
 
   // 1.5. Session-scoped disable check + record current session.
   //

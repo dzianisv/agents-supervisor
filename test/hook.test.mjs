@@ -42,11 +42,91 @@ test('endsWithTrailingQuestion: false for statements, non-strings, and empty inp
   assert.equal(endsWithTrailingQuestion(42), false);
 });
 
-test('sanitizeCwd rejects relative / traversal paths', () => {
+// CONTRACT: sanitizeCwd is TOTAL — it returns null for a bad cwd, it never
+// throws. It used to throw HERE and return null in bin/plainspeak-on-stop.mjs
+// under the same name; core/transcript.mjs now owns the single copy. Null is
+// the contract a caller actually reads (plainspeak's `if (!cwd) exit(0)`);
+// nothing ever caught the throw, it just unwound into the process-level
+// unhandledRejection backstop.
+test('sanitizeCwd returns null (never throws) for relative / traversal / non-string paths', () => {
   const d = mkcwd();
   assert.equal(sanitizeCwd(d), d);
-  assert.throws(() => sanitizeCwd('rel/path'));
-  assert.throws(() => sanitizeCwd(`${d}/../foo`));
+  assert.equal(sanitizeCwd('rel/path'), null);
+  assert.equal(sanitizeCwd(`${d}/../foo`), null);
+  assert.equal(sanitizeCwd(undefined), null);
+  assert.equal(sanitizeCwd(42), null);
+});
+
+test('sanitizeCwd is the same function in both Stop hooks', async () => {
+  const plainspeak = await import('../bin/plainspeak-on-stop.mjs');
+  const core = await import('../core/transcript.mjs');
+  assert.equal(sanitizeCwd, core.sanitizeCwd, 'supervisor hook must not define its own copy');
+  assert.equal(plainspeak.sanitizeCwd, core.sanitizeCwd, 'plainspeak hook must not define its own copy');
+});
+
+// CONTRACT: the shared debug logger is TOTAL. plainspeak's private copy
+// wrapped its ENTIRE body in try/catch and documented "best effort";
+// supervisor's built the path and the JSON line OUTSIDE the try. Sharing one
+// body must not export the weaker guarantee — a Stop hook that dies inside its
+// own logger takes the turn with it, and plainspeak's whole design rule is
+// that it must never disturb a delivered reply.
+test('createDebugLogger never throws: bad cwd, unserializable payload, throwing onError', async () => {
+  const { createDebugLogger } = await import('../core/transcript.mjs');
+  const seen = [];
+  const d = createDebugLogger({
+    stateDir: '.supervisor',
+    isEnabled: () => true,
+    onError: (err, line) => { seen.push([err, line]); },
+  });
+  // path.join(cwd, ...) throws TypeError on any non-string cwd.
+  for (const badCwd of [42, {}, [], Symbol('x'), true]) {
+    assert.doesNotThrow(() => d({ msg: 'x' }, badCwd), `cwd=${String(badCwd)}`);
+  }
+  // JSON.stringify throws on circular / BigInt payloads.
+  const circular = { msg: 'c' };
+  circular.self = circular;
+  assert.doesNotThrow(() => d(circular, mkcwd()));
+  assert.doesNotThrow(() => d({ msg: 'b', n: 1n }, mkcwd()));
+  assert.ok(seen.length >= 7, `onError should have observed every failure, got ${seen.length}`);
+  // A serialization failure has no line to report.
+  assert.ok(seen.some(([, line]) => line === null), 'serialization failure reports line=null');
+
+  // An onError that itself throws must not escape either.
+  const boom = createDebugLogger({
+    stateDir: '.supervisor',
+    isEnabled: () => true,
+    onError: () => { throw new Error('onError exploded'); },
+  });
+  assert.doesNotThrow(() => boom({ msg: 'x' }, 42));
+
+  // A throwing isEnabled must not escape.
+  const badGate = createDebugLogger({
+    stateDir: '.supervisor',
+    isEnabled: () => { throw new Error('env read exploded'); },
+  });
+  assert.doesNotThrow(() => badGate({ msg: 'x' }, mkcwd()));
+});
+
+// A logger that writes `<cwd>/.supervisor/debug.log` must never be handed the
+// RAW `payload.cwd` off stdin — that is exactly what sanitizeCwd exists to
+// prevent, and the supervisor hook used to log `stop_hook_active_seen` with
+// the unvalidated value BEFORE it ever called sanitizeCwd.
+test('supervisor main() validates cwd before any debug() call', () => {
+  const src = fs.readFileSync(path.join(PROJECT_ROOT, 'bin/supervisor-on-stop.mjs'), 'utf8');
+  const body = src.slice(src.indexOf('async function main()'));
+  assert.ok(body.includes('async function main()'), 'main() must exist');
+  const sanitizeAt = body.indexOf('sanitizeCwd(payload?.cwd');
+  assert.ok(sanitizeAt > 0, 'main() must sanitize payload.cwd');
+  assert.equal(
+    /debug\([^)]*\},\s*payload[?.]*\.cwd\s*\)/.test(body), false,
+    'no debug() call may pass the raw payload.cwd',
+  );
+  // The only debug() calls allowed before the sanitize are the ones that
+  // explicitly pass process.cwd() (the stdin-parse failure path).
+  const before = body.slice(0, sanitizeAt);
+  for (const call of before.match(/debug\([\s\S]*?\);/g) ?? []) {
+    assert.ok(call.includes('process.cwd()'), `debug() before sanitizeCwd must use process.cwd(): ${call}`);
+  }
 });
 
 test('attempt counter: round-trips and is monotonic', () => {
