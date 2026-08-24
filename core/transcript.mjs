@@ -239,19 +239,32 @@ export function readStdin() {
  * `isEnabled` is a function, not a boolean, so a caller may read env at call
  * time rather than at module load.
  *
- * @param {{stateDir:string, isEnabled:() => boolean, file?:string, onError?:(err:unknown, line:string)=>void}} opts
+ * CONTRACT: the returned logger is TOTAL — a logger that can throw is a logger
+ * that can kill the turn it was only supposed to describe. `path.join` throws a
+ * TypeError on a non-string `cwd` and `JSON.stringify` throws on a circular or
+ * BigInt-bearing `obj`, so BOTH the path build and the serialization live
+ * inside the try, not just the write. (plainspeak's private copy wrapped its
+ * whole body and documented "best effort"; supervisor's did not. Sharing one
+ * body must not quietly export the weaker of the two guarantees — plainspeak in
+ * particular must never add noise to, or abort, a delivered reply.) `onError`
+ * is called for any failure and is itself guarded: a throwing `onError` cannot
+ * escape either. `line` is passed as null when the failure was the
+ * serialization itself.
+ *
+ * @param {{stateDir:string, isEnabled:() => boolean, file?:string, onError?:(err:unknown, line:string|null)=>void}} opts
  * @returns {(obj:object, cwd?:string) => void}
  */
 export function createDebugLogger({ stateDir, isEnabled, file = 'debug.log', onError }) {
   return function debug(obj, cwd) {
-    if (!isEnabled()) return;
-    const dir = path.join(cwd ?? process.cwd(), stateDir);
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n';
+    let line = null;
     try {
+      if (!isEnabled()) return;
+      const dir = path.join(cwd ?? process.cwd(), stateDir);
+      line = JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n';
       fs.mkdirSync(dir, { recursive: true });
       fs.appendFileSync(path.join(dir, file), line);
     } catch (err) {
-      if (onError) onError(err, line);
+      try { if (onError) onError(err, line); } catch { /* a logger must never throw */ }
     }
   };
 }

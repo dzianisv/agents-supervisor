@@ -628,6 +628,20 @@ async function main() {
     process.exit(0);
   }
 
+  // 0. Resolve and validate cwd FIRST, before any code that logs. `debug()`
+  // writes `<cwd>/.supervisor/debug.log`, so handing it the RAW `payload.cwd`
+  // — a value that came straight off stdin — writes the log wherever that
+  // string points, which is precisely what sanitizeCwd exists to prevent.
+  // sanitizeCwd is TOTAL and returns null on a bad cwd (see core/transcript.mjs
+  // for why null beat the throw this file used to use). Fail open, explicitly
+  // and visibly, instead of unwinding into the process-level rejection
+  // backstop where a bad input is indistinguishable from a real crash.
+  const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
+  if (!cwd) {
+    debug({ msg: 'invalid_cwd', session_id: payload?.session_id, cwd: payload?.cwd }, process.cwd());
+    process.exit(0);
+  }
+
   // 1. Stop-hook re-invocation marker — logged only, never an exit gate. CC
   // sets stop_hook_active=true on every Stop event that follows a prior
   // {decision:'block'} in the same chain, i.e. on essentially every injected
@@ -639,19 +653,10 @@ async function main() {
   // capped at min(runawayLimit, CLAUDE_CODE_STOP_HOOK_BLOCK_CAP), is now the
   // sole continuation gate.
   if (loopGuard(payload)) {
-    debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, payload.cwd);
+    debug({ msg: 'stop_hook_active_seen', session_id: payload.session_id }, cwd);
   }
 
   const { session_id, transcript_path } = payload;
-  // sanitizeCwd is TOTAL and returns null on a bad cwd (see core/transcript.mjs
-  // for why null beat the throw this file used to use). Fail open, explicitly
-  // and visibly, instead of unwinding into the process-level rejection
-  // backstop where a bad input is indistinguishable from a real crash.
-  const cwd = sanitizeCwd(payload?.cwd ?? process.cwd());
-  if (!cwd) {
-    debug({ msg: 'invalid_cwd', session_id, cwd: payload?.cwd }, process.cwd());
-    process.exit(0);
-  }
 
   // 1.5. Session-scoped disable check + record current session.
   //
