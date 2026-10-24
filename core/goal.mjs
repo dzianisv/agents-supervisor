@@ -612,9 +612,8 @@ export const goalStore = {
   },
   /**
    * Mirror of the OpenCode-side supervisorStore.setStatusDiagram so both
-   * runtimes read the same on-disk key. ABSENT MEANS ON — only an explicit
-   * `false` disables the status.md/roadmap directive, so every session
-   * written before this key existed keeps the feature. Read it through
+   * runtimes read the same on-disk key. ABSENT MEANS OFF — only an explicit
+   * `true` enables the status.md/roadmap directive. Read it through
    * isStatusDiagramEnabled(), never as a bare truthiness test.
    */
   setStatusDiagram(cwd, sessionId, enabled) {
@@ -663,11 +662,12 @@ export const goalStore = {
 };
 
 /**
- * Default-on gate for the status directive. `undefined` (never toggled) and
- * `true` both mean on. Shared by both runtimes.
+ * Default-OFF gate for the status directive. Only an explicit
+ * `/supervisor status on` (`statusDiagram: true`) enables it; `undefined`
+ * (never toggled) and `false` both mean off. Shared by both runtimes.
  */
 export function isStatusDiagramEnabled(state) {
-  return state?.statusDiagram !== false;
+  return state?.statusDiagram === true;
 }
 
 /**

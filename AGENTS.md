@@ -244,7 +244,7 @@ nothing.
 
 ### `test/status-directive.test.mjs` — status/roadmap directive
 
-`STATUS_DIAGRAM_DIRECTIVE` leads with `STATUS_DIRECTIVE_MARKER` and `appendStatusDirectiveToSystem` is idempotent — `experimental.chat.system.transform` fires more than once per user turn on opencode 1.17.9, so a naive push duplicates the directive. `checkStatusCompliance` is deterministic and LLM-free (it runs on the complete path) and fails OPEN: unknown turn start lets any existing `status.md` count. `isStatusDiagramEnabled` is default-ON — absent/undefined mean on, only an explicit `false` disables.
+`STATUS_DIAGRAM_DIRECTIVE` leads with `STATUS_DIRECTIVE_MARKER` and `appendStatusDirectiveToSystem` is idempotent — `experimental.chat.system.transform` fires more than once per user turn on opencode 1.17.9, so a naive push duplicates the directive. `checkStatusCompliance` is deterministic and LLM-free (it runs on the complete path) and fails OPEN: unknown turn start lets any existing `status.md` count. `isStatusDiagramEnabled` is default-OFF — absent/undefined/`false` mean off, only an explicit `true` (`/supervisor status on`) enables.
 
 E2E coverage in `test/e2e-opencode.test.mjs` under `describe("status directive system-prompt injection")` asserts at the fixture LLM, i.e. on the wire: opencode 1.17.9 never populates `AssistantMessage.system` in the REST transcript, so a transcript assertion would pass vacuously. Also pins the FLAT dotted hook key — opencode resolves hooks by literal `hooks[name]` lookup, and a nested `{experimental:{chat:{system:{transform}}}}` object is silently ignored.
 

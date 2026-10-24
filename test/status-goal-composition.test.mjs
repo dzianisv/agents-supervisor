@@ -222,7 +222,7 @@ describe("autopilot nudge honours /supervisor:status off (opencode runtime)", ()
     tmpDir = mkdtempSync(join(tmpdir(), "sup-comp-autopilot-"))
   })
 
-  test("default-on: the nudge carries the directive", async () => {
+  test("default-off: the nudge carries no directive", async () => {
     writeState(tmpDir, ACTIVE_SESSION_ID, { mode: "autopilot", autopilot: true })
     const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
@@ -230,7 +230,18 @@ describe("autopilot nudge honours /supervisor:status off (opencode runtime)", ()
     await new Promise((r) => setTimeout(r, 400))
     const nudge = activePrompts()[0]?.text || ""
     assert.match(nudge, /Autopilot/)
-    assert.ok(nudge.includes(STATUS_DIRECTIVE_MARKER), "default-on nudge must carry the directive")
+    assert.ok(!nudge.includes(STATUS_DIRECTIVE_MARKER), "default-off nudge must not carry the directive")
+  })
+
+  test("statusDiagram:true: the nudge carries the directive", async () => {
+    writeState(tmpDir, ACTIVE_SESSION_ID, { mode: "autopilot", autopilot: true, statusDiagram: true })
+    const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+    await new Promise((r) => setTimeout(r, 400))
+    const nudge = activePrompts()[0]?.text || ""
+    assert.match(nudge, /Autopilot/)
+    assert.ok(nudge.includes(STATUS_DIRECTIVE_MARKER), "explicitly-enabled nudge must carry the directive")
   })
 
   test("statusDiagram:false: the nudge is still sent, without the directive", async () => {
@@ -278,8 +289,16 @@ describe("system-prompt gate resolves the session directory without a warm cache
     assert.ok(!system.some((s) => s.includes(STATUS_DIRECTIVE_MARKER)), "disabled session must not receive the directive")
   })
 
-  test("control: the same cold plugin DOES inject for an enabled session", async () => {
+  test("default-off: a session that never toggled the directive is not injected", async () => {
     writeState(serverDir, ACTIVE_SESSION_ID, { projectDir })
+    const { client } = createMockClient(makeMessages("hi", projectDir), completeAssessment())
+    const plugin = await SupervisorPlugin({ client, directory: serverDir })
+    const system = await transform(plugin, ACTIVE_SESSION_ID)
+    assert.ok(!system.some((s) => s.includes(STATUS_DIRECTIVE_MARKER)), "default-off session must not receive the directive")
+  })
+
+  test("control: the same cold plugin DOES inject for an enabled session", async () => {
+    writeState(serverDir, ACTIVE_SESSION_ID, { projectDir, statusDiagram: true })
     const { client } = createMockClient(makeMessages("hi", projectDir), completeAssessment())
     const plugin = await SupervisorPlugin({ client, directory: serverDir })
     const system = await transform(plugin, ACTIVE_SESSION_ID)
@@ -388,7 +407,7 @@ describe("supervisor toggle: off/on still wins over mode after the status branch
 
   test("status report renders the directive state and does not mutate anything", async () => {
     const out = await toggle({ action: "status" }, { sessionID: ACTIVE_SESSION_ID })
-    assert.match(out, /status directive: on/)
+    assert.match(out, /status directive: off/)
     assert.match(out, /enabled: yes/)
   })
 })

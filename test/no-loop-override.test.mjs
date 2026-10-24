@@ -257,7 +257,12 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
 
     // No status.md in tmpDir and the final assistant text has no roadmap
-    // block => non-compliant. statusDiagram is left absent, i.e. default ON.
+    // block => non-compliant. statusDiagram is default OFF, so opt in explicitly.
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
+    writeFileSync(
+      statePath(tmpDir, ACTIVE_SESSION_ID),
+      JSON.stringify({ statusDiagram: true })
+    )
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
     await new Promise((r) => setTimeout(r, 5000))

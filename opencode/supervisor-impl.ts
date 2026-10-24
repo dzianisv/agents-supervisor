@@ -2879,7 +2879,7 @@ You are in autopilot mode. Continue working on the current task. Do not stop to 
 When you have genuinely completed ALL work (not just one step), call the supervisor_loop_exit tool (reason: completed) to hand control back. If this nudge is looping without progress, call it with reason: stuck.
 
 Continue now.`
-          // Gated by the same default-on `statusDiagram` flag the Claude Code
+          // Gated by the same default-off `statusDiagram` flag the Claude Code
           // hook uses (bin/supervisor-on-stop.mjs), so `/supervisor:status
           // off` silences the directive on BOTH runtimes. Before this, the
           // opencode nudge appended it unconditionally and the toggle was a

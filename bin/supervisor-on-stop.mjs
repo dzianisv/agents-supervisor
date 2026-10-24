@@ -1006,7 +1006,7 @@ async function main() {
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
     // Parity with the OpenCode autopilot nudge (opencode/supervisor-impl.ts):
     // the status/roadmap directive rides along with EVERY continuation, on
-    // both runtimes. Gated by the same default-on `statusDiagram` flag, so
+    // both runtimes. Gated by the same default-off `statusDiagram` flag, so
     // `/supervisor:status off` silences it here too.
     //
     // The attempt number is tracked and written to the verdict/debug log, but
