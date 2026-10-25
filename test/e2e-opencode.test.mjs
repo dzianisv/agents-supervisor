@@ -45,6 +45,7 @@ import assert from "node:assert/strict"
 import { readFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { startLiveServer, hasOpencode } from "./helpers/live-server.mjs"
+import { sessionStore } from "../core/session-store.mjs"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -456,6 +457,9 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
       assert.equal(createRes.status, 200)
       const session = await createRes.json()
+      // Status is opt-in. Seed it before the first model turn rather than
+      // assuming the obsolete default-ON behavior or spending a toggle turn.
+      sessionStore.mutate(tmpDir, session.id, (state) => { state.statusDiagram = true })
 
       // The very first turn of the session — the one the supervisor's
       // continuation-prompt path can never reach, which is the whole reason
@@ -829,7 +833,8 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
   const model = { providerID: "test-fixture", modelID: "fixture-model" }
   /** probe -> number of judge calls seen for that session so far. */
   let judgeCalls
-  /** probe -> how many judge calls to answer "incomplete" before "complete". */
+  const lastJudgedReply = new Map()
+  /** probe -> how many distinct agent replies to answer "incomplete" before "complete". */
   const completeAfter = new Map()
 
   before(async () => {
@@ -843,7 +848,12 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
         // cannot express "this session"; content can.
         const probe = [...completeAfter.keys()].find((p) => ctx.fullText.includes(p))
         if (!probe) return verdict()
-        const n = (judgeCalls.get(probe) || 0) + 1
+        // OpenCode can emit duplicate idle events for one assistant reply.
+        // Rejudging unchanged evidence is not another agent iteration.
+        const reply = ctx.fullText.match(/Made some progress on attempt \d+\. Stopping here for now\./g)?.at(-1)
+        const changed = reply !== lastJudgedReply.get(probe)
+        const n = (judgeCalls.get(probe) || 0) + (changed ? 1 : 0)
+        if (changed) lastJudgedReply.set(probe, reply)
         judgeCalls.set(probe, n)
         const limit = completeAfter.get(probe)
         // ACTIONLESS sentinel first: `-1` must not fall into the `n > limit`
