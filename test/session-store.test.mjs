@@ -38,7 +38,7 @@ import {
   GC_MAX_AGE_MS,
   GC_MAX_SESSIONS,
 } from '../core/session-store.mjs';
-import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
+import { goalStore } from '../core/goal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(__dirname, '..', 'bin', 'supervisor.mjs');
@@ -165,10 +165,10 @@ describe('migration from the old layout', () => {
     assert.equal(state.maxAttempts, 9, 'retry override survives');
     assert.equal(state.statusDiagram, false, 'flags survive');
     assert.equal(state.projectDir, cwd);
-    // A legacy mode:'goal' is migrated forward to reflection at load time (goal
-    // is no longer a mode), with the goal object itself preserved verbatim.
-    assert.equal(state.mode, 'reflection', 'legacy mode:goal must migrate to reflection');
-    assert.equal(resolveSupervisorMode(state), 'reflection');
+    assert.equal(state.mode, undefined, 'obsolete modes are stripped without losing the goal');
+    assert.equal(state.autopilot, undefined);
+    assert.equal(state.goal.source, 'user', 'legacy goals remain user-owned');
+    assert.equal(state.goal.acceptanceCriteria, 'legacy goal');
     assert.deepEqual(readDisabled(cwd), [sid], 'the disabled flag must NOT be lost');
   });
 
@@ -218,6 +218,32 @@ describe('migration from the old layout', () => {
     assert.equal(goalStore.load(cwd, sid).goal.condition, 'current goal');
   });
 
+  test('every obsolete mode migrates without losing contracts, counters or flags', () => {
+    for (const mode of ['goal', 'reflection', 'autopilot']) {
+      const cwd = tmpProject();
+      sessionStore.save(cwd, mode, {
+        mode, autopilot: true, maxAttempts: 9, statusDiagram: true,
+        attempts: { turnKey: 'human-1', count: 4 },
+        goal: { condition: 'Run the login checks', status: 'active', acceptanceCriteria: 'valid and invalid inputs tested', verification: 'node --test login.mjs' },
+      });
+      const state = sessionStore.load(cwd, mode);
+      assert.equal(state.mode, undefined);
+      assert.equal(state.autopilot, undefined);
+      assert.equal(state.goal.condition, 'Run the login checks');
+      assert.equal(state.goal.verification, 'node --test login.mjs');
+      assert.equal(state.goal.acceptanceCriteria, 'valid and invalid inputs tested');
+      assert.equal(state.goal.source, 'user');
+      assert.equal(state.maxAttempts, 9);
+      assert.equal(state.statusDiagram, true);
+      assert.equal(state.attempts.count, 4);
+      goalStore.setRetry(cwd, mode, 12);
+      const bytes = JSON.parse(fs.readFileSync(statePath(cwd, mode), 'utf8'));
+      assert.equal(bytes.mode, undefined);
+      assert.equal(bytes.autopilot, undefined);
+      assert.equal(bytes.goal.condition, 'Run the login checks');
+    }
+  });
+
   test('a session with no footprint at all reads as {}', () => {
     const cwd = tmpProject();
     assert.deepEqual(goalStore.load(cwd, 'ses_never_seen'), {});
@@ -253,12 +279,12 @@ describe('two concurrent sessions in one project', () => {
     const A = 'ses_leak_a';
     const B = 'ses_leak_b';
     goalStore.setGoal(cwd, A, 'goal A');
-    goalStore.setMode(cwd, B, 'autopilot');
+    goalStore.setRetry(cwd, B, 9);
 
     assert.equal(goalStore.load(cwd, A).goal.condition, 'goal A');
-    assert.equal(goalStore.load(cwd, A).mode, 'reflection');
+    assert.equal(goalStore.load(cwd, A).maxAttempts, undefined);
     assert.equal(goalStore.load(cwd, B).goal, undefined, "B must not see A's goal");
-    assert.equal(goalStore.load(cwd, B).mode, 'autopilot');
+    assert.equal(goalStore.load(cwd, B).maxAttempts, 9);
   });
 
   test('attempt counters are independent per session', () => {

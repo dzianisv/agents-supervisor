@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import { scoreVerbosity, buildStylePrompt, buildRewriteDirective, STYLE_RULES } from '../core/verbosity.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
-import { goalStore, resolveSupervisorMode } from '../core/goal.mjs';
+import { goalStore, readProjectGoalCondition } from '../core/goal.mjs';
 // THE shared Stop-hook primitives — see core/transcript.mjs. These used to be
 // private copies here and in bin/supervisor-on-stop.mjs; sanitizeCwd's two
 // copies had already drifted apart on their failure mode.
@@ -135,17 +135,16 @@ export function alreadyFiredThisTurn(sessionId, turnKey, cwd) {
 // --- Supervisor coexistence guard -------------------------------------------
 
 /**
- * Deterministic, non-racy half of the guard: an active supervisor goal or
- * autopilot drive was armed on a PRIOR turn (persisted state, no timing
+ * Deterministic, non-racy half of the guard: an active supervisor goal
+ * was armed on a PRIOR turn (persisted state, no timing
  * dependency) — always defer while one is running. High confidence: this
  * reads state that was committed before the current Stop event even fired.
  */
 export function supervisorGoalActive(cwd, sessionId) {
   try {
     const state = goalStore.load(cwd, sessionId);
-    const mode = resolveSupervisorMode(state);
-    if (mode === 'autopilot') return true;
     if (state?.goal?.status === 'active') return true;
+    if (!state?.goal && state.goalCleared !== true && readProjectGoalCondition(cwd)) return true;
     return false;
   } catch {
     return false;

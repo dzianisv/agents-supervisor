@@ -144,7 +144,10 @@ describe("supervisor_loop_exit", () => {
     await plugin.tool.supervisor_loop_exit.execute({ reason: "completed" }, { sessionID: SESSION_ID })
     assert.equal(sessionStore.load(tmpDir, SESSION_ID).loopExit.turnKey, TURN_ONE)
 
-    // The human speaks again → new turn key.
+    // A fresh human task with an active goal must be supervised again.
+    const priorExit = sessionStore.load(tmpDir, SESSION_ID).loopExit
+    goalStore.setGoal(tmpDir, SESSION_ID, "ship the thing")
+    sessionStore.mutate(tmpDir, SESSION_ID, s => { s.loopExit = priorExit })
     msgs = makeMessages(TURN_TWO)
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
     await new Promise((r) => setTimeout(r, 4000))
@@ -203,7 +206,7 @@ describe("supervisor_loop_exit", () => {
     assert.equal(state.goal?.status, "paused")
   })
 
-  test("supervisor_loop_exit does not touch autopilot state outside autopilot mode", async () => {
+  test("completed cannot record an exit or stand down an active goal", async () => {
     // The predecessor `autopilot_exit` tool is gone (it was a second tool for
     // the same job and unconditionally called setAutopilot(false), which is
     // the footgun documented above). This pins that `supervisor_loop_exit`
@@ -218,10 +221,12 @@ describe("supervisor_loop_exit", () => {
     assert.equal(plugin.tool.autopilot_exit, undefined, "the predecessor autopilot_exit tool must not be registered")
 
     const res = await plugin.tool.supervisor_loop_exit.execute({ reason: "completed" }, { sessionID: SESSION_ID })
-    assert.match(String(res.title), /Supervision loop ended/)
+    assert.match(String(res.title), /pending judge/i)
     const state = sessionStore.load(tmpDir, SESSION_ID)
-    assert.equal(state.autopilot, false, "goal mode must never flip autopilot true from a loop-exit call")
-    assert.equal(state.goal?.condition, "ship the thing", "the active goal must survive a loop-exit call outside autopilot")
+    assert.equal(state.loopExit, undefined)
+    assert.equal(state.autopilot, undefined)
+    assert.equal(state.goal?.condition, "ship the thing")
+    assert.equal(state.goal?.status, "active")
   })
 })
 

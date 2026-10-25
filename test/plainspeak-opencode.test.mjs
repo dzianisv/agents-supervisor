@@ -9,14 +9,9 @@
  *   - `goalStore.setPlainspeak` round-tripping through the ONE session store
  *     without clobbering a neighbouring key,
  *   - the injected message shape (marker first, empty result = no injection),
- *   - and SOURCE-LEVEL pins on the three suppressions that make the feature
- *     safe: autopilot, an active goal, and the one-rewrite-per-turn guard.
- *
- * The source pins exist because those three lines have no unit-testable seam
- * (they live inside the session.idle closure) and deleting any one of them is
- * silent: autopilot would get nagged mid-work, a goal turn would get a style
- * chore instead of progress, and the turn guard is the ONLY termination proof
- * plainspeak has.
+ *   - and SOURCE-LEVEL pins on active session/project goal suppression and
+ *     the one-rewrite-per-turn guard. No-goal turns can still receive an
+ *     independent style rewrite; the completion counter is never consumed.
  */
 
 import { test, describe } from 'node:test';
@@ -194,14 +189,14 @@ describe('supervisor-impl.ts source pins', () => {
     );
   });
 
-  test('AUTOPILOT suppression is present', () => {
-    // Autopilot is mid-work by definition — never nag style.
-    assert.match(IMPL, /if \(mode === "autopilot" \|\| sup\.autopilot === true\) return false/);
+  test('no removed execution branch gates independent plainspeak', () => {
+    const start = IMPL.indexOf('async function maybeInjectPlainspeak(');
+    const helper = IMPL.slice(start, IMPL.indexOf('const scored', start));
+    assert.doesNotMatch(helper, /mode === "autopilot"|sup\.autopilot/);
   });
 
   test('ACTIVE-GOAL suppression is present', () => {
-    // A goal is an attribute now (not a mode), so the guard keys off `goal`
-    // alone — the retired `mode === "goal"` disjunct is gone.
+    // Goal work takes precedence over style chores.
     assert.match(IMPL, /if \(goal\) return false/);
     assert.match(IMPL, /if \(args\.projectGoalCondition\) return false/);
   });
@@ -231,11 +226,16 @@ describe('supervisor-impl.ts source pins', () => {
     assert.match(IMPL, /if \(!directive \|\| !directive\.trim\(\)\) return false/);
   });
 
-  test('plainspeak runs AFTER the status correction, never alongside it', () => {
+  test('plainspeak never shares a turn with status correction, including the no-goal path', () => {
+    const noGoalStart = IMPL.indexOf('if (!goal && !projectCondition) {');
+    assert.ok(noGoalStart > 0, 'no-goal path must exist independently of the judge');
+    const noGoal = IMPL.slice(noGoalStart, IMPL.indexOf('// ONE resolver', noGoalStart));
+    assert.match(noGoal, /if \(statusCorrectionSent\.get\(sessionId\) !== turnKey\) \{\s*await maybeInjectPlainspeak/);
+    assert.match(noGoal, /statusCorrectionSent\.set\(sessionId, turnKey\)[\s\S]*?promptAsync\([\s\S]*?return/);
     const correctionReturn = IMPL.indexOf('Supervisor injected status checkpoint correction for');
-    const firstPlain = IMPL.indexOf('await maybeInjectPlainspeak(');
-    assert.ok(correctionReturn > 0 && firstPlain > correctionReturn,
-      'the status correction early-return must precede every plainspeak call site');
+    const judgedPath = IMPL.slice(correctionReturn);
+    assert.ok(correctionReturn > 0 && judgedPath.indexOf('await maybeInjectPlainspeak(') > 0,
+      'the judged completion path must also perform correction before plainspeak');
   });
 
   test('the toggle is wired', () => {

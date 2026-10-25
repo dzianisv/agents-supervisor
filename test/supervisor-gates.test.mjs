@@ -153,8 +153,8 @@ function readDisabled(dir) {
 
 function readMode(dir, sessionId) {
   const p = statePath(dir, sessionId)
-  if (!existsSync(p)) return null
-  return JSON.parse(readFileSync(p, "utf-8")).mode ?? null
+  if (!existsSync(p)) return undefined
+  return JSON.parse(readFileSync(p, "utf-8")).mode
 }
 
 /**
@@ -318,10 +318,11 @@ describe("BUG B: /supervisor off must never be swallowed by a filler `mode`", ()
     assert.doesNotMatch(out, /^Supervisor mode set to/, "must not report a bare mode change for an off request")
   })
 
-  test("{mode:'reflection', action:'off'} still applies the mode and says so", async () => {
+  test("off precedes obsolete mode filler without persisting a mode", async () => {
     const out = await toggle({ mode: "reflection", action: "off" })
-    assert.equal(readMode(tmpDir, SESSION_ID), "reflection", "an explicit mode must still be stored")
-    assert.match(out, /mode also set to reflection/i, `Tool must report both axes. Got: ${out}`)
+    assert.equal(readMode(tmpDir, SESSION_ID), undefined)
+    assert.match(out, /removed/i)
+    assert.ok(readDisabled(tmpDir).includes(SESSION_ID))
   })
 
   // The single worst observed case: the user asked OFF and the supervisor was
@@ -415,18 +416,15 @@ describe("BUG B: /supervisor off must never be swallowed by a filler `mode`", ()
     assert.match(after, /enabled: no/, `Status must show the session is off. Got: ${after}`)
   })
 
-  test("a bare mode change (no action) still works", async () => {
-    const out = await toggle({ mode: "autopilot" })
-    assert.match(out, /mode set to autopilot/i)
-    assert.equal(readMode(tmpDir, SESSION_ID), "autopilot")
-    assert.ok(!readDisabled(tmpDir).includes(SESSION_ID), "a mode change must not disable the session")
-  })
-
-  test("legacy action:'reflection' / action:'autopilot' still work", async () => {
-    assert.match(await toggle({ action: "autopilot" }), /mode set to autopilot/i)
-    assert.equal(readMode(tmpDir, SESSION_ID), "autopilot")
-    assert.match(await toggle({ action: "reflection" }), /mode set to reflection/i)
-    assert.equal(readMode(tmpDir, SESSION_ID), "reflection")
+  test("obsolete mode args and actions report removal and preserve the goal", async () => {
+    writeActiveGoal(tmpDir, SESSION_ID)
+    for (const args of [{ mode: "autopilot" }, { action: "autopilot" }, { action: "reflection" }]) {
+      assert.match(await toggle(args), /removed/i)
+      assert.equal(readMode(tmpDir, SESSION_ID), undefined)
+      assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal?.status, "active")
+    }
+    assert.equal(plugin.tool.supervisor_autopilot, undefined)
+    assert.ok(!readDisabled(tmpDir).includes(SESSION_ID))
   })
 
   test("filler action ('null') falls through to status, not to off", async () => {

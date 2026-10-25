@@ -42,9 +42,11 @@
 
 import { describe, test, before, after } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs"
 import { join } from "node:path"
+import { execFileSync } from "node:child_process"
 import { startLiveServer, hasOpencode } from "./helpers/live-server.mjs"
+import { goalStore, writeProjectGoal, readProjectGoalContract, readGoalAchievedLog } from "../core/goal.mjs"
 import { sessionStore } from "../core/session-store.mjs"
 
 // ---------------------------------------------------------------------------
@@ -70,7 +72,7 @@ async function sendMessage(baseUrl, sessionId, text, timeoutMs = 60_000, opts = 
       signal: controller.signal,
     })
     clearTimeout(timer)
-    assert.equal(res.status, 200, `Expected 200 for "${text}", got ${res.status}`)
+    if (res.status !== 200) assert.fail(`Expected 200 for "${text}", got ${res.status}: ${(await res.text()).slice(0, 2000)}`)
     return await res.json()
   } catch (err) {
     clearTimeout(timer)
@@ -178,7 +180,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
   const model = { providerID: "test-fixture", modelID: "fixture-model" }
 
   before(async () => {
-    server = await startLiveServer({ label: "e2e" })
+    server = await startLiveServer({ label: "e2e", seedProject(dir) {
+      const commands = join(dir, ".opencode", "commands")
+      mkdirSync(commands, { recursive: true })
+      for (const name of ["supervisor:autopilot", "supervisor:reflection", "custom-user-command"]) {
+        writeFileSync(join(commands, `${name}.md`), `---\ndescription: Previously installed command\n---\nLegacy ${name} command.\n`)
+      }
+    } })
     baseUrl = server.baseUrl
     tmpDir = server.projectDir
     fixtureLlm = server.fixture
@@ -214,10 +222,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(commands.length > 0, "Should have at least one command registered")
 
     const commandNames = commands.map((c) => c.name)
+    assert.ok(commandNames.includes("custom-user-command"), "upgrade must preserve unrelated installed commands")
+    for (const retired of ["supervisor:autopilot", "supervisor:reflection"]) assert.ok(existsSync(join(tmpDir, ".opencode", "commands", `${retired}.md`)), "fixture must actually contain stale installed command files")
     // The supervisor plugin must register a /supervisor command
-    const hasSupervisorRelated = commandNames.some(
-      (name) => name === "autopilot" || name.includes("supervisor")
-    )
+    const hasSupervisorRelated = commandNames.includes("supervisor")
+    for (const removed of ["autopilot", "supervisor:autopilot", "supervisor:reflection"]) {
+      assert.ok(!commandNames.includes(removed), `${removed} must not be registered`)
+    }
     assert.ok(
       hasSupervisorRelated,
       `Expected a supervisor command in the registry — plugin config hook did not register it. Commands found: ${commandNames.join(", ")}`
@@ -251,7 +262,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
 
     // Give the session a task to derive a goal FROM (deriveAndSetGoal reads
     // the session transcript via buildTaskContext).
-    await sendMessage(baseUrl, session.id, "Add input validation to the login form.", 120_000, { model })
+    await sendMessage(baseUrl, session.id, "Add input validation to the login form. E2E_DERIVE_ONLY", 120_000, { model })
 
     // No condition, no existing session/project goal — must attempt LLM
     // derivation (align-supervisor-modes binding contract) rather than
@@ -271,10 +282,12 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       !existsSync(goalMdPath),
       `An auto-derived goal must NOT be persisted to ${goalMdPath} — it is session-scoped`
     )
-    assert.ok(
-      goalContent.toLowerCase().includes("derived") || goalContent.toLowerCase().includes("goal"),
-      `Expected goal response to acknowledge derivation. Got: ${goalContent.slice(0, 500)}`
-    )
+    assert.match(goalContent, /derived/i)
+    const derivedState = sessionStore.load(tmpDir, session.id)
+    assert.equal(derivedState.goal?.source, "agent")
+    assert.ok(derivedState.goal?.acceptanceCriteria)
+    assert.ok(derivedState.goal?.verification)
+    assert.ok(!existsSync(join(tmpDir, ".agents", "supervisor", "Goal.md")))
   })
 
   test("supervisor set-goal set/status/clear works", { timeout: 900_000 }, async () => {
@@ -286,32 +299,33 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     // 1. Set a goal
     const setRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal all tests pass", 300_000, { model })
     assert.ok(setRes, "Goal set response should not be null")
-    const setContent = JSON.stringify(setRes).toLowerCase()
-    assert.ok(
-      setContent.includes("goal") || setContent.includes("all tests pass"),
-      `Expected goal set response to mention "goal" or the condition. Got: ${JSON.stringify(setRes).slice(0, 500)}`
-    )
+    assert.match(JSON.stringify(setRes), /Goal set for session/)
+    assert.doesNotMatch(JSON.stringify(setRes), /FAILED/)
+    const declared = sessionStore.load(tmpDir, session.id).goal
+    assert.equal(declared?.condition, "all tests pass")
+    assert.equal(declared?.source, "user")
+    assert.equal(declared?.status, "active")
+    assert.equal(readProjectGoalContract(tmpDir)?.condition, declared.condition)
+    assert.equal(readProjectGoalContract(tmpDir)?.acceptanceCriteria, declared.acceptanceCriteria)
+    assert.equal(readProjectGoalContract(tmpDir)?.verification, declared.verification)
 
     // 2. Check status — should reflect the active goal
     const statusRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal", 300_000, { model })
     assert.ok(statusRes, "Goal status response should not be null")
-    const statusContent = JSON.stringify(statusRes).toLowerCase()
-    assert.ok(
-      statusContent.includes("all tests pass") || statusContent.includes("goal"),
-      `Expected goal status to mention the goal condition. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
-    )
+    assert.match(JSON.stringify(statusRes), /Goal \(active, source: user\)/)
+    assert.match(JSON.stringify(statusRes), /all tests pass/)
+    assert.deepEqual(sessionStore.load(tmpDir, session.id).goal, declared)
 
     // 3. Clear the goal
     const clearRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal clear", 300_000, { model })
     assert.ok(clearRes, "Goal clear response should not be null")
-    const clearContent = JSON.stringify(clearRes).toLowerCase()
-    assert.ok(
-      clearContent.includes("clear") || clearContent.includes("no goal") || clearContent.includes("removed"),
-      `Expected goal clear response to mention "clear" or "no goal". Got: ${JSON.stringify(clearRes).slice(0, 500)}`
-    )
+    assert.match(JSON.stringify(clearRes), /Goal cleared/)
+    const cleared = sessionStore.load(tmpDir, session.id)
+    assert.equal(cleared.goal, undefined)
+    assert.equal(cleared.goalCleared, true)
   })
 
-  test("supervisor reflection mode works", { timeout: 600_000 }, async () => {
+  test("obsolete mode requests explicitly report removal", { timeout: 600_000 }, async () => {
     // Create a fresh session
     const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
     assert.equal(createRes.status, 200)
@@ -322,7 +336,7 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.ok(res, "Reflection response should not be null")
     const content = JSON.stringify(res).toLowerCase()
     assert.ok(
-      content.includes("reflection") || content.includes("mode") || content.includes("supervisor"),
+      content.includes("removed"),
       `Expected reflection response to mention "reflection" or "mode". Got: ${JSON.stringify(res).slice(0, 500)}`
     )
   })
@@ -457,15 +471,13 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
       const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
       assert.equal(createRes.status, 200)
       const session = await createRes.json()
-      // Status is opt-in. Seed it before the first model turn rather than
-      // assuming the obsolete default-ON behavior or spending a toggle turn.
-      sessionStore.mutate(tmpDir, session.id, (state) => { state.statusDiagram = true })
 
       // The very first turn of the session — the one the supervisor's
       // continuation-prompt path can never reach, which is the whole reason
       // this hook exists. The probe makes the calls for THIS turn
       // identifiable in a server-wide, concurrently-written request log; see
       // turnCalls() for why an index slice cannot do that job.
+      goalStore.setStatusDiagram(tmpDir, session.id, true)
       const PROBE = "E2E_STATUS_FIRSTTURN_PROBE"
       await sendMessage(baseUrl, session.id, `Say hello. ${PROBE}`, 120_000, { model })
 
@@ -528,125 +540,123 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     })
   })
 
-  describe("autopilot mode", () => {
-    // Uses the suite-level fixture `model` — no cooldown needed since the
-    // fixture is local and instantaneous (no remote rate limiting to avoid).
+})
 
-    // Proves the real `supervisor_loop_exit` tool (opencode/supervisor-impl.ts,
-    // executeSupervisorLoopExit) round-trips end to end: enabling autopilot
-    // makes the tool available to the model; a plain, non-"/supervisor"
-    // continuation-style message (standing in for the nudge the plugin's own
-    // session.idle handler injects) causes the fixture to call it, the real
-    // server executes it, and supervisorStore records autopilot as disabled
-    // for the session — the concrete mechanism by which "the agent must call
-    // supervisor_loop_exit when work is complete" (see the autopilot tool
-    // description string) works. The predecessor `autopilot_exit` tool has
-    // been deleted (a second tool for the same job that unconditionally
-    // called setAutopilot(false), silently destroying an active goal — see
-    // AGENTS.md's stop-mechanism section); this test covers the same
-    // end-to-end behavior against its replacement.
-    test("supervisor_loop_exit tool ends autopilot mode for the session", { timeout: 300_000 }, async () => {
-      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
-      assert.equal(createRes.status, 200)
-      const session = await createRes.json()
-
-      const enableRes = await sendMessage(baseUrl, session.id, "/supervisor autopilot", 120_000, { model })
-      assert.ok(JSON.stringify(enableRes).toLowerCase().includes("autopilot"))
-
-      // Plain continuation nudge — no "/supervisor" prefix, tools available.
-      // The fixture routes this to supervisor_loop_exit (see
-      // test/helpers/opencode-fixture-llm.mjs), exactly as a real model is
-      // instructed to once "genuinely completed ALL work" (see the
-      // supervisorLoopExitDescription / continuation-nudge prompt text in
-      // opencode/supervisor-impl.ts).
-      const exitRes = await sendMessage(baseUrl, session.id, "Continue with the next step.", 120_000, { model })
-      const exitContent = JSON.stringify(exitRes).toLowerCase()
-      assert.ok(
-        exitContent.includes("supervision loop ended"),
-        `Expected the supervisor_loop_exit tool's own summary text in the response. Got: ${JSON.stringify(exitRes).slice(0, 500)}`
-      )
-
-      // `POST /session/{id}/message` returns ONLY the final assistant message
-      // of the turn — the text-only summary written AFTER the tool executed
-      // (verified live: its `parts` contain just step-start/text/step-finish,
-      // never a `type: "tool"` part). The tool-call part with the literal
-      // tool name lives on an EARLIER message in the same turn
-      // (`finish: "tool-calls"`), so asserting the tool's NAME against
-      // `exitRes` can never pass — it is asserting an API shape that does not
-      // exist. Fetch the full transcript and inspect the real tool-call part
-      // instead, so this proves the actual `supervisor_loop_exit` tool
-      // executed, not merely that some text happened to mention "exit".
-      const allMsgs = await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()
-      const toolParts = allMsgs.flatMap((m) => m.parts || []).filter((p) => p?.type === "tool")
-      assert.ok(
-        toolParts.some((p) => p.tool === "supervisor_loop_exit"),
-        `Expected a real supervisor_loop_exit tool-call part in the transcript. Tool parts seen: ${JSON.stringify(toolParts.map((p) => p.tool))}`
-      )
-      assert.ok(
-        !toolParts.some((p) => p.tool === "autopilot_exit"),
-        `The deleted autopilot_exit tool must never appear as a tool-call part in the transcript. Tool parts seen: ${JSON.stringify(toolParts.map((p) => p.tool))}`
-      )
-
-      // Confirm the mode was actually flipped off server-side (not merely
-      // that the tool call text was echoed) by checking status afterward.
-      // executeSupervisorLoopExit -> supervisorStore.setAutopilot(..., false)
-      // -> setMode(..., DEFAULT_SUPERVISOR_MODE) i.e. "reflection"
-      // (core/goal.mjs), so the status report's "mode:" line must read
-      // "reflection", never "autopilot".
-      const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 120_000, { model })
-      const statusContent = JSON.stringify(statusRes).toLowerCase()
-      assert.ok(
-        statusContent.includes("mode: reflection"),
-        `Expected mode: reflection after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
-      )
-      assert.ok(
-        !statusContent.includes("mode: autopilot"),
-        `Expected autopilot to be disabled after supervisor_loop_exit. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
-      )
-    })
-
-    test("autopilot lifecycle: enable, status, switch to reflection, switch to goal", { timeout: 900_000 }, async () => {
-      const createRes = await fetch(`${baseUrl}/session`, { method: "POST" })
-      assert.equal(createRes.status, 200)
-      const session = await createRes.json()
-
-      // 1. Enable autopilot via slash command
-      const enableRes = await sendMessage(baseUrl, session.id, "/supervisor autopilot", 300_000, { model })
-      assert.ok(enableRes, "Autopilot enable response should not be null")
-      const enableContent = JSON.stringify(enableRes).toLowerCase()
-      assert.ok(
-        enableContent.includes("autopilot") && (enableContent.includes("enabled") || enableContent.includes("mode")),
-        `Expected autopilot response to mention "autopilot" and "enabled" or "mode". Got: ${JSON.stringify(enableRes).slice(0, 500)}`
-      )
-
-      // 2. Check status — should reflect autopilot mode
-      const statusRes = await sendMessage(baseUrl, session.id, "/supervisor", 300_000, { model })
-      assert.ok(statusRes, "Status response should not be null")
-      const statusContent = JSON.stringify(statusRes).toLowerCase()
-      assert.ok(
-        statusContent.includes("autopilot") || statusContent.includes("supervisor") || statusContent.includes("mode") || statusContent.includes("enabled"),
-        `Expected status response to mention supervisor state. Got: ${JSON.stringify(statusRes).slice(0, 500)}`
-      )
-
-      // 3. Switch to reflection mode
-      const reflectionRes = await sendMessage(baseUrl, session.id, "/supervisor reflection", 300_000, { model })
-      assert.ok(reflectionRes, "Reflection switch response should not be null")
-      const reflectionContent = JSON.stringify(reflectionRes).toLowerCase()
-      assert.ok(
-        reflectionContent.includes("reflection") || reflectionContent.includes("mode"),
-        `Expected reflection response to mention "reflection" or "mode". Got: ${JSON.stringify(reflectionRes).slice(0, 500)}`
-      )
-
-      // 4. Switch to goal mode (from reflection, proving full mode cycle works)
-      const goalRes = await sendMessage(baseUrl, session.id, "/supervisor set-goal tests pass", 300_000, { model })
-      assert.ok(goalRes, "Goal switch response should not be null")
-      const goalContent = JSON.stringify(goalRes).toLowerCase()
-      assert.ok(
-        goalContent.includes("goal") || goalContent.includes("supervisor") || goalContent.includes("tests pass"),
-        `Expected goal response to acknowledge the command. Got: ${JSON.stringify(goalRes).slice(0, 500)}`
-      )
-    })
+describe("goal contract workflow", { skip: SKIP && "opencode binary not in PATH", timeout: 600_000 }, () => {
+  // Other sessions may legitimately retire THEIR project goal. Isolate this
+  // server/project so their background audits cannot pollute this proof.
+  let server, baseUrl, tmpDir, fixtureLlm
+  let auditStarted, heldAudit = false
+  const firstAudit = new Promise(resolve => { auditStarted = resolve })
+  const model = { providerID: "test-fixture", modelID: "fixture-model" }
+  before(async () => {
+    server = await startLiveServer({ label: "goal-contract", responder: async ({ fullText, lastText }) => {
+      if (!heldAudit && fullText.includes("E2E_CONTRACT_WORKFLOW") && lastText.trimStart().startsWith(REFLECTION_MARKER)) {
+        heldAudit = true
+        auditStarted()
+        // Force the newer human turn's idle to arrive during this old audit.
+        await sleep(4000)
+      }
+      return null
+    } })
+    baseUrl = server.baseUrl
+    tmpDir = server.projectDir
+    fixtureLlm = server.fixture
   })
+  after(async () => { await server?.stop() })
+
+  test("fixture audit rejects a bare completion claim, continues through real failing checks, and retires after passing evidence", { timeout: 600_000 }, async () => {
+    writeFileSync(join(tmpDir, "validation.test.mjs"), `import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { isValid } from './validation.mjs';\ntest('accepts nonempty input', () => assert.equal(isValid('ok'), true));\ntest('rejects empty input', () => assert.equal(isValid(''), false));\n`)
+    const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+    goalStore.setRetry(tmpDir, session.id, 3)
+    await sendMessage(baseUrl, session.id, "Implement input validation in validation.mjs and run validation.test.mjs. E2E_CONTRACT_WORKFLOW", 120_000, { model })
+    const state = sessionStore.load(tmpDir, session.id)
+    assert.equal(state.goal?.source, "agent")
+    assert.match(state.goal?.acceptanceCriteria, /validation.test.mjs passes/)
+    assert.match(state.goal?.verification, /node --test validation.test.mjs/)
+    assert.equal(state.goal.status, "active")
+    const projectPath = join(tmpDir, ".agents", "supervisor", "Goal.md")
+    assert.equal(existsSync(projectPath), false)
+    await Promise.race([firstAudit, sleep(30_000).then(() => { throw new Error("Initial goal audit never started") })])
+    const complete = await sendMessage(baseUrl, session.id, "Report completion now.", 120_000, { model })
+    assert.match(JSON.stringify(complete), /must be judged|pending judge/i)
+    assert.equal(sessionStore.load(tmpDir, session.id).loopExit, undefined)
+    try { assert.ok(await waitForInjectionCount(baseUrl, session.id, 1)) }
+    catch (error) { throw new Error(`${error.message}\nState: ${JSON.stringify(sessionStore.load(tmpDir, session.id))}\n${server.debugLog().slice(-16000)}`) }
+    assert.equal(sessionStore.load(tmpDir, session.id).goal?.status, "active")
+    assert.equal(existsSync(projectPath), false, "agent contract must not write a project goal")
+
+    // No further human prompt. First run real failing tests; the next
+    // continuation implements the helper and reruns those same tests.
+    await settleInjections(baseUrl, session.id)
+    const transcript = await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()
+    const prose = transcript.flatMap(m => m.parts || []).filter(p => p.type === "text").map(p => p.text).join("\n")
+    assert.match(prose, /VALIDATION_EXIT=1/)
+    assert.match(prose, /VALIDATION_EXIT=0/)
+    const feedback = transcript.flatMap(m => m.parts || []).filter(p => p.type === "text" && p.text.includes(FEEDBACK_MARKER)).map(p => p.text).join("\n")
+    assert.ok(feedback.includes(state.goal.acceptanceCriteria))
+    assert.ok(feedback.includes(state.goal.verification))
+    const calls = callsMentioning(fixtureLlm, "E2E_CONTRACT_WORKFLOW")
+    assert.ok(calls.some(b => systemTextOf(b).includes("<!-- supervisor:goal-ownership -->")))
+    const audits = calls.filter(b => userTextsOf(b).some(t => t.includes(REFLECTION_MARKER) || t.includes(JUDGE_MARKER)))
+    assert.ok(audits.length > 0, "a real completion assessment must occur")
+    for (const call of audits) {
+      const input = userTextsOf(call).join("\n")
+      for (const field of [state.goal.condition, state.goal.acceptanceCriteria, state.goal.verification]) assert.ok(input.includes(field), `assessment lost contract field: ${field}`)
+    }
+    const tools = calls.flatMap(b => b.tools || []).map(t => t.function?.name)
+    assert.ok(tools.includes("supervisor_goal"))
+    assert.ok(!tools.includes("supervisor_autopilot"))
+    assert.equal(await countInjections(baseUrl, session.id), 2, "failed evidence must get a second continuation")
+    assert.equal(sessionStore.load(tmpDir, session.id).goal, undefined, "fixture passing-evidence verdict retires the contract")
+    assert.ok(readGoalAchievedLog(tmpDir).some(r => r.sessionId === session.id && r.acceptanceCriteria === state.goal.acceptanceCriteria))
+    assert.ok(server.debugLog().includes(`Coalescing idle while audit in flight: ${session.id}`), "new-turn idle must actually overlap the old audit")
+    const cleanEnv = { ...process.env }
+    delete cleanEnv.NODE_TEST_CONTEXT
+    const independent = execFileSync(process.execPath, ["--test", "validation.test.mjs"], { cwd: tmpDir, encoding: "utf8", env: cleanEnv })
+    assert.match(independent, /pass 2/)
+    assert.equal(existsSync(projectPath), false)
+  })
+
+    test("agent cannot replace a user goal, even with replace=true", { timeout: 300_000 }, async () => {
+      const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      await sendMessage(baseUrl, session.id, "/supervisor set-goal Preserve this user contract", 120_000, { model })
+      const result = await sendMessage(baseUrl, session.id, "E2E_REPLACE_USER", 120_000, { model })
+      assert.match(JSON.stringify(result), /FAILED to set goal/)
+      const state = sessionStore.load(tmpDir, session.id)
+      assert.equal(state.goal?.condition, "Preserve this user contract")
+      assert.equal(state.goal?.source, "user")
+      await sendMessage(baseUrl, session.id, "/supervisor off", 120_000, { model })
+    })
+
+    test("agent cannot shadow a project-only user contract", { timeout: 300_000 }, async () => {
+      writeProjectGoal(tmpDir, "User project contract", { acceptanceCriteria: "User acceptance", verification: "User verification" })
+      const expected = readProjectGoalContract(tmpDir)
+      const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      const result = await sendMessage(baseUrl, session.id, "E2E_REPLACE_USER project-only", 120_000, { model })
+      assert.match(JSON.stringify(result), /FAILED to set goal.*user-set project goal/)
+      assert.equal(sessionStore.load(tmpDir, session.id).goal, undefined)
+      assert.deepEqual(readProjectGoalContract(tmpDir), expected)
+      await sendMessage(baseUrl, session.id, "/supervisor off", 120_000, { model })
+    })
+
+    test("no-goal idle does not create a completion judge or continuation", { timeout: 300_000 }, async () => {
+      const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
+      // Explicitly cleared sessions must not inherit a stale project goal.
+      goalStore.clearGoal(tmpDir, session.id)
+      await sendMessage(baseUrl, session.id, "Implement the local change without declaring a goal. E2E_NO_GOAL", 120_000, { model })
+      await sleep(3000)
+      const calls = callsMentioning(fixtureLlm, "E2E_NO_GOAL")
+      assert.ok(calls.length > 0)
+      assert.ok(!calls.some(b => userTextsOf(b).some(t => t.startsWith(JUDGE_MARKER) || t.startsWith(REFLECTION_MARKER))))
+      assert.equal(await countInjections(baseUrl, session.id), 0)
+      assert.equal(sessionStore.load(tmpDir, session.id).goal, undefined)
+      assert.ok(!calls.some(b => systemTextOf(b).includes("<!-- supervisor:status-directive -->")), "status defaults off")
+      await sendMessage(baseUrl, session.id, "What is two plus two? E2E_QUESTION_ONLY", 120_000, { model })
+      const questionCalls = turnCalls(fixtureLlm, "E2E_QUESTION_ONLY")
+      assert.ok(questionCalls.length > 0)
+      assert.ok(!questionCalls.some(b => systemTextOf(b).includes("<!-- supervisor:goal-ownership -->")), "plain questions do not need goal declaration")
+    })
 })
 
 // ===========================================================================
@@ -716,7 +726,7 @@ function budgetResponder(judgeFor, { staticReply = false } = {}) {
       return { text: "I made the change and handed back for judgement." }
     }
     if (fullText.includes("DERIVE SUPERVISOR GOAL")) {
-      return { text: JSON.stringify({ goal: "all tests pass", falsifiable: true, rationale: "runnable" }) }
+      return { text: JSON.stringify({ goal: "all tests pass", falsifiable: true, acceptance_criteria: "All requested tests pass", verification: "Run npm test and inspect exit code 0", rationale: "runnable" }) }
     }
     if (fullText.includes("CLASSIFY TASK ROUTING")) return { text: JSON.stringify({ category: "backend" }) }
     if (fullText.includes("REVIEW SUPERVISOR COMPLETION")) return { text: "Review looks good." }
@@ -848,8 +858,8 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
         // cannot express "this session"; content can.
         const probe = [...completeAfter.keys()].find((p) => ctx.fullText.includes(p))
         if (!probe) return verdict()
-        // OpenCode can emit duplicate idle events for one assistant reply.
-        // Rejudging unchanged evidence is not another agent iteration.
+        // Duplicate idle events may rejudge one reply; only new evidence is
+        // another agent iteration, not another HTTP call to the judge.
         const reply = ctx.fullText.match(/Made some progress on attempt \d+\. Stopping here for now\./g)?.at(-1)
         const changed = reply !== lastJudgedReply.get(probe)
         const n = (judgeCalls.get(probe) || 0) + (changed ? 1 : 0)
@@ -879,19 +889,15 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
    * Drive one human turn on a fresh session with a given retry budget and
    * return how many times the supervisor injected.
    */
-  async function runTurn({ budget, probe, complete = Infinity, autopilot = false, waitTarget = null, stopAfterTarget = false, waitStallMs = 60_000 }) {
+  async function runTurn({ budget, probe, complete = Infinity, waitTarget = null, stopAfterTarget = false, waitStallMs = 60_000 }) {
     completeAfter.set(probe, complete)
     const session = await (await fetch(`${baseUrl}/session`, { method: "POST" })).json()
 
     await sendMessage(baseUrl, session.id, `/supervisor retry ${budget}`, 120_000, { model })
-    if (autopilot) {
-      await sendMessage(baseUrl, session.id, "/supervisor autopilot", 120_000, { model })
-      // The command turn is a human turn, and autopilot deliberately bypasses
-      // the non-actionable-turn gate, so it burns its OWN budget on it. Let
-      // that finish before the real turn starts, or its tail races the turn
-      // under test.
-      await settleInjections(baseUrl, session.id)
-    }
+    goalStore.setGoal(server.projectDir, session.id, actionableTask(probe), {
+      acceptanceCriteria: "Retry helper and unit tests are implemented and passing",
+      verification: "Run the retry unit tests and inspect passing evidence",
+    })
     // Let any supervision of the COMMAND turns finish before the real turn.
     await sleep(3000)
     // Everything already in the transcript belongs to the COMMAND turns, which
@@ -1020,36 +1026,22 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
     )
   })
 
-  test("autopilot nudges repeatedly within one human turn and is capped by the same runaway limit", { timeout: 600_000 }, async () => {
-    const { sessionId, injections, startIndex } = await runTurn({ budget: 3, probe: "PROBE-AUTOPILOT", autopilot: true })
-
-    assert.equal(injections, 3, `autopilot must nudge exactly 3 times for a runaway limit of 3, got ${injections}`)
-
-    // The agent-facing nudge must NOT show a budget counter. A visible "n/N"
-    // denominator tells the agent a budget exists and invites it to pace or
-    // wrap up early — the loop's only intended stop is supervisor_loop_exit.
-    // Re-adding `(${autopilotAttempt}/${runawayLimit})` to the nudge template
-    // makes this assertion fail (sensitivity proven in the sibling
-    // nudge-no-counter unit test).
-    const injectedNudges = (await (await fetch(`${baseUrl}/session/${sessionId}/message`)).json())
-      .slice(startIndex)
-      .filter((m) => m?.info?.role === "user")
-      .flatMap((m) => (m.parts || []).map((p) => p?.text || ""))
-      .filter((t) => t.includes(FEEDBACK_MARKER) && t.includes("Autopilot"))
-    assert.equal(injectedNudges.length, 3, `expected 3 autopilot nudges, got ${injectedNudges.length}`)
-    for (const nudge of injectedNudges) {
-      assert.doesNotMatch(
-        nudge, /Autopilot\s*\(\s*\d+\s*\/\s*\d+\s*\)/,
-        `autopilot nudge must not render an "n/N" counter, got: ${JSON.stringify(nudge.slice(0, 60))}`
-      )
+  test("unmet goal feedback carries the full contract and keeps the goal active at the runaway cap", { timeout: 600_000 }, async () => {
+    const { sessionId, injections, startIndex } = await runTurn({ budget: 3, probe: "PROBE-UNMET-CONTRACT" })
+    assert.equal(injections, 3)
+    const feedback = (await (await fetch(`${baseUrl}/session/${sessionId}/message`)).json())
+      .slice(startIndex).filter(m => m.info?.role === "user")
+      .flatMap(m => m.parts || []).filter(p => p.type === "text" && p.text.includes(FEEDBACK_MARKER))
+    assert.equal(feedback.length, 3)
+    for (const part of feedback) {
+      assert.match(part.text, /Retry helper and unit tests are implemented and passing/)
+      assert.match(part.text, /Run the retry unit tests/)
+      assert.doesNotMatch(part.text, /\(\s*\d+\s*\/\s*\d+\s*\)/)
     }
-
-    // Runaway-limit exhaustion must disarm autopilot, or the next human turn
-    // silently resumes an unattended loop.
-    const state = JSON.parse(
-      readFileSync(join(server.projectDir, ".supervisor", "sessions", sessionId, "state.json"), "utf-8")
-    )
-    assert.notEqual(state.mode, "autopilot", "autopilot must be disarmed once its runaway limit is spent")
+    const state = sessionStore.load(server.projectDir, sessionId)
+    assert.equal(state.goal?.status, "active")
+    assert.equal(state.mode, undefined)
+    assert.equal(state.autopilot, undefined)
   })
 })
 
@@ -1087,6 +1079,9 @@ describe("no-progress gate caps a genuinely-repeating agent (opencode)", { skip:
     // A generous budget (5) — if this capped at 2 only because the budget
     // was small, it would prove nothing about the no-progress gate itself.
     await sendMessage(baseUrl, session.id, "/supervisor retry 5", 120_000, { model })
+    goalStore.setGoal(server.projectDir, session.id, actionableTask(probe), {
+      acceptanceCriteria: "Retry tests pass", verification: "Run retry tests",
+    })
     await sleep(3000)
     const startIndex = (await (await fetch(`${baseUrl}/session/${session.id}/message`)).json()).length
 
@@ -1125,6 +1120,9 @@ describe("per-turn budget survives a server restart", { skip: SKIP && "opencode 
       const session = await (await fetch(`${serverA.baseUrl}/session`, { method: "POST" })).json()
       sessionId = session.id
       await sendMessage(serverA.baseUrl, sessionId, "/supervisor retry 2", 120_000, { model })
+      goalStore.setGoal(serverA.projectDir, sessionId, actionableTask(probe), {
+        acceptanceCriteria: "Retry tests pass", verification: "Run retry tests",
+      })
       await sleep(3000)
       const startIndex = (await (await fetch(`${serverA.baseUrl}/session/${sessionId}/message`)).json()).length
       await sendMessage(serverA.baseUrl, sessionId, actionableTask(probe), 180_000, { model })

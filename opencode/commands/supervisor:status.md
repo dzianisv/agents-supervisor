@@ -1,8 +1,8 @@
 ---
 description: Show supervisor status, or turn the status-checkpoint directive on/off.
 ---
-Report the supervisor status: enabled/disabled state, effective mode (reflection,
-goal, or autopilot), any active goal, retry budget, and whether the status
+Report the supervisor status: enabled/disabled state, goal contract,
+runaway safety valve, and whether the status
 checkpoint directive is on.
 
 Do not use the `task` tool or delegate to a subagent. Call the `supervisor` tool
@@ -17,6 +17,6 @@ Interpret `$ARGUMENTS`:
 - `off` → call `supervisor` with `action: "status off"`. Stops injecting the
   instruction and stops gating completion on it.
 
-The directive is ON by default; `off` is the only thing that disables it.
+The directive is OFF by default; `on` explicitly enables it.
 
 Relay the tool response.

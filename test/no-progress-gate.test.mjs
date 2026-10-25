@@ -183,17 +183,15 @@ describe('the gate is wired into the hook', () => {
   });
 
   test('does NOT burn an attempt (no writeAttemptCounter in the gate block)', () => {
-    const block = src.slice(src.indexOf('NO-PROGRESS GATE'), src.indexOf('// 4a. Autopilot fast-path'));
+    const block = src.slice(src.indexOf('NO-PROGRESS GATE'), src.indexOf('// 4a-0. LOOP EXIT'));
     assert.ok(block.length > 0, 'gate block not found');
     assert.equal(/writeAttemptCounter\(/.test(block), false);
   });
 
-  test('sits BEFORE the autopilot fast-path and the judge, so it covers goal/autopilot', () => {
+  test('sits BEFORE the goal judge', () => {
     const gate = src.indexOf('NO-PROGRESS GATE');
-    const autopilot = src.indexOf('// 4a. Autopilot fast-path');
     const judge = src.indexOf('await buildReflectionPrompt(');
-    assert.ok(gate > 0 && autopilot > gate, 'gate must precede the autopilot fast-path');
-    assert.ok(judge > gate, 'gate must precede the judge');
+    assert.ok(gate > 0 && judge > gate, 'gate must precede the goal judge');
   });
 
   test('sits AFTER the attempt-cap gate (cheap eligibility gates run first)', () => {
@@ -202,8 +200,8 @@ describe('the gate is wired into the hook', () => {
     assert.ok(cap > 0 && gate > cap, 'gate must follow the attempt cap check');
   });
 
-  test('AUTOPILOT_EXIT is never swallowed by the gate', () => {
-    assert.match(src, /autopilotExiting/);
-    assert.match(src, /!autopilotExiting && noProgress\.standDown/);
+  test('loop signals reach the stuck handler or completion audit even when repeated', () => {
+    assert.match(src, /const loopExiting = !!loopExit/);
+    assert.match(src, /!loopExiting && noProgress\.standDown/);
   });
 });

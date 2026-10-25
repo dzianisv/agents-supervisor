@@ -16,6 +16,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { goalStore } from '../core/goal.mjs';
+import { sessionStore } from '../core/session-store.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
@@ -47,11 +49,7 @@ function runHook(payload, extraEnv = {}) {
     timeout: 60_000,
     env: { ...process.env, SUPERVISOR_CC_LIVE: '1', ...extraEnv },
   });
-  let verdict = null;
-  try {
-    const vf = path.join(payload.cwd, '.supervisor', `verdict_${payload.session_id}.json`);
-    if (fs.existsSync(vf)) verdict = JSON.parse(fs.readFileSync(vf, 'utf8'));
-  } catch { /* none */ }
+  const verdict = sessionStore.lastVerdict(payload.cwd, payload.session_id);
   return { code: r.status, stdout: (r.stdout || '').trim(), verdict };
 }
 
@@ -122,6 +120,10 @@ const withTestsTurns = [
 
 check('no E2E tests in transcript → hook blocks (live judge)', () => {
   const { dir, tp } = mkSession(noTestsTurns);
+  goalStore.setGoal(dir, 'smoke-no-tests', 'Both CC and OpenCode E2E suites pass', {
+    acceptanceCriteria: 'Both requested E2E suites were run and passed.',
+    verification: 'Report node test/e2e-cc.mjs and node --experimental-strip-types --test test/e2e-opencode.test.mjs with their pass/fail results.',
+  });
   const payload = {
     session_id: 'smoke-no-tests',
     cwd: dir,
@@ -138,6 +140,10 @@ check('no E2E tests in transcript → hook blocks (live judge)', () => {
 
 check('both E2E suites pass in transcript → hook allows stop (live judge)', () => {
   const { dir, tp } = mkSession(withTestsTurns);
+  goalStore.setGoal(dir, 'smoke-with-tests', 'Both CC and OpenCode E2E suites pass', {
+    acceptanceCriteria: 'Both requested E2E suites were run and passed.',
+    verification: 'Report node test/e2e-cc.mjs and node --experimental-strip-types --test test/e2e-opencode.test.mjs with their pass/fail results.',
+  });
   const payload = {
     session_id: 'smoke-with-tests',
     cwd: dir,

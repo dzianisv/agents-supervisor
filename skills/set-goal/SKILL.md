@@ -18,9 +18,20 @@ node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" set-goal "${ARGUMENTS}"
 - `${ARGUMENTS}` = `resume` / `unpause` → resumes a `paused` or `exhausted` goal — keeps the same condition, clears the stale pause reason, and resets this turn's attempt budget. If the goal isn't paused/exhausted, reports that honestly instead of silently doing nothing.
 - otherwise → sets the goal to that condition (e.g. "all tests in test/auth pass and lint is clean").
 
-Relay the CLI output to the user. The goal is injected into the supervisor's judge
-as a mandatory completion requirement, so the agent won't be allowed to stop until
-it's met.
+Relay the CLI output to the user. This is an explicit user-owned goal; do not
+infer or widen it. The condition is the default acceptance criterion. When the
+user supplies separate criteria or a verification plan, pass them with
+`--acceptance-criteria "<criteria>" --verification "<plan>"` on the same CLI call.
+The full explicit user contract persists in session state and
+`.agents/supervisor/Goal.md` for future sessions.
+
+The judge checks the contract against concrete evidence reported in conversation
+prose, not independent raw tool results. `SUPERVISOR_LOOP_EXIT: completed` requests
+that audit and cannot bypass it. A stuck signal can pause; retry/no-progress,
+human blockers or judge errors can stand supervision down without achievement.
+Without an active session/project goal there is no completion supervision.
+Clearing suppresses project fallback in this session; it does not delete shared
+project configuration.
 
 Always name this command `/supervisor:set-goal` in your own output — that is its
 only supported spelling. Older names still parse, but are retired and must not be

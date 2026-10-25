@@ -5,7 +5,9 @@ description: Re-enable the supervisor for this session after it was disabled wit
 
 # /supervisor:on — re-enable for this session
 
-Remove the current session from the disabled list so the supervisor hook fires again on the next stop.
+Remove the current session from the disabled list so an active session/project
+goal can be supervised on the next stop. Enabling alone does not create a goal;
+without a goal there is no completion judge or completion continuation.
 
 ## Steps
 

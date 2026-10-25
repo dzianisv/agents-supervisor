@@ -181,7 +181,7 @@ describe('BUG A: auto-derived goals never create the durable project file', () =
       'an auto-derived goal must NOT be persisted to .agents/supervisor/goal.md — a turn-1 guess became a MANDATORY requirement for turn 50 and every future session'
     );
     assert.ok(
-      src.includes('writeProjectGoal(await resolveSessionDirectoryFor(sid), condition)'),
+      /writeProjectGoal\(projectDir, persisted\.goal!\.condition, persisted\.goal\)/.test(src),
       'an EXPLICIT /supervisor:set-goal <condition> must still create the durable project file'
     );
   });
@@ -298,7 +298,7 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     const raw = await readFile(join(ROOT, 'opencode', 'supervisor-impl.ts'), 'utf-8');
     const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
     assert.ok(src.includes('isActionlessVerdict('), 'opencode must consult isActionlessVerdict before injecting');
-    assert.ok(src.includes('hasFeedbackBody(feedbackText)'), 'opencode must guard against an empty rendered body');
+    assert.ok(src.includes('hasFeedbackBody(renderedFeedback)'), 'opencode must guard against an empty rendered body');
     // The injection must be gated on shouldContinue, not merely on !complete.
     assert.ok(
       src.includes('if (!analysis.shouldContinue || actionlessVerdict)'),
@@ -356,7 +356,7 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
   // remaining exit signal, and this pins that it inherited the same
   // protection: exiting a mode you are not in must be a no-op with respect
   // to autopilot/goal state.
-  test('supervisor_loop_exit is a no-op on autopilot state outside autopilot mode (it must not delete an active goal)', async () => {
+  test('removed modes cannot bypass goal ownership or completion auditing', async () => {
     // 1. The destructive primitive is GONE: setMode away from the goal-bearing
     //    mode no longer drops the goal (a goal is an orthogonal attribute now,
     //    not a mode). This is the two-modes refactor's central invariant — the
@@ -365,18 +365,9 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     try {
       goalStore.setGoal(cwd, 'ses_autopilot_exit_probe', 'ship the thing');
       assert.equal(goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition, 'ship the thing');
-      goalStore.setMode(cwd, 'ses_autopilot_exit_probe', 'reflection');
-      assert.equal(
-        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition,
-        'ship the thing',
-        'setMode must NEVER drop the goal — a mode switch is not a goal clear'
-      );
-      goalStore.setMode(cwd, 'ses_autopilot_exit_probe', 'autopilot');
-      assert.equal(
-        goalStore.load(cwd, 'ses_autopilot_exit_probe').goal?.condition,
-        'ship the thing',
-        'switching to autopilot must keep the goal (as context)'
-      );
+      assert.equal(goalStore.setMode, undefined);
+      assert.equal(goalStore.setAutopilot, undefined);
+      assert.equal(goalStore.load(cwd, 'ses_autopilot_exit_probe').goal.source, 'user');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -393,12 +384,8 @@ describe('BUG B: content-free verdicts stand down instead of looping', () => {
     // before touching autopilot state, and must never delete the goal.
     const exitFn = src.slice(src.indexOf('const executeSupervisorLoopExit'), src.indexOf('let setSupervisorTool'));
     assert.ok(exitFn.length > 0, 'could not locate executeSupervisorLoopExit');
-    const setAutopilotCalls = exitFn.match(/setAutopilot\(directory, sid, false\)/g) || [];
-    assert.equal(setAutopilotCalls.length, 1, 'expected exactly one setAutopilot(false) call in supervisor_loop_exit');
-    assert.ok(
-      /if \(mode === "autopilot"\)\s*\{[\s\S]*?setAutopilot\(directory, sid, false\)/.test(exitFn),
-      'supervisor_loop_exit must only call setAutopilot(false) inside a mode === "autopilot" check'
-    );
+    assert.doesNotMatch(exitFn, /setAutopilot|setMode/);
+    assert.ok(exitFn.indexOf('Completion pending judge audit') < exitFn.indexOf('s.loopExit ='), 'active completion must return before persisting loopExit');
     assert.ok(
       !/delete\s+s(tate)?\.goal/.test(exitFn),
       'supervisor_loop_exit must never delete the goal outright — this is the exact footgun the deleted tool caused'
@@ -518,8 +505,8 @@ describe('resume: a paused goal is not a dead end', () => {
       const reread = goalStore.load(dir, 'ses_resume_persist');
       assert.equal(reread.goal.status, 'active');
       assert.equal(reread.goal.condition, 'ship it');
-      assert.equal(reread.mode, 'reflection', 'resume forces reflection — the mode that VERIFIES a goal (goal is no longer a mode)');
-      assert.equal(reread.autopilot, false);
+      assert.equal(reread.mode, undefined);
+      assert.equal(reread.autopilot, undefined);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -570,8 +557,8 @@ describe('resume: a paused goal is not a dead end', () => {
 
       const state = goalStore.load(dir, 'ses_resume_deadline');
       assert.equal(state.goal.status, 'active');
-      assert.equal(state.mode, 'reflection', 'a resumed deadline-exhausted goal must be in reflection so it is VERIFIED again (goal is no longer a mode)');
-      assert.equal(state.autopilot, false);
+      assert.equal(state.mode, undefined);
+      assert.equal(state.autopilot, undefined);
       assert.ok(
         state.goal.deadline > before,
         `a deadline that already passed must be extended into the future on resume, got ${state.goal.deadline} vs now ${before}`

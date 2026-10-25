@@ -9,7 +9,7 @@
  *
  *   .supervisor/                 machine-written, gitignored
  *     sessions/<session_id>/     everything per-session
- *       state.json               mode, goal, attempts, flags
+ *       state.json               goal, attempts, flags
  *       verdicts.jsonl           append-only verdict log
  *     disabled                   unchanged (a set of ids; it already works)
  *     current_session            unchanged, but demoted to a LAST-RESORT hint
@@ -226,24 +226,17 @@ function readJsonSync(file) {
   }
 }
 
-/**
- * Forward-migrate a persisted state's `mode` field to the TWO-mode model.
- *
- * 'goal' is no longer a supervisor mode — a goal is an orthogonal ATTRIBUTE
- * of the session (`state.goal`). ~20 sessions on disk (and legacy
- * goals/<id>.json files) still carry `mode:'goal'`; a session that loads with
- * it must NOT break and must NOT lose its goal. Map it to 'reflection' (the
- * mode that actually verifies a goal) and leave `state.goal` completely
- * untouched. This is the ONE place that owns load/migration, so both the
- * new-layout read path and the legacy-fold path go through it.
- *
- * Pure: returns the same object (mutated in place) or a shallow copy is not
- * needed — callers pass a freshly-parsed object. Any non-'goal' mode, and an
- * absent mode, are left exactly as-is.
- */
+/** Migrate every old mode to the one goal supervisor without losing session data. */
 export function normalizeLoadedState(state) {
-  if (state && typeof state === 'object' && state.mode === 'goal') {
-    state.mode = 'reflection';
+  if (state && typeof state === 'object') {
+    delete state.mode;
+    delete state.autopilot;
+    if (state.goal && typeof state.goal === 'object') {
+      const goal = state.goal;
+      goal.source = ['agent', 'auto'].includes(goal.source) ? 'agent' : 'user';
+      goal.acceptanceCriteria ??= goal.condition ?? '';
+      goal.verification ??= '';
+    }
   }
   return state;
 }
@@ -283,7 +276,7 @@ export function readLegacyState(cwd, sessionId) {
 function migrateLegacySession(cwd, sessionId) {
   const legacy = readLegacyState(cwd, sessionId);
   if (!legacy) return null;
-  // Normalise the retired `mode:'goal'` → 'reflection' BEFORE persisting the
+  // Strip obsolete execution flags and normalize the contract BEFORE persisting the
   // migrated file, so the on-disk copy is written once in the new shape (the
   // goal object itself is preserved verbatim).
   normalizeLoadedState(legacy);

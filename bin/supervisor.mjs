@@ -6,7 +6,7 @@
  * Usage:
  *   node bin/supervisor.mjs <command> [args…] [--session <id>]
  *
- * Commands: status, on, off, goal, retry, autopilot, mode, reflection
+ * Commands: status, on, off, set-goal, retry
  *
  * SESSION IDENTITY (see core/session-store.mjs resolveSessionId):
  *   1. --session <id>            explicit, wins; a unique prefix is expanded
@@ -31,10 +31,9 @@ import {
   describeRunawayLimit,
   formatRunawayLimit,
   readConfiguredMaxAttempts,
-  resolveSupervisorMode,
   resolveClaudeCodeHardCap,
   writeProjectGoal,
-  readProjectGoalCondition,
+  readProjectGoalContract,
   goalResumeHintSuffix,
 } from '../core/goal.mjs';
 import { resolveSessionId } from '../core/session-store.mjs';
@@ -47,11 +46,22 @@ const cwd = process.cwd();
 // can be passed anywhere and never leaks into a goal condition.
 const rawArgv = process.argv.slice(2);
 let explicitSession = '';
+const contract = { source: 'user' };
 const argv = [];
 for (let i = 0; i < rawArgv.length; i++) {
   const a = rawArgv[i];
   if (a === '--session' || a === '-s') { explicitSession = rawArgv[++i] ?? ''; continue; }
   if (a.startsWith('--session=')) { explicitSession = a.slice('--session='.length); continue; }
+  const contractOption = ['--acceptance-criteria', '--verification'].find((flag) => a === flag || a.startsWith(flag + '='));
+  if (contractOption) {
+    const value = a.includes('=') ? a.slice(contractOption.length + 1) : rawArgv[++i];
+    if (!value?.trim()) {
+      console.error(`${contractOption} requires a non-empty value. Nothing was changed.`);
+      process.exit(1);
+    }
+    contract[contractOption === '--verification' ? 'verification' : 'acceptanceCriteria'] = value;
+    continue;
+  }
   argv.push(a);
 }
 
@@ -100,38 +110,6 @@ if (resolution.ambiguous) bailAmbiguous();
 const NO_SESSION_MSG =
   'No session id available. Pass one explicitly (--session <id>), or run something first so the Stop hook records the session, then retry.';
 
-// Special-case: `mode <word>` → translate to `supervisor <word>` so the
-// parser's `name==='supervisor'` branch handles mode-set correctly.
-// DEPRECATED `mode goal`: 'goal' is no longer a mode — a goal is an orthogonal
-// session ATTRIBUTE. Accept it as a deprecated alias that sets reflection (the
-// mode that VERIFIES a goal) and keeps any existing goal, so users, skills and
-// stale installed command files that still say `mode goal` do not hard-error.
-if (name === 'mode' && argv[1]?.toLowerCase() === 'goal') {
-  if (!sid) {
-    console.log(NO_SESSION_MSG);
-    process.exit(0);
-  }
-  goalStore.setMode(cwd, sid, 'reflection');
-  const st = goalStore.load(cwd, sid);
-  const hasGoal = st.goal?.status === 'active';
-  console.log(
-    `'goal' is no longer a mode — a goal is a session attribute. Mode set to reflection for session ${sid.slice(0, 8)}…` +
-    (hasGoal ? ` (existing goal kept: "${st.goal.condition}").` : `. Set a goal with 'supervisor set-goal <condition>'.`) +
-    sessionSourceNote()
-  );
-  process.exit(0);
-}
-if (name === 'mode') {
-  name = 'supervisor';
-  // args is already the mode word (e.g. "reflection" or "autopilot")
-}
-
-// Special-case: bare `reflection` shorthand → mode-set reflection
-if (name === 'reflection') {
-  name = 'supervisor';
-  args = 'reflection';
-}
-
 // Top-level aliases: `status`, `on`, `off` are supervisor-namespaced in the
 // parser (name==='supervisor' branch). Translate them so the parser sees them.
 if (name === 'status' || name === 'on' || name === 'off') {
@@ -177,19 +155,6 @@ try {
   }
 } catch { /* best effort */ }
 
-/** Report an active goal that a mode switch will now KEEP (not clear). A mode
- * switch never drops a goal any more — a goal is an orthogonal attribute. */
-function noteGoalKeptOnModeSwitch(cwd, sid, mode) {
-  const st = goalStore.load(cwd, sid);
-  if (st.goal?.status === 'active') {
-    if (mode === 'autopilot') {
-      console.log(`ℹ  Goal kept as CONTEXT (autopilot does not run the judge, so it is not verified): "${st.goal.condition}"`);
-    } else {
-      console.log(`ℹ  Goal kept (reflection verifies it on each stop): "${st.goal.condition}"`);
-    }
-  }
-}
-
 // This CLI is the Claude Code control surface, so the runaway valve it reports
 // is resolved through the SAME shared resolver as the Stop hook (retry > config
 // (supervisor.yaml) > env > default), then reduced to CC's platform ceiling.
@@ -219,10 +184,10 @@ switch (cmd.kind) {
   // ── goal ──────────────────────────────────────────────────────────────────
   case 'goal-set': {
     if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    goalStore.setGoal(cwd, sid, cmd.condition);
-    // Also persist to .agents/supervisor/Goal.md so reflection mode picks it up
+    const persisted = goalStore.setGoal(cwd, sid, cmd.condition, contract);
+    // Explicit user goals also persist to .agents/supervisor/Goal.md
     // across sessions. Safe under concurrent writers — see writeProjectGoal.
-    writeProjectGoal(cwd, cmd.condition);
+    writeProjectGoal(cwd, persisted.goal.condition, persisted.goal);
     const override = goalStore.load(cwd, sid).maxAttempts;
     // The Stop hook clamps the runaway safety valve to one under Claude Code's
     // own block-override threshold, so the effective valve here on CC is the
@@ -230,9 +195,9 @@ switch (cmd.kind) {
     const desc = describeRunawayLimit({ sessionOverride: override, config: readConfiguredMaxAttempts(() => {}), hardCap: resolveClaudeCodeHardCap() });
     console.log(
       `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${cmd.condition}".\n` +
-      `The judge sees this as a mandatory completion requirement on every stop and keeps pushing until it is demonstrably met, or until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
+      `The judge checks evidence against this requirement before accepting completion. SUPERVISOR_LOOP_EXIT: completed does not bypass that audit.\n` +
       `${runawayLine(desc)} It resets each time you speak, so the goal is never permanently exhausted mid-session.\n` +
-      `Also saved to .agents/supervisor/Goal.md for reflection mode.`
+      `Also saved to .agents/supervisor/Goal.md for future sessions.`
     );
     break;
   }
@@ -280,29 +245,28 @@ switch (cmd.kind) {
     if (st.goal) {
       console.log(
         `${GOAL_LABEL} (${st.goal.status}): ${st.goal.condition}\n` +
+        `source: ${st.goal.source ?? 'user'}\n` +
+        `acceptance criteria: ${JSON.stringify(st.goal.acceptanceCriteria ?? [])}\n` +
+        `verification: ${JSON.stringify(st.goal.verification ?? [])}\n` +
         `attempts: ${st.goal.attempts}` +
         (st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : '') +
         goalResumeHintSuffix(st.goal)
       );
       break;
     }
-    // No session goal. Binding contract (align-supervisor-modes): set-goal
-    // with no condition and nothing set MUST attempt an LLM derivation
-    // rather than silently no-op-ing — but this CLI has no LLM call wired
-    // in (see the OpenCode plugin's supervisor_goal tool for the actual
-    // derivation flow). Never fabricate a default here either way: report
-    // a project-level goal if one exists, otherwise say so explicitly and
-    // point at how to set one.
-    const projectCondition = readProjectGoalCondition(cwd);
-    if (projectCondition) {
+    // CC uses explicit goals; automatic declaration is OpenCode-only.
+    const project = st.goalCleared === true ? null : readProjectGoalContract(cwd);
+    if (project) {
       console.log(
         `No ${GOAL_LABEL.toLowerCase()} set for this session, but a project-level goal exists ` +
-        `(.agents/supervisor/Goal.md or goal.md): "${projectCondition}". ` +
-        `Reflection mode already enforces it; run 'supervisor set-goal <condition>' to set an explicit session goal instead.`
+        `(.agents/supervisor/Goal.md or goal.md): "${project.condition}".\n` +
+        `source: user (project)\nacceptance criteria: ${JSON.stringify(project.acceptanceCriteria)}\n` +
+        `verification: ${JSON.stringify(project.verification)}\n` +
+        `The goal supervisor enforces it; run 'supervisor set-goal <condition>' to set an explicit session goal instead.`
       );
     } else {
       console.log(
-        `No ${GOAL_LABEL.toLowerCase()} set for this session or the project. ` +
+        `No active ${GOAL_LABEL.toLowerCase()} set for this session${st.goalCleared === true ? ' (project fallback cleared here)' : ' or the project'}. ` +
         `Automatic LLM-based goal derivation is only available via the OpenCode plugin's supervisor_goal tool; ` +
         `on this CLI, set one explicitly: supervisor set-goal <condition>`
       );
@@ -351,72 +315,29 @@ switch (cmd.kind) {
       `Runaway safety valve (session override): ${st.maxAttempts != null ? formatRunawayLimit(st.maxAttempts) : '(none — using default/config/env)'}; ` +
       `in effect: ${formatRunawayLimit(desc.limit)} injections per human turn (tier: ${desc.tier})` +
       `${desc.cappedByPlatform ? ` — reduced from ${desc.unlimited ? 'unlimited' : desc.requested} by Claude Code's Stop-hook cap of ${desc.hardCap}` : ''}.\n` +
-      `The loop's real stop is SUPERVISOR_LOOP_EXIT, not this number.`
+      `Completion requires the goal evidence audit; this number is only a runaway valve.`
     );
     break;
   }
 
-  // ── mode-set ──────────────────────────────────────────────────────────────
-  case 'mode-set': {
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    goalStore.setMode(cwd, sid, cmd.mode);
-    // A mode switch KEEPS any active goal now (a goal is an attribute, not a
-    // mode) — announce that instead of silently clearing it.
-    noteGoalKeptOnModeSwitch(cwd, sid, cmd.mode);
-    const desc = ccRunaway(sid);
-    console.log(`mode: ${cmd.mode}`);
-    if (cmd.mode === 'autopilot') {
-      console.log(
-        `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
-        `${runawayLine(desc)}`
-      );
-    } else if (cmd.mode === 'reflection') {
-      console.log('Supervisor back to reflection mode (judge runs on each stop).');
-    }
-    break;
-  }
-
-  // ── autopilot-on ──────────────────────────────────────────────────────────
-  case 'autopilot-on': {
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    goalStore.setAutopilot(cwd, sid, true);
-    // Autopilot KEEPS any active goal as context now (it is not verified).
-    noteGoalKeptOnModeSwitch(cwd, sid, 'autopilot');
-    const desc = ccRunaway(sid);
-    console.log('mode: autopilot');
-    console.log(
-      `Autopilot on — supervisor will auto-continue without judge until you output SUPERVISOR_LOOP_EXIT: completed (alone on its own line).\n` +
-      `${runawayLine(desc)}`
-    );
-    break;
-  }
-
-  // ── autopilot-off ─────────────────────────────────────────────────────────
-  case 'autopilot-off': {
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    goalStore.setAutopilot(cwd, sid, false);
-    console.log('mode: reflection');
-    console.log('Supervisor back to reflection mode (judge runs on each stop).');
-    break;
-  }
-
-  // ── autopilot-status ──────────────────────────────────────────────────────
-  case 'autopilot-status': {
-    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); }
-    const st = goalStore.load(cwd, sid);
-    const effective = resolveSupervisorMode(st);
-    const isAuto = effective === 'autopilot';
-    console.log(`mode: ${effective}`);
-    console.log(`autopilot active: ${isAuto ? 'yes' : 'no'}`);
-    break;
+  case 'mode-removed': {
+    console.log('Supervisor modes, autopilot and reflection commands were removed. Use set-goal <condition> for goal-based supervision, or on/off to enable/disable it. Nothing was changed.');
+    process.exit(1);
   }
 
   // ── supervisor-status ─────────────────────────────────────────────────────
   case 'supervisor-status': {
-    // Delegate entirely to bin/status.mjs — it owns the effective-mode line.
+    // The shared parser returns status for this command; its subargument is
+    // a directive toggle, not the supervisor enable axis.
+    const toggle = args.trim().match(/^status\s+(on|off)$/i);
+    if (toggle) {
+      if (!sid) { console.log(NO_SESSION_MSG); process.exit(1); }
+      goalStore.setStatusDiagram(cwd, sid, toggle[1].toLowerCase() === 'on');
+    }
+    // Delegate entirely to bin/status.mjs, retaining the caller's identity.
     const statusScript = path.join(__dirname, 'status.mjs');
     try {
-      execFileSync('node', [statusScript], { cwd, stdio: 'inherit' });
+      execFileSync('node', [statusScript], { cwd, stdio: 'inherit', env: { ...process.env, ...(sid ? { SUPERVISOR_SESSION_ID: sid } : {}) } });
     } catch (err) {
       // stdio:'inherit' means err.stdout/err.stderr are always null; just propagate exit code.
       process.exit(err.status ?? 1);
@@ -428,7 +349,7 @@ switch (cmd.kind) {
   case 'autoreview-on':
   case 'autoreview-off':
   case 'autoreview-status': {
-    console.log('Use /supervisor:autoreview on|off — not yet wired to this CLI.');
+    console.log('Autoreview is not wired to the Claude Code CLI. In OpenCode use /supervisor autoreview on|off.');
     process.exit(0);
   }
 
@@ -464,7 +385,7 @@ switch (cmd.kind) {
     const given = process.argv[2] ?? '(none)';
     console.log(
       `Unknown supervisor command: ${given}.\n` +
-      `Valid commands: status, on, off, set-goal, retry, autopilot, reflection, mode, solofounder (alias for set-goal).`
+      `Valid commands: status, on, off, set-goal (clear/resume), retry, autoreview, solofounder (alias for set-goal).`
     );
     process.exit(1);
   }

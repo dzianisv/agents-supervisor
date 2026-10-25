@@ -1,25 +1,12 @@
 ---
-description: Set / check / clear a session goal the supervisor pushes the agent to meet before stopping.
+description: Set, derive, inspect, clear, or resume a verified goal contract.
 ---
-Manage the supervisor session goal. A goal is a session **attribute**, not a
-mode: setting one puts the session in `reflection` mode (where the judge verifies
-the goal on each stop). Clearing it leaves the session in `reflection`. Note: in
-`autopilot` mode a goal is not verified — its condition is only added to the
-auto-continue nudge as context.
-
-Do not use the `task` tool or delegate to a subagent. Call `supervisor_goal`
-directly in this session so the plugin-provided tool is available.
+Call `supervisor_goal` directly in this session; do not delegate.
 
 Interpret `$ARGUMENTS`:
-- empty -> call `supervisor_goal` with no args (report current goal status).
-- `clear` / `stop` / `off` / `reset` / `none` / `cancel` -> call `supervisor_goal` with `clear: true`.
-- `resume` / `unpause` -> call `supervisor_goal` with `resume: true` (revives a `paused` or `exhausted` goal — keeps the same condition, clears the stale pause reason, and resets this turn's attempt budget; a no-op with an honest message if the goal is not paused/exhausted).
-- anything else -> call `supervisor_goal` with `condition: "$ARGUMENTS"` (the goal the agent must demonstrably meet, e.g. "all tests in test/auth pass and lint is clean").
+- empty: call with no args. Reports an existing goal, or derives a session-only agent contract from requested work if none exists.
+- `clear` / `stop` / `off` / `reset` / `none` / `cancel`: call with `clear: true, source: "user"` (explicit user cancellation).
+- `resume` / `unpause`: call with `resume: true`.
+- anything else: call with `condition: "$ARGUMENTS"`, `source: "user"`, `acceptanceCriteria` describing observable success within exactly the requested scope, and `verification` describing checks/evidence for every criterion.
 
-After the tool returns, relay its message. While a goal is active the supervisor
-keeps re-prompting the agent until the goal is met or the retry budget runs out.
-
-After relaying the tool response, if the user asked to set a goal, mention:
-- This is a **session-scoped** goal (lost when the session ends).
-- For a **project-level** persistent goal that applies in reflection mode across
-  all sessions, edit `.agents/supervisor/Goal.md` in the project root.
+Relay the tool's actual result, including failures. Explicit user-set goals are also saved to `.agents/supervisor/Goal.md`; inferred agent contracts are session-only. The idle judge audits all criteria before accepting completion. `supervisor_loop_exit(completed)` cannot bypass that audit.

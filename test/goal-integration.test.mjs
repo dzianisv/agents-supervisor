@@ -9,11 +9,11 @@
 
 import { describe, test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
-import { readProjectGoalHistory, RUNAWAY_CEILING } from "../core/goal.mjs"
+import { writeProjectGoal, readProjectGoalHistory, readProjectGoalCondition, RUNAWAY_CEILING } from "../core/goal.mjs"
 import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
 
 // ---------------------------------------------------------------------------
@@ -162,23 +162,144 @@ describe("integration: supervisor goal loop", () => {
     const goalTool = plugin.tool.supervisor_goal
     assert.ok(goalTool, "supervisor_goal tool must exist on plugin")
 
-    const result = await goalTool.execute({ condition: "all tests pass" })
+    const result = await goalTool.execute({ condition: "all tests pass", source: "agent", acceptanceCriteria: "All tests pass", verification: "Run npm test" })
     assert.ok(typeof result === "string")
     assert.ok(result.includes("Goal set"), `Expected 'Goal set' in result, got: ${result}`)
 
     // Read state file
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
-    // Setting a goal forces reflection (the verifying mode) — 'goal' is no
-    // longer a mode; the goal is an orthogonal attribute.
-    assert.equal(state.mode, "reflection")
+    assert.equal(state.mode, undefined)
+    assert.equal(state.goal.source, "agent")
+    assert.equal(state.goal.acceptanceCriteria, "All tests pass")
+    assert.equal(state.goal.verification, "Run npm test")
     assert.equal(state.goal.condition, "all tests pass")
     assert.equal(state.goal.status, "active")
     assert.equal(state.goal.attempts, 0)
-    assert.equal(state.autopilot, false)
+    assert.equal(state.autopilot, undefined)
   })
 
-  test("goal clear reverts to reflection mode", async () => {
+  test("agent contracts stay session-only, require explicit replacement, and cannot replace user goals", async () => {
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    const declare = args => plugin.tool.supervisor_goal.execute(args, { sessionID: SESSION_ID })
+    const agent = { condition: "Fix auth", source: "agent", acceptanceCriteria: "Auth tests pass", verification: "Run auth tests" }
+    assert.match(await declare(agent), /Goal set/)
+    assert.equal(existsSync(join(tmpDir, ".agents", "supervisor", "Goal.md")), false)
+    assert.match(await declare({ ...agent, condition: "Redirect auth" }), /FAILED/)
+    assert.match(await declare({ ...agent, condition: "Redirect auth", replace: true }), /Goal set/)
+    assert.match(await declare({ condition: "User scope", source: "user" }), /Goal set/)
+    assert.match(await declare({ ...agent, replace: true }), /FAILED/)
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal.condition, "User scope")
+  })
+
+  test("retired supervisor goal alias cannot manufacture user authority", async () => {
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.tool.supervisor_goal.execute({ condition: "User objective", source: "user" }, { sessionID: SESSION_ID })
+    const original = sessionStore.load(tmpDir, SESSION_ID).goal
+    for (const args of [{ clear: true }, { condition: "Unqualified replacement" }]) {
+      const result = await plugin.tool.supervisor.execute({ action: "goal", ...args }, { sessionID: SESSION_ID })
+      assert.match(result, /retired/)
+      assert.deepEqual(sessionStore.load(tmpDir, SESSION_ID).goal, original)
+      assert.equal(readProjectGoalCondition(tmpDir), "User objective")
+    }
+  })
+
+  test("agent declaration cannot shadow a project-only user goal", async () => {
+    writeProjectGoal(tmpDir, "User project objective")
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    const result = await plugin.tool.supervisor_goal.execute({ condition: "Easier objective", source: "agent", acceptanceCriteria: "Easy check", verification: "Inspect easy check" }, { sessionID: SESSION_ID })
+    assert.match(result, /FAILED.*user-set project goal/)
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal, undefined)
+    assert.equal(readProjectGoalCondition(tmpDir), "User project objective")
+  })
+
+  test("a project goal introduced during inference is protected", async () => {
+    const { client } = createMockClient(makeMessages())
+    const originalMessages = client.session.messages
+    client.session.messages = async args => args.path.id === SESSION_ID ? originalMessages(args) : {
+      data: [{ info: { role: "assistant", time: { completed: Date.now() } }, parts: [{ type: "text", text: JSON.stringify({ goal: "Inferred objective", falsifiable: true, acceptance_criteria: "Inferred checks pass", verification: "Run inferred checks" }) }] }],
+    }
+    client.session.promptAsync = async () => { writeProjectGoal(tmpDir, "New user project objective"); return {} }
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    const result = await plugin.tool.supervisor_goal.execute({}, { sessionID: SESSION_ID })
+    assert.match(result, /FAILED to set derived goal.*user-set project goal/)
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal, undefined)
+    assert.equal(readProjectGoalCondition(tmpDir), "New user project objective")
+  })
+
+  for (const busyInitially of [false, true]) test(`idle for a new human turn is not lost while an older audit is in flight (busy=${busyInitially})`, { timeout: 45_000 }, async () => {
+    const { client, getActiveSessionPrompts, getEphemeralPrompts } = createMockClient(makeMessages())
+    let current = makeMessages()
+    const originalMessages = client.session.messages
+    client.session.messages = async args => args.path.id === SESSION_ID ? { data: current } : originalMessages(args)
+    let busy = busyInitially
+    client.session.status = async () => ({ data: busy ? { [SESSION_ID]: { type: "busy" } } : {} })
+    let begin, release
+    const started = new Promise(resolve => { begin = resolve })
+    const held = new Promise(resolve => { release = resolve })
+    const originalPrompt = client.session.promptAsync
+    let heldOnce = false
+    client.session.promptAsync = async args => {
+      if (args.path.id !== SESSION_ID && !heldOnce) { heldOnce = true; begin(); await held }
+      return originalPrompt(args)
+    }
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.tool.supervisor_goal.execute({ condition: "Fix auth and verify it", source: "user" }, { sessionID: SESSION_ID })
+    const oldIdle = plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    await started
+    current = makeMessages().map((m, i) => ({ ...m, info: { ...m.info, id: i === 0 ? "msg_new_human_turn" : "msg_new_reply" } }))
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    release()
+    await oldIdle
+    if (busyInitially) {
+      const auditsBeforeReplay = getEphemeralPrompts().length
+      await new Promise(resolve => setTimeout(resolve, 1750))
+      assert.equal(getEphemeralPrompts().length, auditsBeforeReplay, "queued idle must not audit an agent that is now busy")
+      busy = false
+      await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    }
+    const deadline = Date.now() + 20_000
+    while (!getActiveSessionPrompts().length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(getActiveSessionPrompts().length, 1, "the newer idle must be replayed after discarding the stale audit")
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).attempts?.turnKey, "msg_new_human_turn")
+  })
+
+  test("judge outage cannot achieve or retire a goal", async () => {
+    const { client, getActiveSessionPrompts } = createMockClient(makeMessages())
+    client.session.create = async () => { throw new Error("judge unavailable") }
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.tool.supervisor_goal.execute({ condition: "Verify auth", source: "agent", acceptanceCriteria: "Auth tests pass", verification: "Run auth tests" }, { sessionID: SESSION_ID })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal?.status, "active")
+    assert.equal(getActiveSessionPrompts().length, 0)
+  })
+
+  test("a failed project write is not reported as persistent success", async () => {
+    writeFileSync(join(tmpDir, ".agents"), "not a directory")
+    const { client } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    const result = await plugin.tool.supervisor_goal.execute({ condition: "User contract", source: "user" }, { sessionID: SESSION_ID })
+    assert.match(result, /Session goal set, but FAILED/)
+    assert.equal(sessionStore.load(tmpDir, SESSION_ID).goal?.status, "active")
+  })
+
+  test("paused and cleared session goals do not reactivate through stale project fallback", async () => {
+    const { client, getEphemeralPrompts, getActiveSessionPrompts } = createMockClient(makeMessages())
+    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+    await plugin.tool.supervisor_goal.execute({ condition: "Stale project goal", source: "user" }, { sessionID: SESSION_ID })
+    sessionStore.mutate(tmpDir, SESSION_ID, s => { s.goal.status = "paused" })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    assert.equal(getEphemeralPrompts().length, 0)
+    await plugin.tool.supervisor_goal.execute({ clear: true, source: "user" }, { sessionID: SESSION_ID })
+    await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
+    assert.equal(getEphemeralPrompts().length, 0)
+    assert.equal(getActiveSessionPrompts().length, 0)
+  })
+
+  test("goal clear leaves a tombstone and no execution mode", async () => {
     const { client } = createMockClient(makeMessages())
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
 
@@ -187,19 +308,20 @@ describe("integration: supervisor goal loop", () => {
 
     const goalTool = plugin.tool.supervisor_goal
 
-    // Set a goal first
-    await goalTool.execute({ condition: "all tests pass" })
+    // Set a user goal first.
+    await goalTool.execute({ condition: "all tests pass", source: "user" })
 
     // Clear the goal
-    const result = await goalTool.execute({ clear: true })
+    const result = await goalTool.execute({ clear: true, source: "user" })
     assert.ok(result.includes("cleared"), `Expected 'cleared' in result, got: ${result}`)
 
     // Read state file
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
-    assert.equal(state.mode, "reflection")
+    assert.equal(state.mode, undefined)
     assert.equal(state.goal, undefined)
-    assert.equal(state.autopilot, false)
+    assert.equal(state.goalCleared, true)
+    assert.equal(state.autopilot, undefined)
   })
 
   test("goal status returns current condition when goal active", async () => {
@@ -211,8 +333,8 @@ describe("integration: supervisor goal loop", () => {
 
     const goalTool = plugin.tool.supervisor_goal
 
-    // Set a goal
-    await goalTool.execute({ condition: "all tests pass" })
+    // Set a user goal.
+    await goalTool.execute({ condition: "all tests pass", source: "user" })
 
     // Check status (no condition, no clear)
     const result = await goalTool.execute({})
@@ -220,27 +342,26 @@ describe("integration: supervisor goal loop", () => {
     assert.ok(result.includes("active"), `Expected 'active' in status, got: ${result}`)
   })
 
-  test("deprecated mode:'goal' via the supervisor tool → sets reflection, keeps the goal, no hard error", async () => {
+  test("obsolete mode:'goal' reports removal and keeps the goal", async () => {
     const { client } = createMockClient(makeMessages())
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin["tool.execute.before"]({ tool: "supervisor_goal", sessionID: SESSION_ID })
 
     // Set a goal first.
-    await plugin.tool.supervisor_goal.execute({ condition: "all tests pass" })
+    await plugin.tool.supervisor_goal.execute({ condition: "all tests pass", source: "user" })
 
     // 'goal' is no longer a mode — the supervisor tool must accept it as a
     // deprecated alias that maps to reflection and KEEPS the goal.
     const result = await plugin.tool.supervisor.execute({ mode: "goal" }, { sessionID: SESSION_ID })
-    assert.match(result, /no longer a mode/i, `Expected deprecation notice, got: ${result}`)
-    assert.match(result, /reflection/i)
+    assert.match(result, /removed/i)
 
     const state = sessionStore.load(tmpDir, SESSION_ID)
-    assert.equal(state.mode, "reflection")
+    assert.equal(state.mode, undefined)
     assert.equal(state.goal?.condition, "all tests pass", "the deprecated alias must KEEP the goal")
     assert.equal(state.goal?.status, "active")
   })
 
-  test("autopilot + active goal → nudge CONTAINS the goal condition and the judge is NOT invoked", async () => {
+  test("legacy flags cannot bypass the judge; both judge and continuation contain the contract", async () => {
     const messages = makeMessages()
     const { client, getEphemeralPrompts, getActiveSessionPrompts } = createMockClient(messages)
 
@@ -254,6 +375,8 @@ describe("integration: supervisor goal loop", () => {
         autopilot: true,
         goal: {
           condition: "all integration tests are green",
+          acceptanceCriteria: "Every integration test passes with exit code 0",
+          verification: "Run the integration suite and inspect the results",
           status: "active",
           attempts: 0,
           tokenBaseline: 0,
@@ -269,16 +392,15 @@ describe("integration: supervisor goal loop", () => {
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: SESSION_ID } } })
     await new Promise(r => setTimeout(r, 5000))
 
-    // The judge runs in an EPHEMERAL session; autopilot must never spawn one.
-    assert.equal(getEphemeralPrompts().length, 0, "autopilot must NOT invoke the judge (no ephemeral session)")
-
-    // The autopilot nudge is injected into the ACTIVE session and carries the
-    // goal condition as context.
+    assert.ok(getEphemeralPrompts().length > 0, "legacy flags must not bypass the judge")
     const activePrompts = getActiveSessionPrompts()
-    assert.ok(activePrompts.length > 0, "autopilot must inject a continuation nudge")
-    const nudge = activePrompts[activePrompts.length - 1]?.body?.parts?.[0]?.text || ""
-    assert.match(nudge, /Autopilot/i, "must be the autopilot nudge")
-    assert.match(nudge, /all integration tests are green/, "the goal condition must be appended to the nudge as context")
+    assert.ok(activePrompts.length > 0)
+    for (const prompt of [getEphemeralPrompts()[0], activePrompts.at(-1)]) {
+      const text = prompt.body.parts[0].text
+      assert.match(text, /all integration tests are green/)
+      assert.match(text, /Every integration test passes with exit code 0/)
+      assert.match(text, /Run the integration suite/)
+    }
   })
 
   test("session.idle with active goal in reflection injects goal into judge prompt", async () => {
@@ -378,9 +500,7 @@ describe("integration: supervisor goal loop", () => {
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active at the per-turn cap, got: ${state.goal.status}`)
-    // Loaded mode is reflection: the seeded legacy mode:"goal" is migrated
-    // forward on load, and the goal is recognised as an attribute regardless.
-    assert.equal(state.mode, "reflection", `Mode must be reflection (goal is an attribute now), got: ${state.mode}`)
+    assert.equal(state.mode, undefined, "legacy mode must be discarded")
 
     // No continuation should have been injected to the active session
     const activePrompts = getActiveSessionPrompts()
@@ -425,7 +545,7 @@ describe("integration: supervisor goal loop", () => {
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "active", `Goal must stay active after the per-turn reset, got: ${state.goal.status}`)
-    assert.equal(state.mode, "reflection", `Mode must be reflection (goal is an attribute now), got: ${state.mode}`)
+    assert.equal(state.mode, undefined)
     assert.equal(
       state.goal.lastTurnKey,
       LAST_USER_MSG_ID,
@@ -474,7 +594,7 @@ describe("integration: supervisor goal loop", () => {
     const state = sessionStore.load(tmpDir, SESSION_ID)
 
     assert.equal(state.goal.status, "exhausted", `Goal should be exhausted past its deadline, got: ${state.goal.status}`)
-    assert.equal(state.mode, "reflection", `Mode should revert to reflection, got: ${state.mode}`)
+    assert.equal(state.mode, undefined)
 
     const activePrompts = getActiveSessionPrompts()
     assert.equal(activePrompts.length, 0, `No prompt should be sent to active session after exhaustion, got ${activePrompts.length}`)
@@ -507,13 +627,13 @@ describe("integration: supervisor goal loop", () => {
     const goalTool = plugin.tool.supervisor_goal
 
     const conditions = ["race-condition-A", "race-condition-B"]
-    const results = await Promise.all(conditions.map((c) => goalTool.execute({ condition: c })))
+    const results = await Promise.all(conditions.map((c) => goalTool.execute({ condition: c, source: "user" })))
     for (const [i, r] of results.entries()) {
       assert.ok(r.includes(conditions[i]), `Result ${i} should echo its own condition, got: ${r}`)
     }
 
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "Goal.md")
-    const goalMd = readFileSync(goalMdPath, "utf8")
+    const goalMd = readProjectGoalCondition(tmpDir)
     assert.ok(conditions.includes(goalMd), `Goal.md current pointer must be one of the raced conditions, got: ${JSON.stringify(goalMd)}`)
 
     const history = readProjectGoalHistory(tmpDir)
@@ -543,7 +663,7 @@ describe("integration: supervisor goal loop", () => {
 
     const longCondition = "x".repeat(5000)
     const expected = longCondition.slice(0, 4000)
-    const result = await goalTool.execute({ condition: longCondition })
+    const result = await goalTool.execute({ condition: longCondition, source: "user" })
     assert.ok(result.includes(expected), "Reply must echo the truncated condition")
     assert.ok(!result.includes(longCondition), "Reply must NOT echo the untruncated condition")
 
@@ -551,7 +671,7 @@ describe("integration: supervisor goal loop", () => {
     assert.equal(state.goal.condition, expected, "Session state must store the truncated condition, matching Goal.md/history")
 
     const goalMdPath = join(tmpDir, ".agents", "supervisor", "Goal.md")
-    const goalMd = readFileSync(goalMdPath, "utf8")
+    const goalMd = readProjectGoalCondition(tmpDir)
     assert.equal(goalMd, expected, "Goal.md must hold the truncated condition")
 
     const history = readProjectGoalHistory(tmpDir)

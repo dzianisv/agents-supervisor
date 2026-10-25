@@ -1,7 +1,7 @@
 {
   "name": "opencode-supervisor",
-  "version": "0.1.0",
-  "description": "OpenCode supervisor plugin — catches premature agent stops on session.idle and re-prompts the agent to finish. Tools: supervisor, set_supervisor, supervisor_train.",
+  "version": "0.4.0",
+  "description": "OpenCode goal supervisor — declares scoped acceptance criteria and verifies completion evidence on idle. Tools: supervisor, supervisor_goal, supervisor_retry, supervisor_loop_exit, set_supervisor, supervisor_train.",
   "type": "module",
   "main": "supervisor.ts",
   "exports": { ".": "./supervisor.ts" },

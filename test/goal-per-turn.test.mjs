@@ -1,13 +1,9 @@
 // goal-per-turn.test.mjs — the goal loop's per-turn budget contract.
 //
-// These behaviors used to live in a separate `solofounder` supervisor mode
-// (its own state file, its own deadline, its own continuation template). That
-// mode was folded into a plain active GOAL: everything that made it different
-// is now the default behaviour of an active goal (verified in reflection), and
-// the CEO playbook lives in the skill prompt (skills/solofounder/SKILL.md)
-// instead of the hook. What this file pins:
+// One goal supervisor; the CEO playbook stays in its skill, not in the hook.
+// What this file pins:
 //
-//   1. solofounder is NOT a supervisor mode any more.
+//   1. Retired execution commands cannot mutate the contract.
 //   2. The attempt budget is per HUMAN TURN — goal.attempts resets when the
 //      human speaks again, so a goal is never permanently exhausted
 //      mid-session by the attempts cap.
@@ -24,10 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   goalStore,
-  SUPERVISOR_MODES,
-  DEFAULT_SUPERVISOR_MODE,
   DEFAULT_MAX_GOAL_DURATION_MS,
-  resolveSupervisorMode,
   parseSupervisorCommand,
 } from '../core/goal.mjs';
 import { FEEDBACK_MARKER } from '../core/evaluation.mjs';
@@ -39,12 +32,12 @@ const ON_STOP = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
 
 // ── 1. solofounder is gone as a mode, alive only as a command alias ─────────
 
-test('solofounder is no longer a supervisor mode', () => {
-  assert.deepEqual([...SUPERVISOR_MODES], ['autopilot', 'reflection']);
-  assert.equal(resolveSupervisorMode({ mode: 'solofounder' }), DEFAULT_SUPERVISOR_MODE,
-    'an unknown/retired mode value must fall back to the default, not resolve');
-  assert.throws(() => goalStore.setMode(mkcwd(), 's0', 'solofounder'), /Invalid supervisor mode/);
-  assert.equal(typeof goalStore.setSolofounder, 'undefined', 'setSolofounder must be gone');
+test('retired execution setters are absent and commands explicitly parse removed', () => {
+  assert.equal(typeof goalStore.setMode, 'undefined');
+  assert.equal(typeof goalStore.setAutopilot, 'undefined');
+  for (const word of ['autopilot', 'reflection', 'mode']) {
+    assert.deepEqual(parseSupervisorCommand(word, ''), { kind: 'mode-removed' });
+  }
 });
 
 test('the retired `solofounder` command word now just arms a plain goal', () => {
@@ -59,28 +52,17 @@ test('the retired `solofounder` command word now just arms a plain goal', () => 
   );
 });
 
-// ── 2. setMode: a mode switch NEVER drops the goal (the :433 landmine) ──────
+// ── 2. Contract fields survive independent control writes ──────────────────
 
-test('setMode never drops the goal; "goal" is not a valid mode', () => {
+test('retry and status toggles keep the goal contract intact', () => {
   const d = mkcwd();
-  goalStore.setGoal(d, 's1', 'ship the feature');
-  // Setting a goal forces reflection (the verifying mode) — 'goal' is not a mode.
-  assert.equal(goalStore.load(d, 's1').mode, 'reflection');
-  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
-
-  // Switching to autopilot KEEPS the goal (as context) — the old
-  // `if (mode !== 'goal') delete state.goal` landmine is gone.
-  goalStore.setMode(d, 's1', 'autopilot');
-  assert.equal(goalStore.load(d, 's1').mode, 'autopilot');
-  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
-
-  // …and back to reflection, still intact.
-  goalStore.setMode(d, 's1', 'reflection');
-  assert.equal(goalStore.load(d, 's1').goal.condition, 'ship the feature');
-
-  // 'goal' is no longer a valid low-level mode (the deprecated INPUT alias is
-  // mapped to reflection at the CLI/tool surface, not in this primitive).
-  assert.throws(() => goalStore.setMode(d, 's1', 'goal'), /Invalid supervisor mode/);
+  goalStore.setGoal(d, 's1', 'ship the feature', {
+    acceptanceCriteria: 'health test passes', verification: 'npm test',
+  });
+  const before = goalStore.load(d, 's1').goal;
+  goalStore.setRetry(d, 's1', 9);
+  goalStore.setStatusDiagram(d, 's1', true);
+  assert.deepEqual(goalStore.load(d, 's1').goal, before);
 });
 
 // ── 3. Deadline is a long backstop, not a 30-minute session cap ────────────
@@ -90,7 +72,8 @@ test('setGoal deadline is the 30-day backstop, not the old 30-minute cap', () =>
   const now = Date.now();
   const state = goalStore.setGoal(d, 's2', 'all tests pass', { now });
 
-  assert.equal(state.mode, 'reflection');
+  assert.equal(state.mode, undefined);
+  assert.equal(state.goal.source, 'user');
   assert.equal(state.goal.status, 'active');
   assert.equal(state.goal.attempts, 0);
   assert.equal(state.goal.lastTurnKey, null, 'seeded so the first stop stamps without resetting');
@@ -296,7 +279,7 @@ test('goal: judge status "complete" allows the stop (goal achieved, not injected
   // .supervisor/goal-achieved.log.
   const state = loadGoalState(d, sid);
   assert.equal(state.goal, undefined, 'session goal must be cleared once achieved');
-  assert.equal(state.mode, 'reflection');
+  assert.equal(state.mode, undefined);
 });
 
 // ── 5. The judge prompt must actually carry the session goal condition ─────
@@ -310,7 +293,10 @@ test('goal: the session goal condition reaches the judge prompt as a mandatory r
   const d = mkcwd();
   const sid = 'goal-prompt-test';
   const condition = 'the refresh-token rotation test passes';
-  goalStore.setGoal(d, sid, condition);
+  goalStore.setGoal(d, sid, condition, {
+    acceptanceCriteria: 'token rotates exactly once and expired tokens fail',
+    verification: 'npm test -- auth reports both scenarios passing',
+  });
 
   const turns = [
     { type: 'user', message: { role: 'user', content: 'fix auth' } },
@@ -329,6 +315,8 @@ test('goal: the session goal condition reaches the judge prompt as a mandatory r
 
   const dumped = fs.readFileSync(dumpPath, 'utf8');
   assert.match(dumped, /GOAL \(mandatory completion requirement\)/);
+  assert.match(dumped, /token rotates exactly once and expired tokens fail/);
+  assert.match(dumped, /npm test -- auth reports both scenarios passing/);
   assert.match(dumped, new RegExp(condition.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 

@@ -17,7 +17,7 @@ import { goalStore, isStatusDiagramEnabled } from '../core/goal.mjs';
 
 // ---------------------------------------------------------------------------
 // The status/roadmap directive must ride along with EVERY supervisor
-// continuation prompt (autopilot nudge + reflection feedback) so the roadmap
+// goal continuation prompt so the roadmap
 // survives context compaction. These tests pin its content and its position
 // (always last).
 // ---------------------------------------------------------------------------

@@ -61,18 +61,19 @@ The single-agent **Operating loop** below is what each *doer* runs on its narrow
 
 ## Set the $1M ARR done-bar (Step 1 — before the loop)
 
-This skill runs inside the **supervisor** plugin, on a **goal** in reflection mode.
-A goal is a session attribute, not a mode — everything that once made a separate
-`solofounder` supervisor mode different (per-human-turn attempt budget, effectively
-unbounded deadline, condition injected into the judge as a mandatory completion
-requirement) is now what any active goal does in reflection. This skill is the
-prompt-level layer on top: it arms a goal whose condition is the $1M ARR done-bar.
-Goal state lives in `.agents/supervisor/Goal.md` plus the per-session store
-under `.supervisor/sessions/<sessionId>/state.json`. On every turn-end the hook judges the reply against that
-condition and — if unmet — forces a continuation instead of letting the agent stop.
-That hook IS the persistence motor; there is no separate `.autopilot/` engine to arm and
-no `active`/heartbeat file to write. Arming the goal below is a real tool call you make
-THIS turn, not a plan you describe — a turn that ends without it armed nothing.
+This skill uses the **one goal supervisor**, not another execution mode. Arm a
+contract whose condition is the $1M ARR done-bar, with observable acceptance
+criteria and a verification plan. Preserve an existing user-owned goal and all
+user permissions; never replace it or expand scope just to keep running.
+
+On CC, the explicit user-authorized CLI goal lives in the per-session store and
+its condition also persists in `.agents/supervisor/Goal.md`. On OpenCode, declare
+an agent-owned session-only contract through `supervisor_goal` before multi-step
+work (unless an existing user goal already governs it). No active goal means no
+completion supervision. No heartbeat or cadence file is involved. The judge
+checks concrete evidence reported in prose; it does not independently read tool
+results, and a completed signal cannot bypass its audit. Retry/no-progress,
+human blockers and errors can still stand the loop down without achievement.
 
 1. **Resolve the revenue source (once).** `${ARGUMENTS}` names the product/context. Find
    how ITS revenue is actually read: grep the target project for a billing or store
@@ -125,7 +126,7 @@ Stop hook can force at most **~7 turn-continuations within a single unbroken hum
 message** — Claude Code overrides the hook and lets the turn end after 8 consecutive
 `{decision:'block'}` responses (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`, default 8, hook stays
 one under it). An active goal does not bypass this cap; it is the same Stop-hook
-mechanism as `reflection`. For a genuinely long autonomous drive toward $1M ARR, either:
+mechanism as every other active goal. For a genuinely long autonomous drive toward $1M ARR, either:
 - pair this skill with the `/loop` skill (a fresh message resets CC's per-turn counter,
   so `/loop` re-invoking the prompt on an interval is what actually spans hours/days), or
 - raise `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` in the environment running the session (still

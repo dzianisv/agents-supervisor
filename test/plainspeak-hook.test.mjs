@@ -139,11 +139,11 @@ test('alreadyFiredThisTurn: an unknown turn key (null) is always treated as alre
 // supervisor coexistence guard
 // ---------------------------------------------------------------------------
 
-test('supervisorGoalActive: true when autopilot is on', () => {
+test('supervisorGoalActive: obsolete autopilot flag does not suppress independent style checking', () => {
   const d = mkcwd();
     ensureSessionDir(d, 's1');
     fs.writeFileSync(statePath(d, 's1'), JSON.stringify({ autopilot: true }));
-  assert.equal(supervisorGoalActive(d, 's1'), true);
+  assert.equal(supervisorGoalActive(d, 's1'), false);
 });
 
 test('supervisorGoalActive: true when a goal is active', () => {
@@ -159,6 +159,20 @@ test('supervisorGoalActive: false when supervisor state is absent or idle', () =
     ensureSessionDir(d, 's2');
     fs.writeFileSync(statePath(d, 's2'), JSON.stringify({ goal: { status: 'achieved' } }));
   assert.equal(supervisorGoalActive(d, 's2'), false);
+});
+
+test('supervisorGoalActive: project fallback defers style, but pause/clear suppress fallback', () => {
+  const d = mkcwd();
+  const dir = path.join(d, '.agents', 'supervisor');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'Goal.md'), 'project contract');
+  assert.equal(supervisorGoalActive(d, 'inherits'), true);
+  ensureSessionDir(d, 'paused');
+  fs.writeFileSync(statePath(d, 'paused'), JSON.stringify({ goal: { status: 'paused', condition: 'session goal' } }));
+  assert.equal(supervisorGoalActive(d, 'paused'), false);
+  ensureSessionDir(d, 'cleared');
+  fs.writeFileSync(statePath(d, 'cleared'), JSON.stringify({ goalCleared: true }));
+  assert.equal(supervisorGoalActive(d, 'cleared'), false);
 });
 
 test('supervisorRecentlyBlocked: true only for a fresh, injected:true verdict written at/after sinceMs', () => {

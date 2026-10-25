@@ -28,8 +28,8 @@ test('hooks/hooks.json registers the Stop hook → bin/supervisor-on-stop.mjs', 
   assert.ok(fs.existsSync(path.join(ROOT, 'bin', 'supervisor-on-stop.mjs')));
 });
 
-test('bundled skills exist with frontmatter names → /supervisor:{train,status,set-goal,retry,on,off,autopilot,reflection}', () => {
-  for (const name of ['train', 'status', 'set-goal', 'retry', 'on', 'off', 'autopilot', 'reflection']) {
+test('bundled goal/control skills exist with frontmatter names', () => {
+  for (const name of ['train', 'status', 'set-goal', 'retry', 'on', 'off']) {
     const p = path.join(ROOT, 'skills', name, 'SKILL.md');
     assert.ok(fs.existsSync(p), `skills/${name}/SKILL.md missing`);
     const fm = fs.readFileSync(p, 'utf8').slice(0, 400);
@@ -42,7 +42,6 @@ test('OpenCode command files mirror the Claude Code skill names', () => {
   const found = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort();
   assert.deepEqual(found, [
     'supervisor.md',
-    'supervisor:autopilot.md',
     'supervisor:off.md',
     'supervisor:on.md',
     // OpenCode-ONLY, deliberately with no skills/plain counterpart: plainspeak
@@ -50,7 +49,6 @@ test('OpenCode command files mirror the Claude Code skill names', () => {
     // / PLAINSPEAK_DISABLED, not by a /supervisor:* command. Adding a Claude
     // Code skill here would advertise a toggle that runtime does not read.
     'supervisor:plain.md',
-    'supervisor:reflection.md',
     'supervisor:retry.md',
     'supervisor:set-goal.md',
     'supervisor:status.md',
@@ -110,6 +108,14 @@ test('every documented command name actually parses (docs cannot drift from the 
   assert.deepEqual(parseSupervisorCommand('supervisor', 'set-goal resume'), { kind: 'goal-resume' });
   assert.deepEqual(parseSupervisorCommand('set-goal', 'resume'), { kind: 'goal-resume' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'set-goal unpause'), { kind: 'goal-resume' });
+});
+
+test('retired execution skills are absent and plugin/marketplace upgrade together', () => {
+  for (const name of ['autopilot', 'reflection']) {
+    assert.equal(fs.existsSync(path.join(ROOT, 'skills', name)), false);
+  }
+  assert.equal(read('.claude-plugin/plugin.json').version, '0.4.0');
+  assert.equal(read('.claude-plugin/marketplace.json').plugins.find((p) => p.name === 'supervisor').version, '0.4.0');
 });
 
 test('marketplace.json lists supervisor with source "."', () => {

@@ -19,7 +19,7 @@
 
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { extractGoalCondition, buildGoalRequirementSection, RUNAWAY_CEILING } from './goal.mjs'
+import { extractGoalContract, buildGoalRequirementSection, RUNAWAY_CEILING } from './goal.mjs'
 import { DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt } from './assessment.mjs'
 import { loadParsedRubric, formatRubricMarkdown } from './rubric-loader.mjs'
 import { PROMPT_TEXT_LIMIT, truncateForPrompt, formatConversationTurns } from './task-context.mjs'
@@ -177,8 +177,8 @@ export async function buildReflectionPrompt({
   const currentAttempt = attemptCount || 0
 
   // If no session goal was passed, check Goal.md for a project-level goal
-  const projectGoalCondition = !goalSection ? extractGoalCondition(goalFile) : ''
-  const effectiveGoalSection = goalSection || (projectGoalCondition ? buildGoalRequirementSection(projectGoalCondition) : undefined)
+  const projectGoal = !goalSection ? extractGoalContract(goalFile) : null
+  const effectiveGoalSection = goalSection || (projectGoal ? buildGoalRequirementSection(projectGoal.condition, projectGoal) : undefined)
 
   // Judge context. Both runtimes supply a real `conversationChain`; the
   // fallback synthesizes a one-turn chain so a legacy context (bare
@@ -230,6 +230,9 @@ export async function buildReflectionPrompt({
   if (systemPromptFile) {
     const interpolated = interpolateTemplate(systemPromptFile, templateVars)
     const parts = [interpolated]
+    // Custom and older templates may omit {{goalSection}}. The contract is
+    // mandatory independently of template formatting, not an optional variable.
+    if (effectiveGoalSection && !interpolated.includes(effectiveGoalSection)) parts.push(effectiveGoalSection)
     if (effectivePatternsFile) {
       parts.push(effectivePatternsFile)
     }

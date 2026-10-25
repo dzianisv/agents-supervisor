@@ -185,6 +185,10 @@ export async function startLiveServer(opts = {}) {
   const { port, release } = await reserveFreePort()
   const baseUrl = `http://127.0.0.1:${port}`
   const childEnv = { ...process.env, HOME: isolatedHome, SUPERVISOR_DEBUG: "1" }
+  // The server's bash tool must be able to run REAL node:test commands. This
+  // runner-private flag otherwise makes nested `node --test` skip all files
+  // with exit 0 (a dangerously false-green validation result).
+  delete childEnv.NODE_TEST_CONTEXT
   for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
   for (const key of AMBIENT_SERVER_ENV_VARS) delete childEnv[key]
 

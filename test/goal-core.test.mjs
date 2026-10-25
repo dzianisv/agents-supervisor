@@ -6,17 +6,39 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { statePath } from '../core/session-store.mjs';
+import { evaluateSelfAssessment } from '../core/evaluation.mjs';
 import {
   goalStore, resolveRunawayLimit, describeRunawayLimit, readConfiguredMaxAttempts,
   resolveClaudeCodeHardCap, decideGoalTransition, RUNAWAY_CEILING,
-  parseSupervisorCommand, buildGoalRequirementSection,
-  DEFAULT_SUPERVISOR_MODE, resolveSupervisorMode, appendGoalContextToNudge,
-  extractGoalCondition, writeProjectGoal, readProjectGoalHistory,
+  parseSupervisorCommand, buildGoalRequirementSection, buildGoalAssessmentContext,
+  GOAL_OWNERSHIP_MARKER, appendGoalOwnershipDirectiveToSystem, sameGoalContract,
+  extractGoalCondition, writeProjectGoal, readProjectGoalHistory, readProjectGoalContract, retireProjectGoal, readGoalAchievedLog,
 } from '../core/goal.mjs';
 
 const mkcwd = () => fs.mkdtempSync(path.join(tmpdir(), 'sup-goal-'));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUPERVISOR_GOAL_BIN = path.join(HERE, '..', 'bin', 'supervisor-goal.mjs');
+
+test('goal contracts, not coding heuristics, define the required workflow', () => {
+  const context = buildGoalAssessmentContext({ taskType: 'coding', conversationChain: 'Requested a local patch only; no PR.', requiresTests: true, requiresBuild: true, requiresPR: true, requiresCI: true, requiresLocalTests: true, requiresLocalTestsEvidence: true, pushedToDefaultBranch: true });
+  const assessment = { status: 'complete', confidence: 0.99, remaining_work: [], next_steps: [], needs_user_action: [], evidence: {} };
+  assert.equal(evaluateSelfAssessment(assessment, context).shouldContinue, false);
+  assert.equal(evaluateSelfAssessment({ ...assessment, remaining_work: ['Verify the acceptance criterion'] }, context).shouldContinue, true);
+  assert.equal(context.conversationChain, 'Requested a local patch only; no PR.');
+  assert.equal(buildGoalAssessmentContext(null), null);
+});
+
+test('agent declarations cannot shadow an effective user project contract', () => {
+  const d = mkcwd();
+  const project = mkcwd();
+  const contract = { source: 'agent', acceptanceCriteria: 'Agent criteria', verification: 'Run agent checks', projectDir: project };
+  writeProjectGoal(project, 'User project objective');
+  assert.throws(() => goalStore.setGoal(d, 'project-protected', 'Easier objective', contract), /user-set project goal/);
+  assert.equal(goalStore.load(d, 'project-protected').goal, undefined);
+  goalStore.clearGoal(d, 'project-protected');
+  assert.equal(goalStore.setGoal(d, 'project-protected', 'New requested task', contract).goal.source, 'agent');
+  assert.equal(readProjectGoalContract(project).condition, 'User project objective');
+});
 
 test('goalStore: setGoal/load/clear round-trip, 0600 perms', () => {
   const d = mkcwd();
@@ -63,17 +85,28 @@ test('parseSupervisorCommand + buildGoalRequirementSection (shared logic)', () =
   assert.equal(buildGoalRequirementSection(''), '');
 });
 
-test('appendGoalContextToNudge: appends the condition, no-ops on blank (shared by both runtimes)', () => {
-  const base = 'Autopilot (1/50)\n\nContinue now.';
-  const withGoal = appendGoalContextToNudge(base, 'all tests pass');
-  assert.ok(withGoal.startsWith(base), 'the original nudge is preserved as a prefix');
-  assert.match(withGoal, /all tests pass/, 'the goal condition is appended as context');
-  assert.match(withGoal, /goal for this session/i);
-  // Blank/whitespace/nullish conditions never mutate the nudge.
-  assert.equal(appendGoalContextToNudge(base, ''), base);
-  assert.equal(appendGoalContextToNudge(base, '   '), base);
-  assert.equal(appendGoalContextToNudge(base, null), base);
-  assert.equal(appendGoalContextToNudge(base, undefined), base);
+test('goal ownership directive is idempotent and teaches scoped, checkable goals', () => {
+  const system = ['original system'];
+  appendGoalOwnershipDirectiveToSystem(system);
+  appendGoalOwnershipDirectiveToSystem(system);
+  assert.equal(system.length, 2);
+  assert.equal(system[0], 'original system');
+  assert.ok(system[1].includes(GOAL_OWNERSHIP_MARKER));
+  assert.match(system[1], /acceptanceCriteria/);
+  assert.match(system[1], /verification/);
+  assert.match(system[1], /Plain questions/);
+  assert.match(system[1], /does not grant permission/);
+});
+
+test('goal requirement renders every criterion and verification without inventing deliverables', () => {
+  const section = buildGoalRequirementSection('Fix login', {
+    acceptanceCriteria: 'Invalid email is rejected; valid email signs in.',
+    verification: 'Run node --test test/login.test.mjs and report pass/fail.',
+  });
+  assert.match(section, /Invalid email is rejected; valid email signs in/);
+  assert.match(section, /node --test test\/login.test.mjs/);
+  assert.match(section, /do not invent extra deliverables/i);
+  assert.match(section, /You do not see tool calls/);
 });
 
 test('parseSupervisorCommand supports root /supervisor mode UX', () => {
@@ -81,42 +114,140 @@ test('parseSupervisorCommand supports root /supervisor mode UX', () => {
   assert.deepEqual(parseSupervisorCommand('supervisor', 'status'), { kind: 'supervisor-status' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'off'), { kind: 'supervisor-off' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'on'), { kind: 'supervisor-on' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'autopilot'), { kind: 'mode-set', mode: 'autopilot' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'static'), { kind: 'mode-set', mode: 'autopilot' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'reflection'), { kind: 'mode-set', mode: 'reflection' });
+  for (const removed of ['autopilot', 'static', 'reflection', 'mode goal']) {
+    assert.deepEqual(parseSupervisorCommand('supervisor', removed), { kind: 'mode-removed' });
+    assert.deepEqual(parseSupervisorCommand(removed.split(' ')[0], ''), { kind: 'mode-removed' });
+  }
   assert.deepEqual(parseSupervisorCommand('supervisor', 'goal'), { kind: 'goal-status' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'goal clear'), { kind: 'goal-clear' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'goal all tests pass'), { kind: 'goal-set', condition: 'all tests pass' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'retry 24'), { kind: 'retry-set', n: 24 });
 });
 
-test('goalStore persists supervisor mode and resolves legacy state', () => {
+test('goals persist contracts and provenance without selectable modes', () => {
   const d = mkcwd();
-  assert.equal(DEFAULT_SUPERVISOR_MODE, 'reflection');
-  assert.equal(resolveSupervisorMode({}), 'reflection');
-  assert.equal(resolveSupervisorMode({ autopilot: true }), 'autopilot');
-  // A goal is an ATTRIBUTE now, not a mode. An active goal alone no longer
-  // resolves to a 'goal' mode — it resolves to reflection (where it is
-  // verified). A legacy persisted mode:'goal' also maps forward to reflection.
-  assert.equal(resolveSupervisorMode({ goal: { condition: 'x', status: 'active', attempts: 0, tokenBaseline: 0, startedAt: 0, deadline: 9e9, lastReason: '' } }), 'reflection');
-  assert.equal(resolveSupervisorMode({ mode: 'goal' }), 'reflection');
-
   goalStore.setGoal(d, 's3', 'ship it');
-  // Setting a goal forces reflection (the mode that verifies it), not a mode.
-  assert.equal(goalStore.load(d, 's3').mode, 'reflection');
-  assert.equal(goalStore.load(d, 's3').autopilot, false);
+  const state = goalStore.load(d, 's3');
+  assert.equal(state.goal.source, 'user');
+  assert.equal(state.goal.acceptanceCriteria, 'ship it');
+  assert.equal(state.mode, undefined);
+  assert.equal(state.autopilot, undefined);
+  assert.equal(goalStore.setMode, undefined);
+  assert.equal(goalStore.setAutopilot, undefined);
+});
 
-  goalStore.setMode(d, 's3', 'autopilot');
-  assert.equal(goalStore.load(d, 's3').mode, 'autopilot');
-  // A mode switch NEVER drops the goal now (the :433 landmine is removed).
-  assert.equal(goalStore.load(d, 's3').goal?.condition, 'ship it');
-  assert.equal(resolveSupervisorMode(goalStore.load(d, 's3')), 'autopilot');
+test('agent contracts cannot overwrite user goals, including paused goals', () => {
+  const d = mkcwd();
+  goalStore.setGoal(d, 'user', 'user outcome');
+  goalStore.mutate(d, 'user', (s) => { s.goal.status = 'paused'; s.maxAttempts = 12; });
+  const before = goalStore.load(d, 'user');
+  assert.throws(() => goalStore.setGoal(d, 'user', 'agent replacement', {
+    source: 'agent', replace: true, acceptanceCriteria: 'tests pass', verification: 'npm test',
+  }), /user-set goal/);
+  assert.deepEqual(goalStore.load(d, 'user'), before);
+});
 
-  goalStore.setAutopilot(d, 's3', false);
-  assert.equal(goalStore.load(d, 's3').mode, 'reflection');
-  assert.equal(goalStore.load(d, 's3').autopilot, false);
-  // Still there after flipping back — only clearGoal/retire may remove it.
-  assert.equal(goalStore.load(d, 's3').goal?.condition, 'ship it');
+test('agent replacement is explicit; contract fields survive resume and attempts are reset', () => {
+  const d = mkcwd();
+  const opts = { source: 'agent', acceptanceCriteria: 'valid inputs pass', verification: 'node --test test/login.mjs' };
+  goalStore.setGoal(d, 'agent', 'Fix the login form', opts);
+  assert.throws(() => goalStore.setGoal(d, 'agent', 'Fix the logout flow', opts), /already set/);
+  goalStore.setGoal(d, 'agent', 'Fix the logout flow', { ...opts, replace: true });
+  goalStore.mutate(d, 'agent', (s) => { s.goal.status = 'paused'; s.attempts = { count: 4, turnKey: 'old' }; });
+  goalStore.resumeGoal(d, 'agent');
+  const state = goalStore.load(d, 'agent');
+  assert.equal(state.goal.condition, 'Fix the logout flow');
+  assert.equal(state.goal.source, 'agent');
+  assert.equal(state.goal.acceptanceCriteria, opts.acceptanceCriteria);
+  assert.equal(state.goal.verification, opts.verification);
+  assert.equal(state.attempts, undefined);
+});
+
+test('a fresh declaration has a fresh audit identity, even with identical text and time', () => {
+  const d = mkcwd();
+  const first = goalStore.setGoal(d, 'identity', 'Fix the login form', { now: 100 }).goal;
+  const second = goalStore.setGoal(d, 'identity', 'Fix the login form', { now: 100 }).goal;
+  assert.notEqual(first.id, second.id);
+  assert.equal(sameGoalContract(first, second), false);
+  assert.equal(sameGoalContract(second, { ...second, attempts: 7 }), true);
+  assert.equal(sameGoalContract(second, { ...second, status: 'paused' }), false);
+  assert.equal(sameGoalContract(second, { ...second, acceptanceCriteria: 'New stricter criterion' }), false);
+});
+
+test('audited agent completion logs evidence metadata but cannot retire an unrelated project contract', () => {
+  const d = mkcwd();
+  const condition = 'Fix the login form';
+  const contract = { acceptanceCriteria: 'Invalid inputs are rejected', verification: 'node --test login.mjs' };
+  writeProjectGoal(d, condition, contract);
+  goalStore.clearGoal(d, 'agent-complete'); // Explicitly cancel this session's project fallback.
+  const expectedGoal = goalStore.setGoal(d, 'agent-complete', condition, { ...contract, source: 'agent' }).goal;
+  const result = goalStore.completeGoal(d, 'agent-complete', { expectedGoal, reason: 'Login tests pass' });
+  assert.equal(result.achieved, true);
+  assert.equal(result.state.goal, undefined);
+  assert.equal(readProjectGoalContract(d).condition, condition, 'agent-only goals never delete project files, even when text matches');
+  const log = readGoalAchievedLog(d);
+  assert.equal(log.length, 1);
+  assert.equal(log[0].goalId, expectedGoal.id);
+  assert.equal(log[0].acceptanceCriteria, contract.acceptanceCriteria);
+});
+
+test('stale or unlogged completion cannot destroy an active declaration', () => {
+  const d = mkcwd();
+  const stale = goalStore.setGoal(d, 'audit-race', 'Fix the login form').goal;
+  const fresh = goalStore.setGoal(d, 'audit-race', 'Fix the logout flow').goal;
+  assert.equal(goalStore.completeGoal(d, 'audit-race', { expectedGoal: stale }).achieved, false);
+  assert.deepEqual(goalStore.load(d, 'audit-race').goal, fresh);
+  assert.equal(readGoalAchievedLog(d).length, 0);
+  fs.mkdirSync(path.join(d, '.supervisor', 'goal-achieved.log'));
+  assert.equal(goalStore.completeGoal(d, 'audit-race', { expectedGoal: fresh }).achieved, false);
+  assert.deepEqual(goalStore.load(d, 'audit-race').goal, fresh, 'failed audit logging must preserve the goal');
+});
+
+test('stale stuck signals cannot pause or resurrect a replaced or cleared goal', () => {
+  const d = mkcwd();
+  const old = goalStore.setGoal(d, 'pause', 'Fix the login form').goal;
+  const replacement = goalStore.setGoal(d, 'pause', 'Fix the logout flow').goal;
+  assert.equal(goalStore.pauseGoal(d, 'pause', { expectedGoal: old }).paused, false);
+  assert.deepEqual(goalStore.load(d, 'pause').goal, replacement);
+  goalStore.clearGoal(d, 'pause');
+  assert.equal(goalStore.pauseGoal(d, 'pause', { expectedGoal: replacement }).paused, false);
+  assert.equal(goalStore.load(d, 'pause').goal, undefined);
+  assert.equal(goalStore.load(d, 'pause').goalCleared, true);
+});
+
+test('project fallback pause is atomic, contract-preserving and respects clears and new goals', () => {
+  const d = mkcwd();
+  writeProjectGoal(d, 'Fix the login form', { acceptanceCriteria: 'Login and logout tests pass', verification: 'node --test login.mjs' });
+  const projectGoal = readProjectGoalContract(d);
+  goalStore.setGoal(d, 'session-goal', 'A different user outcome');
+  assert.equal(goalStore.pauseGoal(d, 'session-goal', { projectGoal }).paused, false);
+  goalStore.clearGoal(d, 'cleared');
+  assert.equal(goalStore.pauseGoal(d, 'cleared', { projectGoal }).paused, false);
+  const paused = goalStore.pauseGoal(d, 'fallback', { projectGoal, reason: 'Missing authorization' });
+  assert.equal(paused.paused, true);
+  assert.equal(paused.state.goal.status, 'paused');
+  assert.equal(paused.state.goal.acceptanceCriteria, projectGoal.acceptanceCriteria);
+  assert.equal(paused.state.goal.verification, projectGoal.verification);
+  writeProjectGoal(d, projectGoal.condition, { ...projectGoal, acceptanceCriteria: 'A stricter criterion' });
+  assert.equal(goalStore.pauseGoal(d, 'stale-project', { projectGoal }).paused, false);
+  assert.equal(goalStore.load(d, 'stale-project').goal, undefined);
+});
+
+test('invalid agent contracts fail loudly, without persisting a goal', () => {
+  const d = mkcwd();
+  assert.throws(() => goalStore.setGoal(d, 'bad', 'fix login', { source: 'agent' }), /acceptance criteria and verification/);
+  assert.throws(() => goalStore.setGoal(d, 'bad', ''), /must not be empty/);
+  assert.throws(() => goalStore.setGoal(d, 'bad', 'fix login', { source: 'invented' }), /source/);
+  assert.deepEqual(goalStore.load(d, 'bad'), {});
+});
+
+test('clear suppresses stale project fallback until a new goal is set', () => {
+  const d = mkcwd();
+  goalStore.setGoal(d, 'clear', 'Fix the login form');
+  goalStore.clearGoal(d, 'clear');
+  assert.equal(goalStore.load(d, 'clear').goalCleared, true);
+  goalStore.setGoal(d, 'clear', 'Fix the logout flow');
+  assert.equal(goalStore.load(d, 'clear').goalCleared, undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -162,6 +293,24 @@ test('writeProjectGoal: single write — Goal.md + history both contain the cond
   assert.equal(history.length, 1);
   assert.equal(history[0].condition, 'ship the feature');
   assert.ok(history[0].ts && history[0].pid, 'history entry must carry ts + pid');
+});
+
+test('project goal contracts survive reload and retirement checks the full contract', () => {
+  const d = mkcwd();
+  const condition = 'Fix the login form';
+  const original = { acceptanceCriteria: 'Valid and invalid inputs are tested', verification: 'node --test test/login.mjs' };
+  writeProjectGoal(d, condition, original);
+  assert.deepEqual(readProjectGoalContract(d), { condition, ...original, source: 'user' });
+  assert.equal(readProjectGoalHistory(d)[0].verification, original.verification);
+  const revised = { ...original, acceptanceCriteria: original.acceptanceCriteria + '; keyboard submission works' };
+  writeProjectGoal(d, condition, revised);
+  const oldVerdict = retireProjectGoal(d, { condition, contract: original });
+  assert.equal(oldVerdict.removed.length, 0, 'a stale verdict cannot retire stricter criteria with the same condition');
+  assert.equal(readProjectGoalContract(d).acceptanceCriteria, revised.acceptanceCriteria);
+  const currentVerdict = retireProjectGoal(d, { condition, contract: revised });
+  assert.equal(currentVerdict.logged, true);
+  assert.equal(currentVerdict.removed.length, 1);
+  assert.equal(readProjectGoalContract(d), null);
 });
 
 test('writeProjectGoal: sequential double-write — current pointer is the last write, history has both', () => {

@@ -1,7 +1,7 @@
 {
   "name": "agents-supervisor",
-  "version": "0.1.0",
-  "description": "Dataset-backed supervisor that catches premature agent stops and re-prompts the agent to finish — for Claude Code (Stop hook) and OpenCode (session.idle). Includes /supervisor:train to learn from your sessions.",
+  "version": "0.4.0",
+  "description": "Goal-based supervisor for Claude Code and OpenCode: explicit acceptance criteria, idle continuation and evidence-based completion.",
   "type": "module",
   "license": "MIT",
   "author": "dzianisv",

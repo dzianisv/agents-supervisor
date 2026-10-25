@@ -26,7 +26,6 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { callAnthropic } from '../core/llm-client.mjs';
 import {
-  FEEDBACK_MARKER,
   isNonHumanUserText, hashReply, evaluateNoProgress,
   inferTaskType, extractToolCommands, detectSignals,
   getRecentCommands, hasLocalTestCommand, isTestRunnerCommand, pushedToDefaultBranch,
@@ -34,9 +33,8 @@ import {
 } from '../core/evaluation.mjs';
 import { parseSelfAssessmentJson } from '../core/assessment.mjs';
 import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from '../core/feedback.mjs';
-import { goalStore, describeRunawayLimit, readConfiguredMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, resolveSupervisorMode, buildGoalRequirementSection, appendGoalContextToNudge, readProjectGoalCondition, retireProjectGoal, isStatusDiagramEnabled, withResumeHint, formatRunawayLimit } from '../core/goal.mjs';
+import { goalStore, describeRunawayLimit, readConfiguredMaxAttempts, decideGoalTransition, resolveClaudeCodeHardCap, buildGoalRequirementSection, buildGoalAssessmentContext, readProjectGoalContract, sameGoalContract, retireProjectGoal, isStatusDiagramEnabled, withResumeHint, formatRunawayLimit } from '../core/goal.mjs';
 import { sessionStore, maybeGcSessions } from '../core/session-store.mjs';
-import { appendStatusDirective } from '../core/status-directive.mjs';
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs';
 import {
   extractLastAssistantText, currentUserTask, buildConversationChain, userMessageText,
@@ -691,24 +689,24 @@ async function main() {
   // still fast-exits here without paying the poll's up-to-1s latency.
   const earlyTail = transcript_path ? readTranscriptTail(transcript_path) : [];
   const turnKey = computeTurnKey(normalizeTranscriptToMessages(earlyTail));
+  // Control turns never spend budget or mutate a goal, even at the cap.
+  if (shouldSkipReflection({ text: turnKey ?? '', hasActiveGoal: true }).skip) {
+    debug({ msg: 'supervisor_control_turn', session_id }, cwd);
+    process.exit(0);
+  }
 
   // THE per-turn attempt counter. There is exactly one on this runtime: this
-  // turn-scoped file counter. It covers every path that pushes the agent
-  // (plain reflection injections, autopilot nudges, goal continuations) and
+  // turn-scoped file counter. It covers every goal continuation and
   // resets by itself when turnKey moves. `goal.attempts` is NOT a second
   // counter — it is mirrored from this value below purely so the persisted
   // goal record and `/supervisor:set-goal` status stay truthful.
   const attempts = readAttempts(session_id, cwd, turnKey);
 
-  // 3. Attempt cap.
-  // Goal loop: if a goal is active, raise the retry budget.
-  // All goal logic is best-effort — any failure falls back to default.
+  // 3. Load the goal contract before applying the shared runaway valve.
   let goal = null;
   let goalState = {};
-  let mode = 'reflection';
   try {
     goalState = goalStore.load(cwd, session_id);
-    mode = resolveSupervisorMode(goalState);
     if (goalState.goal && goalState.goal.status === 'active') {
       goal = goalState.goal;
       // A goal's attempt budget is per-human-turn, not cumulative for the
@@ -723,26 +721,31 @@ async function main() {
       // lastTurnKey is still stamped so the persisted record says which human
       // turn the count belongs to.
       if (turnKey != null && (goal.lastTurnKey !== turnKey || goal.attempts !== attempts)) {
-        goal = { ...goal, lastTurnKey: turnKey, attempts };
-        goalState = { ...goalState, goal };
-        // mutate(), never save(): `goalState` was read before the attempt
-        // counter was touched, and attempts now live in the SAME state.json.
-        // A blind overwrite here would silently clobber the counter written
-        // by writeAttemptCounter — a lost update inside one process.
-        try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = goal; }); } catch { /* best effort */ }
+        const expected = goal;
+        let synchronized = false;
+        goalState = sessionStore.mutate(cwd, session_id, (s) => {
+          if (!sameGoalContract(expected, s.goal)) return;
+          const latestCount = s.attempts?.turnKey === turnKey ? s.attempts.count : 0;
+          s.goal = { ...s.goal, lastTurnKey: turnKey, attempts: Math.max(attempts, latestCount || 0) };
+          synchronized = true;
+        });
+        if (!synchronized) {
+          debug({ msg: 'stale_goal_attempt_sync', session_id }, cwd);
+          process.exit(0);
+        }
+        goal = goalState.goal;
       }
     }
   } catch (e) {
     debug({ msg: 'goal_load_failed', err: String(e?.message ?? e) }, cwd);
-    // Best-effort mode recovery: if load failed transiently, retry once so the
-    // autopilot cleanup path below (setAutopilot false) can still fire correctly.
-    try { mode = resolveSupervisorMode(goalStore.load(cwd, session_id)); } catch { /* */ }
+    // An unreadable session must not reactivate a paused goal via project fallback.
+    process.exit(0);
   }
 
   // ONE runaway-limit rule, shared with the OpenCode plugin (core/goal.mjs
   // describeRunawayLimit): `/supervisor retry N` > config (supervisor.yaml) >
-  // env > RUNAWAY_CEILING for EVERY mode, then reduced to CC's platform
-  // ceiling. There is no per-mode default — the limit is a runaway safety
+  // env > RUNAWAY_CEILING, then reduced to CC's platform
+  // ceiling. The limit is a runaway safety
   // valve, not a budget.
   //
   // HARD_CAP is that platform ceiling — see its definition for the full
@@ -773,23 +776,20 @@ async function main() {
     }, cwd);
   }
 
-  // Project-level goal: when there is no active SESSION goal, fall back to
-  // the project goal (.agents/supervisor/Goal.md, or the lower-case goal.md
-  // written by the OpenCode-side LLM auto-derivation feature — see
-  // core/goal.mjs's readProjectGoalCondition for the shared precedence rule).
-  // A goal is an ATTRIBUTE now, not a mode; `!goal` (no session goal) is the
-  // only gate — there is no `mode==='goal'` to exclude.
+  // Session goals take precedence. Inactive/paused session goals and an
+  // explicit clear suppress project fallback; absence alone may inherit it.
+  // Goal.md takes precedence over the legacy lower-case goal.md.
   let projectGoalSection = '';
   // The exact project condition injected into THIS judgement. Load-bearing
   // for goal retirement: only a file that still holds the condition we
   // actually judged may be deleted (see retireProjectGoal in core/goal.mjs).
   let injectedProjectGoalCondition = '';
-  const effectiveMode = resolveSupervisorMode(goalState);
-  if (!goal) {
-    const cond = readProjectGoalCondition(cwd);
-    if (cond) {
-      injectedProjectGoalCondition = cond;
-      projectGoalSection = buildGoalRequirementSection(cond);
+  let projectGoal = null;
+  if (!goalState.goal && goalState.goalCleared !== true) {
+    projectGoal = readProjectGoalContract(cwd);
+    if (projectGoal?.condition) {
+      injectedProjectGoalCondition = projectGoal.condition;
+      projectGoalSection = buildGoalRequirementSection(projectGoal.condition, projectGoal);
     }
   }
 
@@ -799,7 +799,14 @@ async function main() {
   // "complete" against generic workflow gates while the goal loop then used
   // that verdict to decide the goal was met. (OpenCode always injected it —
   // see supervisor-impl.ts's goalSection — so this was a CC-only gap.)
-  const sessionGoalSection = goal ? buildGoalRequirementSection(goal.condition) : '';
+  const sessionGoalSection = goal ? buildGoalRequirementSection(goal.condition, goal) : '';
+
+  // No contract, no completion supervision. In particular do not invoke the
+  // judge, record feedback, or consume an injection on ordinary questions.
+  if (!goal && !injectedProjectGoalCondition) {
+    debug({ msg: 'no_active_goal', session_id }, cwd);
+    process.exit(0);
+  }
 
   // Shared handler for BOTH goal-exhaust sites (the per-turn cap gate below
   // and the post-judge goal loop). decideGoalTransition reports WHICH
@@ -824,7 +831,9 @@ async function main() {
       // or `/supervisor set-goal`.
       try {
         sessionStore.mutate(cwd, session_id, (s) => {
-          s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || 'goal deadline reached') };
+          if (sameGoalContract(goal, s.goal)) {
+            s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || 'goal deadline reached') };
+          }
         });
       } catch { /* */ }
     }
@@ -833,10 +842,10 @@ async function main() {
   }
 
   if (attempts >= runawayLimit) {
-    // Disable autopilot on budget exhaustion so the next stop is clean.
-    if (mode === 'autopilot') {
-      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* */ }
-    }
+    // A declared stuck signal is still a useful pause even after the last
+    // allowed injection; do not replace it with a mere ceiling event.
+    const cappedExit = parseLoopExitSentinel(buildStopContext(payload, earlyTail).final_assistant_text);
+    if (cappedExit?.reason === 'stuck') finishStuck(cappedExit);
     // An active goal must not die silently here. Because goal.attempts is the
     // same number as `attempts`, decideGoalTransition is guaranteed to report
     // 'exhausted' — with reason 'deadline' if the goal also outlived its
@@ -858,7 +867,7 @@ async function main() {
     // so this can never be confused with a declared exit.
     appendLoopExitLog(cwd, {
       session: session_id, turnKey, reason: 'runaway_ceiling', detail: '',
-      at: Date.now(), mode, attempts, maxAttempts: runawayLimit,
+      at: Date.now(), supervisor: 'goal-based', attempts, maxAttempts: runawayLimit,
       // Name the resolved limit + the tier that set it (retry/config/env/
       // default) so a forensic reader can tell whether the operator chose this
       // bound, and flag when Claude Code's platform cap forced it down below
@@ -867,7 +876,7 @@ async function main() {
       requested: runaway.unlimited ? 'unlimited' : runaway.requested,
       cappedByPlatform: runaway.cappedByPlatform, platformHardCap: runaway.hardCap,
     });
-    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: runawayLimit, goal: !!goal, mode }, cwd);
+    debug({ msg: 'attempt_cap_reached', session_id, attempts, max: runawayLimit, goal: !!goal }, cwd);
     process.exit(0);
   }
 
@@ -894,17 +903,14 @@ async function main() {
   // saw in this session, another push is provably pointless — stand down.
   //
   // Placement: AFTER the cheap eligibility gates (loop guard, disabled,
-  // attempt cap) and AFTER the transcript flush poll, but BEFORE the autopilot
-  // fast-path (4a), the trailing-question guard (4b) and the judge. It
-  // therefore covers the reflection, goal AND autopilot paths — the observed
-  // loop was on the goal/autopilot path, which never reaches the judge.
+  // attempt cap) and AFTER the transcript flush poll, but BEFORE the
+  // trailing-question guard (4b) and the judge.
   //
   // BUDGET: this gate does NOT call writeAttemptCounter — it is an
   // ELIGIBILITY gate, not a spent attempt. Saturating the counter here would
   // make "the agent repeated itself" indistinguishable from "the budget is
   // spent", and a later Stop in the same turn would then take the
-  // budget-exhausted branch and fire its side effects (disable autopilot,
-  // write a goal-exhaust verdict) for the wrong reason. The gate re-derives
+  // budget-exhausted branch and write a goal-exhaust verdict for the wrong reason. The gate re-derives
   // the same answer for free on every Stop, so it needs no persistence of its
   // own beyond the reply hash.
   //
@@ -919,15 +925,10 @@ async function main() {
   // signal arrives as a text sentinel parsed by the SHARED parser
   // (core/loop-exit.mjs) — one definition, two runtimes, no drift.
   //
-  // It must always reach its handler below: it is the only agent-driven stop
-  // (the attempt counter is now just a runaway circuit breaker at
-  // RUNAWAY_CEILING=50), and standing down on a repeat of it would strand the
-  // session in autopilot — or in an endless loop — forever. `AUTOPILOT_EXIT`
-  // is still PARSED as an alias for `reason: 'completed'` (stale installed
-  // skill copies may still emit it), but it is no longer TAUGHT anywhere —
-  // see core/loop-exit.mjs.
+  // A stuck signal must reach its handler; a completed signal must reach
+  // the goal evidence audit, even when the final text repeats.
   const loopExit = parseLoopExitSentinel(ctx.final_assistant_text);
-  const autopilotExiting = !!loopExit;
+  const loopExiting = !!loopExit;
   let priorReplyHash = null;
   let priorRepeatCount = 0;
   try {
@@ -936,8 +937,8 @@ async function main() {
     priorRepeatCount = prior.replyRepeatCount ?? 0;
   } catch { /* best effort */ }
   const noProgress = evaluateNoProgress(ctx.final_assistant_text, priorReplyHash, priorRepeatCount);
-  if (!autopilotExiting && noProgress.standDown) {
-    debug({ msg: 'no_progress_gate', session_id, mode, goal: !!goal, attempts, hash: replyHash, repeats: noProgress.repeatCount, action: 'stand_down' }, cwd);
+  if (!loopExiting && noProgress.standDown) {
+    debug({ msg: 'no_progress_gate', session_id, goal: !!goal, attempts, hash: replyHash, repeats: noProgress.repeatCount, action: 'stand_down' }, cwd);
     process.exit(0);
   }
   // Locked-ish read-modify-write: never save() a whole state object read
@@ -951,95 +952,40 @@ async function main() {
     debug({ msg: 'no_progress_gate_persist_failed', session_id, err: String(e?.message ?? e) }, cwd);
   }
 
-  // 4a-0. LOOP EXIT (all modes). The old AUTOPILOT_EXIT was autopilot-only, so
-  // a goal-mode or plain-reflection agent had no way to end the loop at all.
-  // This handler is mode-agnostic and mirrors the OpenCode tool's semantics.
-  if (loopExit) {
-    const { reason, detail } = loopExit;
+  // 4a-0. LOOP EXIT. Completion is a request for audit, never proof.
+  // Only stuck can bypass an active contract's evidence check.
+  function finishStuck({ reason, detail }) {
     const at = Date.now();
     // Forensic evidence for a doom loop, via the ONE shared writer
     // (core/loop-exit.mjs) also used by the OpenCode tool
     // (opencode/supervisor-impl.ts) and the runaway-ceiling site above.
     // Best-effort, never throws.
-    if (reason === 'stuck') {
-      appendLoopExitLog(cwd, { session: session_id, turnKey, reason, detail, at });
-    }
-    // NEVER `delete state.goal`. A goal is long-lived user intent; "this
-    // turn's loop is over" says nothing about it. `stuck` pauses it and KEEPS
-    // the condition so the user can see and resume it. `completed` leaves it
-    // untouched — same as the OpenCode tool.
-    if (reason === 'stuck') {
-      try {
-        goalStore.mutate(cwd, session_id, (st) => {
-          if (st.goal && st.goal.status === 'active') {
-            st.goal = { ...st.goal, status: 'paused', lastReason: withResumeHint(detail || 'agent reported stuck') };
-          }
-        });
-      } catch { /* best effort */ }
-    }
-    if (mode === 'autopilot') {
-      try { goalStore.setAutopilot(cwd, session_id, false); } catch { /* best effort */ }
+    appendLoopExitLog(cwd, { session: session_id, turnKey, reason, detail, at });
+    // Keep the contract for explicit resume. Materialize an inherited project
+    // goal in session state so its pause also blocks project fallback.
+    try {
+      const result = goalStore.pauseGoal(cwd, session_id, { expectedGoal: goal, projectGoal, reason: detail });
+      if (!result.paused) debug({ msg: 'stale_goal_stuck_signal', session_id }, cwd);
+    } catch (e) {
+      debug({ msg: 'goal_pause_failed', session_id, err: String(e?.message ?? e) }, cwd);
     }
     writeVerdict(session_id, {
       session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION,
       loop_exit: reason, detail,
-      ...(mode === 'autopilot' ? { autopilot: 'exited' } : {}),
     }, cwd);
-    debug({ msg: 'loop_exit', session_id, reason, detail, mode }, cwd);
+    debug({ msg: 'loop_exit', session_id, reason, detail }, cwd);
     process.exit(0);
   }
 
-  // 4a. Autopilot fast-path: skip the judge ENTIRELY; inject a "continue"
-  // nudge until the agent emits SUPERVISOR_LOOP_EXIT or the attempt budget
-  // runs out. Autopilot NEVER runs the judge — even with an active goal. A
-  // goal in autopilot is CONTEXT appended to the nudge, NOT a verified
-  // condition (this is a deliberate, accepted reduction in guarantee: use
-  // reflection mode if you want the goal actually checked). The old gate was
-  // `mode === 'autopilot' && !goal`, which forced the judge whenever a goal
-  // was set; that override is intentionally removed.
-  if (mode === 'autopilot') {
-    // NOTE: the exit signal (SUPERVISOR_LOOP_EXIT, with a parse-only legacy
-    // AUTOPILOT_EXIT alias for stale installed skill copies) is handled
-    // in 4a-0 above, for ALL modes, via the single shared parser.
-    const baseVerdict = { session_id, timestamp: new Date().toISOString(), plugin_version: PLUGIN_VERSION };
-    const nextAttempt = attempts + 1;
-    writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-    // Parity with the OpenCode autopilot nudge (opencode/supervisor-impl.ts):
-    // the status/roadmap directive rides along with EVERY continuation, on
-    // both runtimes. Gated by the same default-off `statusDiagram` flag, so
-    // `/supervisor:status off` silences it here too.
-    //
-    // The attempt number is tracked and written to the verdict/debug log, but
-    // is deliberately NOT rendered into the nudge: a visible "n/N" denominator
-    // tells the agent a budget exists and invites it to pace or wrap up early,
-    // when the only thing that should stop the loop is the agent declaring it
-    // done. Kept identical to the OpenCode nudge apart from the runtime exit.
-    const baseNudge = `${FEEDBACK_MARKER} Autopilot\n\nYou are in autopilot mode. Continue working on the current task. Do not stop to ask for permission or confirmation — proceed with implementation.\n\nWhen you have genuinely completed ALL work (not just one step), output \`SUPERVISOR_LOOP_EXIT: completed\` ALONE on its own line (nothing else on that line) to hand control back. If this nudge is looping without progress, output \`SUPERVISOR_LOOP_EXIT: stuck \u2014 why\` instead.\n\nContinue now.`;
-    // If a goal is set (session goal, else the project Goal.md), append it to
-    // the nudge as working context — shared with the OpenCode runtime via the
-    // ONE helper so the two nudges cannot drift.
-    const nudgeGoalCondition = goal ? goal.condition : injectedProjectGoalCondition;
-    const nudgeWithGoal = appendGoalContextToNudge(baseNudge, nudgeGoalCondition);
-    const nudge = isStatusDiagramEnabled(goalState) ? appendStatusDirective(nudgeWithGoal) : nudgeWithGoal;
-    writeVerdict(session_id, { ...baseVerdict, injected: true, autopilot: 'continue', attempt: nextAttempt }, cwd);
-    process.stdout.write(JSON.stringify({ decision: 'block', reason: nudge }));
-    debug({ msg: 'autopilot_continue', session_id, attempt: nextAttempt, goal: !!nudgeGoalCondition }, cwd);
-    process.exit(0);
-  }
+  if (loopExit?.reason === 'stuck') finishStuck(loopExit);
 
-  // 4b. Pre-judge guard: a trailing question to the user is a strong signal
-  // the correct status is waiting_for_user — forcing a continuation over an
-  // open question would recreate the exact "ignore the human" pattern this
-  // supervisor exists to prevent, so skip the judge entirely rather than
-  // risk a heuristic gate overriding it downstream.
-  if (endsWithTrailingQuestion(ctx.final_assistant_text)) {
-    debug({ msg: 'trailing_question_guard', session_id }, cwd);
-    process.exit(0);
-  }
+  // 4b. Pre-judge guard is intentionally absent for active contracts.
+  // A question mark is not proof of a human-only dependency: permission-seeking
+  // punts must reach the judge, which can still stand down for genuine user waits.
 
   // 5. Build task context from transcript (shared assessment pipeline).
   const normalizedMessages = normalizeTranscriptToMessages(tail);
-  const taskContext = buildTaskContextFromTranscript(normalizedMessages, cwd);
+  const taskContext = buildGoalAssessmentContext(buildTaskContextFromTranscript(normalizedMessages, cwd));
   if (!taskContext) {
     debug({ msg: 'no_task_context', session_id }, cwd);
     process.exit(0);
@@ -1051,8 +997,7 @@ async function main() {
   // core/turn-classifier.mjs). Bypassed entirely while a goal is active.
   const turnGate = shouldSkipReflection({
     text: taskContext.currentTask,
-    hasActiveGoal: !!goal,
-    mode: effectiveMode,
+    hasActiveGoal: !!(goal || injectedProjectGoalCondition),
   });
   if (turnGate.skip) {
     debug({ msg: 'non_actionable_turn', session_id, reason: turnGate.reason }, cwd);
@@ -1148,7 +1093,7 @@ async function main() {
     process.exit(0);
   }
 
-  const assessment = parseSelfAssessmentJson(assessmentText);
+  const assessment = parseSelfAssessmentJson(assessmentText, { requireStatus: true });
   if (!assessment) {
     // Fail-open: a garbage/unparseable judge response is not evidence the
     // task is incomplete. Do not inject — just record why and stop.
@@ -1182,9 +1127,7 @@ async function main() {
         // into `### Missing` alongside real per-turn gaps.
         goal_condition: goal?.condition || injectedProjectGoalCondition || '',
       },
-      // Same default-on flag the autopilot nudge above honours, so
-      // `/supervisor:status off` silences BOTH continuation paths, not just
-      // one of them.
+      // Default-off roadmap directive, independent of supervisor enablement.
       // Claude Code has no tool registry: it must be told the TEXT SENTINEL,
       // not the `supervisor_loop_exit` tool (which is OpenCode-only).
       { statusDirective: isStatusDiagramEnabled(goalState), loopExitStyle: 'sentinel' },
@@ -1201,19 +1144,23 @@ async function main() {
     feedback: analysis.reason,
   });
 
-  // Project-level goal judged met (reflection mode: no session goal object,
+  // Project-level goal judged met (no session goal object,
   // so the goal loop below never runs for it). The condition WAS injected as
   // a MANDATORY completion requirement, so `complete` means it was met —
   // retire it, or it re-fires on every future turn and every future session.
   if (analysis.complete && injectedProjectGoalCondition) {
     try {
-      const retired = retireProjectGoal(cwd, {
-        condition: injectedProjectGoalCondition,
-        sessionId: session_id,
-        source: 'claude-code:project-goal-achieved',
-        reason: analysis.reason || '',
+      let retired;
+      sessionStore.mutate(cwd, session_id, (s) => {
+        if (s.goal || s.goalCleared || !sameGoalContract(projectGoal, readProjectGoalContract(cwd))) return;
+        retired = retireProjectGoal(cwd, {
+          condition: injectedProjectGoalCondition, contract: projectGoal,
+          sessionId: session_id, source: 'claude-code:project-goal-achieved',
+          reason: analysis.reason || '',
+        });
+        if (retired.logged) s.goalCleared = true;
       });
-      debug({ msg: 'project_goal_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+      debug({ msg: retired?.logged ? 'project_goal_retired' : 'stale_project_goal_verdict', session_id, removed: retired?.removed, skipped: retired?.skipped }, cwd);
     } catch (e) {
       debug({ msg: 'project_goal_retire_failed', err: String(e?.message ?? e) }, cwd);
     }
@@ -1230,22 +1177,20 @@ async function main() {
       reason: analysis.reason,
     });
     if (t.action === 'achieved') {
-      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
-      // An achieved goal must DIE: persisting status:'achieved' alone left
-      // .agents/supervisor/Goal.md (or goal.md) on disk, so the next session
-      // re-read it and the goal resurrected forever.
+      // Apply the audit only to its exact active declaration. The human may
+      // have replaced, cleared or paused the contract while the judge ran.
+      let achieved = false;
       try {
-        const retired = retireProjectGoal(cwd, {
-          condition: goal.condition,
-          sessionId: session_id,
-          source: 'claude-code:session-goal-achieved',
-          reason: analysis.reason || '',
-        });
-        debug({ msg: 'goal_project_file_retired', session_id, removed: retired.removed, skipped: retired.skipped }, cwd);
+        achieved = goalStore.completeGoal(cwd, session_id, {
+          expectedGoal: goal, source: 'claude-code:session-goal-achieved', reason: analysis.reason || '',
+        }).achieved;
       } catch (e) {
         debug({ msg: 'goal_project_file_retire_failed', err: String(e?.message ?? e) }, cwd);
       }
-      try { goalStore.clearGoal(cwd, session_id); } catch { /* */ }
+      if (!achieved) {
+        debug({ msg: 'stale_or_unverified_goal_verdict', session_id }, cwd);
+        process.exit(0);
+      }
       verdictRecord.goal = 'achieved';
       verdictRecord.message = `Goal condition met: "${goal.condition}". ${analysis.reason || ''}`.trim();
       writeVerdict(session_id, verdictRecord, cwd);
@@ -1270,15 +1215,24 @@ async function main() {
       process.exit(0);
     }
     if (!analysis.requiresHumanAction) {
-      const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}`;
+      const msg = `Goal not yet met: "${goal.condition}". ${buildAnalysisFeedback()}\n\n${sessionGoalSection}`;
+      let current = false;
+      sessionStore.mutate(cwd, session_id, (s) => {
+        if (!sameGoalContract(goal, s.goal)) return;
+        s.goal = t.goal;
+        current = true;
+      });
+      if (!current) {
+        debug({ msg: 'stale_goal_continuation', session_id }, cwd);
+        process.exit(0);
+      }
       writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);
-      try { sessionStore.mutate(cwd, session_id, (s) => { s.goal = t.goal; }); } catch { /* */ }
       verdictRecord.injected = true;
       verdictRecord.goal = 'continue';
       verdictRecord.feedback_reason = 'goal_continue';
       writeVerdict(session_id, verdictRecord, cwd);
       process.stdout.write(JSON.stringify({ decision: 'block', reason: msg }));
-      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity, mode }, cwd);
+      debug({ msg: 'goal_continue_inject', session_id, attempt: nextAttempt, severity: analysis.severity }, cwd);
       process.exit(0);
     }
     // Human action required with active goal → legit pause, don't burn budget.
@@ -1288,7 +1242,7 @@ async function main() {
     process.exit(0);
   }
 
-  // 6b. Normal (no goal) inject decision.
+  // 6b. Inherited project-goal feedback (no session goal object).
   if (!analysis.complete && analysis.shouldContinue && !analysis.requiresHumanAction && !actionlessVerdict) {
     const feedbackMsg = buildAnalysisFeedback();
     // Last-resort guard: never inject an empty-bodied message.
@@ -1296,6 +1250,14 @@ async function main() {
       verdictRecord.feedback_reason = 'empty_feedback_body';
       writeVerdict(session_id, verdictRecord, cwd);
       debug({ msg: 'no_inject_empty_body', session_id }, cwd);
+      process.exit(0);
+    }
+    let current = false;
+    sessionStore.mutate(cwd, session_id, (s) => {
+      current = !s.goal && !s.goalCleared && sameGoalContract(projectGoal, readProjectGoalContract(cwd));
+    });
+    if (!current) {
+      debug({ msg: 'stale_project_goal_continuation', session_id }, cwd);
       process.exit(0);
     }
     writeAttemptCounter(session_id, nextAttempt, cwd, turnKey);

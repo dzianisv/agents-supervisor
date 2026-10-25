@@ -19,6 +19,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
+import { goalStore } from "../core/goal.mjs"
 
 // ---------------------------------------------------------------------------
 // Test infrastructure: mock opencode client
@@ -164,7 +165,8 @@ describe("integration: supervisor never sets .model on active session", () => {
     ephemeralCounter = 0
   })
 
-  test("reflection mode: feedback injection has no .model field", async () => {
+  test("goal feedback injection has no .model field", async () => {
+    goalStore.setGoal(tmpDir, ACTIVE_SESSION_ID, "Requested tests pass", { acceptanceCriteria: "Tests pass", verification: "Run the tests" })
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
@@ -188,16 +190,10 @@ describe("integration: supervisor never sets .model on active session", () => {
       )
     }
 
-    // Verify at least one prompt was sent (supervisor actually ran)
-    if (activePrompts.length === 0) {
-      // If no feedback was injected, that's also fine (task might be assessed as complete)
-      // But we should have at least one ephemeral session call (assessment)
-      const { getEphemeralSessionPrompts } = createMockClient(messages)
-      // Just ensure the test infrastructure works
-    }
+    assert.ok(activePrompts.length > 0, "a failing contract must inject feedback")
   })
 
-  test("autopilot mode: nudge injection has no .model field", async () => {
+  test("legacy execution flags with no goal cannot inject or switch models", async () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
@@ -217,8 +213,7 @@ describe("integration: supervisor never sets .model on active session", () => {
 
     const activePrompts = getActiveSessionPrompts()
 
-    // Autopilot should inject a nudge
-    assert.ok(activePrompts.length > 0, "Autopilot should have injected at least one prompt to active session")
+    assert.equal(activePrompts.length, 0, "legacy flags must not create a judge-less execution path")
 
     for (const call of activePrompts) {
       assert.equal(
@@ -228,15 +223,10 @@ describe("integration: supervisor never sets .model on active session", () => {
       )
     }
 
-    // Verify the nudge text contains the autopilot marker
-    const nudgeText = activePrompts[0]?.body?.parts?.[0]?.text || ""
-    assert.ok(
-      nudgeText.includes("autopilot") || nudgeText.includes("Autopilot"),
-      "Autopilot nudge should mention autopilot"
-    )
+    assert.equal(goalStore.load(tmpDir, ACTIVE_SESSION_ID).mode, undefined)
   })
 
-  test("goal mode: continuation injection has no .model field", async () => {
+  test("legacy goal migration: verified continuation has no .model field", async () => {
     const messages = makeMessages()
     const { client, getActiveSessionPrompts } = createMockClient(messages)
 
@@ -272,12 +262,13 @@ describe("integration: supervisor never sets .model on active session", () => {
       assert.equal(
         call.body.model,
         undefined,
-        `Goal mode promptAsync to active session MUST NOT set .model but got: ${JSON.stringify(call.body.model)}`
+        `Goal continuation MUST NOT set .model but got: ${JSON.stringify(call.body.model)}`
       )
     }
   })
 
   test("ephemeral sessions CAN set .model (assessment/judge)", async () => {
+    goalStore.setGoal(tmpDir, ACTIVE_SESSION_ID, "Requested tests pass")
     const messages = makeMessages()
     const { client, getEphemeralSessionPrompts } = createMockClient(messages)
 
@@ -292,11 +283,7 @@ describe("integration: supervisor never sets .model on active session", () => {
     const ephemeralPrompts = getEphemeralSessionPrompts()
     // At least one ephemeral session should have been created (for assessment)
     // It's OK for ephemeral sessions to have .model set
-    if (ephemeralPrompts.length > 0) {
-      // This is informational — we just verify they exist and the test ran
-      const withModel = ephemeralPrompts.filter(c => c.body.model !== undefined)
-      // Having .model on ephemeral sessions is fine and expected
-      assert.ok(true, `${withModel.length}/${ephemeralPrompts.length} ephemeral prompts have .model (OK)`)
-    }
+    assert.ok(ephemeralPrompts.length > 0, "active goal must invoke the judge")
+    assert.ok(ephemeralPrompts.some(c => c.body.model !== undefined), "judge session uses a model without changing the active one")
   })
 })

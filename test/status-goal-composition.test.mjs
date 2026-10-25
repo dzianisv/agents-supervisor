@@ -27,6 +27,7 @@ import {
 } from "../core/status-directive.mjs"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
 import { sessionStore } from "../core/session-store.mjs"
+import { goalStore, GOAL_OWNERSHIP_MARKER } from "../core/goal.mjs"
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 const ACTIVE_SESSION_ID = "ses_composition123"
@@ -113,10 +114,7 @@ describe("statusDirective opt-out reaches the reflection path", () => {
       /statusDirective:\s*isStatusDiagramEnabled\(/.test(oc),
       "opencode runtime must pass isStatusDiagramEnabled into buildEscalatingFeedback"
     )
-    assert.ok(
-      /isStatusDiagramEnabled\(sup\)\s*\?\s*appendStatusDirective\(baseNudgeWithGoal\)/.test(oc),
-      "opencode autopilot nudge must honour the same toggle the CC nudge does"
-    )
+    assert.doesNotMatch(oc, /You are in autopilot mode|const baseNudge\s*=/)
   })
 })
 
@@ -216,45 +214,24 @@ function readState(dir, sessionId) {
   return sessionStore.load(dir, sessionId)
 }
 
-describe("autopilot nudge honours /supervisor:status off (opencode runtime)", () => {
-  let tmpDir
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "sup-comp-autopilot-"))
-  })
-
-  test("default-off: the nudge carries no directive", async () => {
-    writeState(tmpDir, ACTIVE_SESSION_ID, { mode: "autopilot", autopilot: true })
-    const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
-    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
-    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
-    await new Promise((r) => setTimeout(r, 400))
-    const nudge = activePrompts()[0]?.text || ""
-    assert.match(nudge, /Autopilot/)
-    assert.ok(!nudge.includes(STATUS_DIRECTIVE_MARKER), "default-off nudge must not carry the directive")
-  })
-
-  test("statusDiagram:true: the nudge carries the directive", async () => {
-    writeState(tmpDir, ACTIVE_SESSION_ID, { mode: "autopilot", autopilot: true, statusDiagram: true })
-    const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
-    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
-    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
-    await new Promise((r) => setTimeout(r, 400))
-    const nudge = activePrompts()[0]?.text || ""
-    assert.match(nudge, /Autopilot/)
-    assert.ok(nudge.includes(STATUS_DIRECTIVE_MARKER), "explicitly-enabled nudge must carry the directive")
-  })
-
-  test("statusDiagram:false: the nudge is still sent, without the directive", async () => {
-    writeState(tmpDir, ACTIVE_SESSION_ID, { mode: "autopilot", autopilot: true, statusDiagram: false })
-    const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
-    const plugin = await SupervisorPlugin({ client, directory: tmpDir })
-    await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
-    await new Promise((r) => setTimeout(r, 400))
-    const nudge = activePrompts()[0]?.text || ""
-    assert.match(nudge, /Autopilot/, "the nudge itself must still be sent — only the directive is suppressed")
-    assert.match(nudge, /supervisor_loop_exit/)
-    assert.ok(!nudge.includes(STATUS_DIRECTIVE_MARKER), "toggle off must suppress the directive")
-  })
+describe("goal continuation honours the independent status toggle", () => {
+  for (const enabled of [undefined, true, false]) {
+    test(`statusDiagram:${enabled}: contract always reaches the agent; directive is opt-in`, async () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "sup-comp-goal-"))
+      goalStore.setGoal(tmpDir, ACTIVE_SESSION_ID, "Fix auth", {
+        acceptanceCriteria: "Auth tests pass", verification: "Run the auth tests",
+      })
+      if (enabled !== undefined) goalStore.setStatusDiagram(tmpDir, ACTIVE_SESSION_ID, enabled)
+      const { client, activePrompts } = createMockClient(makeMessages(), incompleteAssessment())
+      const plugin = await SupervisorPlugin({ client, directory: tmpDir })
+      await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
+      const feedback = activePrompts()[0]?.text || ""
+      assert.match(feedback, /Task (?:Incomplete|may be incomplete)/)
+      assert.match(feedback, /Auth tests pass/)
+      assert.match(feedback, /Run the auth tests/)
+      assert.equal(feedback.includes(STATUS_DIRECTIVE_MARKER), enabled === true)
+    })
+  }
 })
 
 describe("system-prompt gate resolves the session directory without a warm cache", () => {
@@ -320,6 +297,44 @@ describe("system-prompt gate resolves the session directory without a warm cache
     assert.deepEqual(await transform(plugin, ""), ["base prompt"])
   })
 
+  test("goal ownership is default-on, idempotent, and independent of status default-off", async () => {
+    const { client } = createMockClient(makeMessages(), incompleteAssessment())
+    const plugin = await SupervisorPlugin({ client, directory: serverDir })
+    const output = { system: ["base prompt"] }
+    await plugin["experimental.chat.system.transform"]({ sessionID: ACTIVE_SESSION_ID }, output)
+    await plugin["experimental.chat.system.transform"]({ sessionID: ACTIVE_SESSION_ID }, output)
+    assert.equal(output.system.filter(s => s.includes(GOAL_OWNERSHIP_MARKER)).length, 1)
+    assert.equal(output.system.some(s => s.includes(STATUS_DIRECTIVE_MARKER)), false)
+  })
+
+  test("reused system arrays carry only the current goal contract", async () => {
+    const { client } = createMockClient(makeMessages(), incompleteAssessment())
+    const plugin = await SupervisorPlugin({ client, directory: serverDir })
+    const output = { system: ["base prompt"] }
+    goalStore.setGoal(serverDir, ACTIVE_SESSION_ID, "Old scope", { acceptanceCriteria: "Old criteria", verification: "Old checks" })
+    await plugin["experimental.chat.system.transform"]({ sessionID: ACTIVE_SESSION_ID }, output)
+    goalStore.setGoal(serverDir, ACTIVE_SESSION_ID, "New scope", { acceptanceCriteria: "New criteria", verification: "New checks" })
+    await plugin["experimental.chat.system.transform"]({ sessionID: ACTIVE_SESSION_ID }, output)
+    assert.equal(output.system.filter(s => s.includes("<!-- supervisor:active-goal-contract -->")).length, 1)
+    assert.ok(output.system.some(s => s.includes("New criteria") && s.includes("New checks")))
+    assert.equal(output.system.some(s => s.includes("Old criteria")), false)
+  })
+
+  test("ownership stays silent for disabled, child, plan and aborted sessions", async () => {
+    for (const gate of ["off", "child", "plan", "abort"]) {
+      const messages = makeMessages()
+      if (gate === "plan") messages.unshift({ info: { role: "system" }, parts: [{ type: "text", text: "Plan Mode" }] })
+      const { client } = createMockClient(messages, incompleteAssessment())
+      if (gate === "child") client.session.get = async () => ({ data: { parentID: "ses_parent" } })
+      const plugin = await SupervisorPlugin({ client, directory: serverDir })
+      if (gate === "off") await plugin.tool.supervisor.execute({ action: "off" }, { sessionID: ACTIVE_SESSION_ID })
+      if (gate === "abort") await plugin.event({ event: { type: "session.error", properties: { sessionID: ACTIVE_SESSION_ID, error: { name: "MessageAbortedError" } } } })
+      const system = await transform(plugin, ACTIVE_SESSION_ID)
+      assert.equal(system.some(s => s.includes(GOAL_OWNERSHIP_MARKER)), false, gate)
+      if (gate === "off") await plugin.tool.supervisor.execute({ action: "on" }, { sessionID: ACTIVE_SESSION_ID })
+    }
+  })
+
   test("runSupervisor persists projectDir so the NEXT process can resolve it", async () => {
     const { client } = createMockClient(makeMessages("Fix auth.ts and run tests", projectDir), completeAssessment())
     const plugin = await SupervisorPlugin({ client, directory: serverDir })
@@ -379,10 +394,11 @@ describe("supervisor toggle: off/on still wins over mode after the status branch
     assert.match(readFileSync(join(tmpDir, ".supervisor", "disabled"), "utf-8"), new RegExp(ACTIVE_SESSION_ID))
   })
 
-  test('action:"off" alongside a REAL mode applies both axes, and off still wins', async () => {
+  test('action:"off" wins over obsolete mode filler', async () => {
     const out = await toggle({ action: "off", mode: "autopilot" }, { sessionID: ACTIVE_SESSION_ID })
     assert.match(out, /disabled/i)
-    assert.match(out, /Mode also set to autopilot/)
+    assert.match(out, /modes have been removed/i)
+    assert.equal(readState(tmpDir, ACTIVE_SESSION_ID).mode, undefined)
     assert.match(readFileSync(join(tmpDir, ".supervisor", "disabled"), "utf-8"), new RegExp(ACTIVE_SESSION_ID))
   })
 

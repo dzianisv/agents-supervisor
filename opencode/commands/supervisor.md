@@ -1,26 +1,17 @@
 ---
-description: Show supervisor status or switch supervisor modes for this session.
+description: Inspect and control the goal supervisor for this session.
 ---
-Inspect and control the supervisor for this project. There are two modes:
-`reflection` (default) and `autopilot`. A goal is a session *attribute*, not a
-mode — set one with `set-goal` and it works in either mode (verified in
-reflection; context-only in autopilot).
-
-Do not use the `task` tool or delegate to a subagent. Call the supervisor tools
-directly in this session so the plugin-provided tools are available.
-
-If the user just typed `/supervisor`, call the `supervisor` tool with no args to
-report status: enabled/disabled state, effective mode, goal, and retry budget.
+Call the tools directly in this session; do not delegate.
 
 Interpret `$ARGUMENTS`:
-- empty / `status` -> call `supervisor` with no args.
-- `off` / `on` -> call `supervisor` with that action to disable/enable the
-  supervisor for THIS session only. These are not modes.
-- `autopilot` -> call `supervisor` with `mode: "autopilot"`.
-- `reflection` -> call `supervisor` with `mode: "reflection"`.
-- `set-goal <condition>` (legacy alias: `goal <condition>`) -> call `supervisor_goal` with the remaining text.
-- exactly `set-goal` / `goal` -> call `supervisor_goal` with no args.
-- `set-goal clear` / `goal clear` -> call `supervisor_goal` with `clear: true`.
-- `set-goal resume` / `goal resume` (also `unpause`) -> call `supervisor_goal` with `resume: true` (revives a `paused` or `exhausted` goal; a no-op with an honest message otherwise).
-- `retry N` -> call `supervisor_retry` with `n: N`.
-- otherwise -> call `set_supervisor` with `$ARGUMENTS` as guidance.
+- empty / `status`: `supervisor({ action: "status" })`.
+- `on` / `off`: `supervisor({ action: "$ARGUMENTS" })`.
+- `status on` / `status off` / `plain on` / `plain off`: `supervisor({ action: "$ARGUMENTS" })`.
+- `set-goal` / `goal`: `supervisor_goal({})` (status or session-only derivation).
+- `set-goal <condition>` / `goal <condition>`: `supervisor_goal` with that condition, `source: "user"`, observable `acceptanceCriteria`, and `verification` evidence/checks. Preserve exactly the user's scope.
+- `set-goal clear`: `supervisor_goal({ clear: true, source: "user" })`.
+- `set-goal resume`: `supervisor_goal({ resume: true })`.
+- `retry <N>`: `supervisor_retry({ n: N })`; `unlimited` means `n: 0`.
+- `autoreview on` / `autoreview off`: `supervisor_autoreview({ enabled: true/false })`.
+
+There are no selectable modes. Old mode requests must not change or drop goals. Relay the actual tool result, including errors. With no active session/project goal there is no completion judge or continuation; status and plainspeak are independent toggles.

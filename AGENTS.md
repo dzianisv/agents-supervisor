@@ -1,545 +1,171 @@
-# agents-supervisor — Agent Instructions
+# agents-supervisor — current architecture and invariants
 
-opencode supervisor plugin — reflection, goal-tracking, autopilot for opencode sessions
+## Delivery gate (mandatory)
 
-## Constraints
+**Never commit or push plugin changes without passing
+`node --experimental-strip-types --test test/e2e-opencode.test.mjs`.** Plugin
+behavior requires a real isolated `opencode serve` and REST command/tool
+registration checks; mocks alone are insufficient. Missing binary, skipped tests,
+or zero executed cases is not a pass. Do not restart ambient user sessions.
 
-- **INVARIANT: NEVER commit or push plugin changes without passing `node --experimental-strip-types --test test/e2e-opencode.test.mjs`.** Run and confirm PASS before any commit that touches `opencode/` files.
-- All tests use `node:test` (Node native test runner). No Vitest, no Jest.
-- Before declaring any plugin change "done": start `opencode serve` with isolated config, verify supervisor commands register via REST API.
-- No mock-only testing of plugin behavior — real `opencode serve` process required.
+Run sequentially, never concurrently:
 
-## Commands
-
-**The `opencode` binary must be on PATH before running the E2E — it is
-commonly installed at `~/.opencode/bin/opencode`, which is NOT on the default
-PATH.** Without it, `test/e2e-opencode.test.mjs` throws immediately (loud,
-non-zero exit — see below) instead of silently skipping:
-
-```bash
-export PATH="$HOME/.opencode/bin:$PATH"
-```
-
-```bash
-# Unit/integration tests (E2E is deliberately EXCLUDED — see below)
+```sh
 npm test
-
-# opencode server E2E test (MUST pass before commit) — needs opencode on PATH, see above
-export PATH="$HOME/.opencode/bin:$PATH" && npm run test:e2e
-
-# Both, sequentially — never concurrently
-export PATH="$HOME/.opencode/bin:$PATH" && npm run test:all
-
-# Live validation against a real `opencode serve` (evidence, not assertions)
-export PATH="$HOME/.opencode/bin:$PATH" && node --experimental-strip-types test/live-validation.mjs
-
-# Claude Code E2E test
 node test/e2e-cc.mjs
-
-# Eval suite
-node evals/judge-eval.mjs
+export PATH="$HOME/.opencode/bin:$PATH"
+node --experimental-strip-types --test test/e2e-opencode.test.mjs
 ```
 
-**Never run `node --test test/*.test.mjs`.** That glob matches
-`e2e-opencode.test.mjs`, and `node --test` runs files CONCURRENTLY
-(`availableParallelism`, 8 here) — so the documented "unit test" command used to
-start a real `opencode serve` alongside 30+ unit files on the same cores, and
-running the documented E2E command straight afterwards started a second one.
-`npm test` now globs `test/!(e2e-*).test.mjs`; the E2E has its own script.
+CI pins OpenCode 1.18.32. Never run the broad `node --test test/*.test.mjs` glob:
+it includes server E2E and runs it alongside unit files. `npm run test:e2e` is the
+separate real-server gate; `npm run test:all` runs npm test then that gate.
+All suites use native `node:test`, not Jest/Vitest. Syntax-check **both**
+`opencode/supervisor.ts` and `opencode/supervisor-impl.ts` with
+`node --experimental-strip-types --check`. CC E2E invokes the real Stop-hook
+script with a fake judge by default; `SUPERVISOR_CC_LIVE=1` enables real calls.
 
-**A missing `opencode` binary fails loud, not quiet.** `node --test` exits 0
-for an all-skipped run — "0 tests, 0 fail" used to be structurally
-indistinguishable from a real pass, and this E2E is a mandatory pre-commit
-gate (see the INVARIANT above). `test/e2e-opencode.test.mjs` now throws at
-module load if `opencode` is not on PATH, unless `SUPERVISOR_E2E_ALLOW_SKIP=1`
-is set explicitly — always check the `ℹ tests N` line reads 20, not 0, on top
-of a green exit code.
+## One goal supervisor
 
-## Structure
+- `opencode/supervisor.ts` loads `opencode/supervisor-impl.ts`.
+- `bin/supervisor-on-stop.mjs` is the CC stdin → stdout adapter.
+- `core/goal.mjs`, `core/reflection-prompt.mjs`, assessment/evaluation/feedback,
+  task context, transcript, no-progress and loop-exit modules are shared logic.
+- `bin/supervisor.mjs` dispatches the explicit CC goal CLI; `bin/status.mjs`
+  reports actual contracts, enable flags and effective runaway limit.
 
-- Plugin: `opencode/supervisor.ts` → `opencode/supervisor-impl.ts`
-- Core logic: `core/*.mjs` (shared between opencode plugin and other consumers)
-- Tests: `test/*.test.mjs`
-- Module system: ESM (`"type": "module"`)
+No public execution modes or unconditional continuation path. No active session
+or project goal means no completion judge and no completion feedback. Keep
+internal reflection/judge names where useful; do not rebuild a second scheduler,
+store, or goal service. Retired commands parse as `mode-removed`; the CLI must
+explain removal and exit nonzero without changing state.
 
-## Two modes, and a goal is an ATTRIBUTE not a mode
+A goal carries `condition`, `acceptanceCriteria`, `verification`, `source`
+(`user|agent`) and lifecycle fields. OpenCode's shared ownership directive tells
+the agent to declare a session-only `supervisor_goal` before multi-step work;
+plain questions need no contract. No-condition LLM derivation also creates an
+agent contract. CC has no registry and uses explicit CLI goals. Automatic agent
+contracts never persist to project files and cannot replace user-owned goals.
+Replacing an agent's own goal requires `replace` and real user redirection.
+Legacy goals without source become user-owned; load strips obsolete execution
+keys while preserving goals, counters and flags.
 
-There are exactly TWO supervisor modes now: `autopilot` and `reflection`
-(`SUPERVISOR_MODES` in `core/goal.mjs`, `SupervisorMode` in
-`opencode/supervisor-impl.ts`). `goal` is NO LONGER a mode. A goal is an
-orthogonal session attribute — `state.goal` — that either mode may carry.
+Session goal > `.agents/supervisor/Goal.md` > legacy `goal.md`. Paused/inactive
+session goals and `goalCleared` suppress project fallback. Explicit user goals
+can persist their contract to project configuration. Achievement retires only
+a file still matching the entire judged contract, with durable evidence logged
+before unlinking; agent completion never deletes a project goal. Never delete a
+concurrent replacement. Stuck pauses the contract and
+logs `.supervisor/loop-exit.log`; resume keeps the contract, resets the turn
+counter, clears the stale reason and extends an expired 30-day deadline.
 
-- **autopilot** — NEVER runs the judge. On each idle it injects the pre-defined
-  autopilot nudge. If a goal is active, its condition is APPENDED to that nudge
-  as context via `appendGoalContextToNudge` (`core/goal.mjs`, shared by both
-  runtimes so the two nudges cannot drift). **A goal in autopilot is context,
-  NOT a verified condition** — this is a deliberate, accepted reduction in
-  guarantee (owner decision). Documented plainly in README/skills. Do not
-  "fix" it by reintroducing a judge call on the autopilot path.
-- **reflection** — judge runs as before. If a goal is active, its condition is
-  threaded into the judge prompt (the existing `buildGoalRequirementSection` /
-  `goalSection` mechanism — reused, not reinvented) so the judge grades against
-  it.
+`supervisor_loop_exit(completed)` (OpenCode) and
+`SUPERVISOR_LOOP_EXIT: completed` alone on its line (CC) **cannot bypass an active
+goal's evidence audit**. No-goal completion is cheap. Judge failure must never
+mark achievement. Stuck may still pause and return control.
 
-**What replaced every `mode === 'goal'` check:** "a goal is set and active",
-i.e. `state.goal && state.goal.status === 'active'`. `resolveSupervisorMode`
-never returns `'goal'` (an active goal resolves to `reflection`). The turn gate
-(`core/turn-classifier.mjs` `shouldSkipReflection`) escapes for
-`mode==='autopilot' || hasActiveGoal` — `isSupervisorControlTurn` is still
-checked BEFORE those escape hatches (unchanged ordering rule).
+## Prompt and runtime safety
 
-**The landmine is disarmed.** `goalStore.setMode` used to run
-`if (mode !== 'goal') delete state.goal` — under two modes that would drop a
-goal on EVERY switch to reflection. It is DELETED. A goal now dies ONLY on an
-explicit `clearGoal` or on achievement-`retireProjectGoal`. Every goal-drop
-path was audited (`clearGoal`, `retireProjectGoal`, `decideGoalTransition`
-status transitions which mutate `goal.status` but never `delete`); none fire on
-a plain mode switch. `test/goal-core.test.mjs`, `test/goal-lifecycle.test.mjs`
-and `test/session-store.test.mjs` pin it.
+- **No model switching:** continuation `client.session.promptAsync` must never
+  contain `.model`. Judge sessions can use configured routing or the current
+  session's model fallback; do not change the active agent's model.
+- Judge evidence is alternating user/assistant **prose**, not raw tool calls,
+  command logs, results, or derived tool signals. Preserve `buildConversationChain`
+  ordering, budgets and explicit truncation markers. Evidence is reported paths,
+  URLs, commands **and results**, not “done.” Do not claim independent/perfect
+  verification or add deterministic test-command gates under this refactor.
+- Keep shipped prose rubrics aligned with the embedded fallback. Do not demand
+  observations the judge cannot see or invent PR/deploy requirements outside
+  user scope. Project SystemPrompt/Patterns/User overrides remain supported;
+  a custom template cannot omit the effective contract.
+- Use one calm feedback template; `buildEscalatingFeedback` has no attempt-count
+  parameters. Never render injection budget counters into agent-facing feedback.
+- Preserve root/child (`session.parentID`, NOT message parentID), judge-session,
+  plan, abort, disabled and control-turn gates. Controls are never work, even
+  with a goal. Actions on/off remain independent of contract and roadmap flags.
+- Coalesce idle events received during an active audit and replay after it exits;
+  do not lose a new human turn. Skip replay while the actual session is busy,
+  retrying or recently aborted. An old audit cannot mutate a replacement goal.
+- CC stdout: exactly `{decision:"block",reason}` when continuing; otherwise
+  empty. Diagnostics go to logs, not stdout. Validate cwd before logging.
+- Skip supervisor and foreign Stop-hook feedback as human input (`isMeta`,
+  `Stop hook feedback:` and shared non-human helpers); they must not become
+  task context, goal seeds, or new human turns.
 
-**Migration (load-time, one place).** Persisted `mode:'goal'` in
-`state.json` or a legacy `goals/<id>.json` maps forward to `reflection` with the
-goal intact, in `normalizeLoadedState` (`core/session-store.mjs`) — the one
-owner of load/migration, wired into both `load()` return paths and
-`migrateLegacySession`. Legacy files are left in place (repo convention).
+## Counters and no-progress
 
-**Deprecated INPUT alias.** The string `'goal'` as a *mode argument* is still
-accepted at the command surface (`bin/supervisor.mjs`, opencode
-`requestedMode==="goal"`): it maps to reflection and KEEPS any goal, with a
-"no longer a mode" notice — it never hard-errors, because stale skills and
-installed command files still say it. The low-level `goalStore.setMode` still
-THROWS on `'goal'` (the alias mapping lives at the command surface, deliberately).
+One counter per human turn, persisted through the shared store. `goal.attempts`
+is a mirror, not a second independently incremented budget. New genuine human
+messages reset it; generated feedback does not. Every committed injection writes
+count+1 before prompting (failed sends still cost an attempt).
 
-## Test Coverage
+Runaway valve: session retry > supervisor.yaml `maxAttempts` >
+`SUPERVISOR_MAX_ATTEMPTS` / legacy env > default 50 **injections**, not inner model
+steps. Positive integers are stored verbatim; invalid inputs reject loudly;
+`unlimited`/`off`/`none`/`0` disables the count cap on OpenCode. CC reduces to
+`resolveClaudeCodeHardCap()` (normally 7) and reports any reduction, including
+unlimited, honestly. Ceiling logs include limit, tier, and platform reduction.
+Spending a turn's budget leaves the goal active; only deadline exhaustion is
+terminal. Eligibility skips never saturate or increment the counter.
 
-### `test/supervisor-gates.test.mjs` — the two "should the supervisor run at all" gates
+The deterministic repeated-reply gate tolerates one repeat and stands down on
+the next; it does not consume budget. Explicit stuck reaches its handler;
+completed still reaches the audit. Empty/actionless verdicts and rendered
+feedback without a body do not inject. Status/exit hints and a standing goal
+alone must not manufacture a feedback body. Human-only blockers stand down.
 
-Covers the two highest-volume misfires found in a 30-day forensic sample of real sessions.
+## Store, identity and concurrency
 
-**Subagent gate.** The supervisor must not run inside delegated subagent sessions (633 of 962 injections, 66%). The gate reads `parentID` off the session object — **verified**, not guessed:
-- SDK: `Session.parentID?: string` (`@opencode-ai/sdk/dist/gen/types.gen.d.ts`)
-- Live REST: `GET /session/{id}` returns `parentID` on a child and omits the key entirely on a root
-- SQLite storage form is `session.parent_id`; the API/SDK form is `parentID`
-- **Trap:** `message.info.parentID` is a *message* id (`msg_…`). Never derive subagent-ness from the transcript.
+`core/session-store.mjs` is the single accessor; goalStore and OpenCode's
+supervisorStore are facades, not duplicate storage implementations.
 
-Override with `superviseSubagents: true` in `~/.config/opencode/supervisor.yaml` (default false). The gate fails **open** when `client.session.get` is missing or throws — a fail-closed gate would silently kill the whole feature on an SDK mismatch.
-
-**`/supervisor off`.** `action: off/on` is handled BEFORE any `mode` branch, because `mode` used to early-return and swallow it (3 of 5 real off-attempts never persisted; one was converted to `mode: autopilot`). The executor also treats runtime filler (`""`, `"null"`, `"undefined"`, actual `null`) as absent — the tool schema reaching the model marks every param required even though zod says `.optional()`, so the model is forced to invent a `mode`. After writing, the disabled state is read back and an explicit `FAILED …` string is returned if it did not persist.
-
-E2E coverage lives in `test/e2e-opencode.test.mjs` under `describe("subagent gate")`: it creates a real child session via `POST /session {parentID}` against a live server, asserts the `parentID` field contract, and asserts the plugin's own debug log shows the child skipped and a root session supervised. That E2E requires the spawned server to run with `SUPERVISOR_DEBUG=1`.
-
-### `test/model-fallback.test.mjs` — Judge session model fallback
-
-Tests `getLastSessionModelSpec()` — the helper that extracts `providerID/modelID` from the active session's messages so judge sessions reuse the session model when no model is configured in `opencode.json` or `supervisor.yaml`.
-
-**Why it exists:** Without this fix, `assessmentAttempts` fell back to `[""]`, letting opencode pick its default provider. On machines with OpenAI credentials, judge sessions silently routed to `gpt-*` even when the user's active session ran `claude-*`.
-
-**What it covers:**
-- Returns `providerID/modelID` from the last assistant message with model info
-- Returns the most recent message (not first) when multiple have model info
-- Returns `null` for empty arrays, messages missing `providerID`/`modelID`, or blank values
-- Handles messages without `info` field (no crash)
-
-**NOT covered (E2E gap):** A real `opencode run` → idle → supervisor fires → judge session model verified. That requires a live `opencode serve` and a real task execution. Run manually to verify:
-```bash
-# 1. Confirm no model in global config
-opencode --version  # should show no default model
-# 2. Run a task and let it go idle
-opencode run "print hello" --model anthropic/claude-opus-4.6
-# 3. Check supervisor debug logs for judge session model
+```
+.supervisor/sessions/<full-id>/state.json       # 0600
+.supervisor/sessions/<full-id>/verdicts.jsonl   # append-only
+.supervisor/disabled                           # session IDs
+.supervisor/current_session                    # hint only
+.agents/supervisor/*                           # project configuration
 ```
 
-### `test/task-context.test.mjs` — judge input
-
-`extractLastAssistantText` is the SINGLE extractor (`core/task-context.mjs`); two copies previously disagreed on which text part of the last assistant message wins. It is now factored through `assistantMessageText`, which `buildConversationChain` also uses — still one extractor.
-
-The judge's context is `buildConversationChain`: the plain alternating `user:` / `assistant:` conversation, oldest→newest, and nothing else. Tool calls, tool inputs, tool results, the `[1]..[n]` demand blob, and the old `currentTask`/`priorContext`/`turnEvidence` split are all gone (owner decision — the judge can no longer independently verify a claim against a tool result). Budget: `CHAIN_MAX_CHARS = 10000`, newest pair always in full up to `PROMPT_TEXT_LIMIT`, older pairs trimmed before dropped, any cut carries an explicit supervisor-attributed marker. `currentTask` survives as the non-actionable-turn-gate input and `taskSummary`, not as judge input. Also covers `truncateForPrompt` — tail-preserving by default (the verdict lives at the END of a long reply), explicit truncation marker, `PROMPT_TEXT_LIMIT = 12000` as the one limit.
-
-### `test/turn-classifier.test.mjs` — non-actionable turn gate
-
-`shouldSkipReflection` must skip "tldr" / "thanks" / "Stop. Reflect." and must NOT skip real work. False skips are the dangerous direction, so the actionable corpus is the larger half. Escape hatches (active goal, autopilot mode, length ceiling, a named file/issue/identifier) are asserted individually.
-
-### `test/goal-lifecycle.test.mjs` — achieved goals must die; empty verdicts must not loop
-
-`retireProjectGoal` only deletes a file that still parses to the exact condition it judged, and writes `.supervisor/goal-achieved.log` BEFORE unlinking. `isActionlessVerdict` (empty missing + empty next_actions + blank feedback) and `hasFeedbackBody` stand the supervisor down instead of injecting — a content-free verdict was observed re-injecting byte-identically 15x at ~20s intervals. A standing goal alone never counts as actionable content. Source assertions pin both guards into `opencode/supervisor-impl.ts`.
-
-### `test/goal-lifecycle.test.mjs` → `describe("resume: ...")` — a paused goal is not a dead end
-
-A goal that gets `paused` (the agent declaring `supervisor_loop_exit` with reason
-`stuck`) or `exhausted` (the 30-day deadline backstop) used to be permanently
-inert: nothing anywhere flipped it back to `active`, and the user's only recovery
-was re-typing the whole condition from scratch — with no indication that was
-necessary. `resumeGoal()` (`core/goal.mjs`) is the explicit fix, wired through
-`bin/supervisor.mjs set-goal resume` (CLI) and the `supervisor_goal` /
-`supervisor` tools' `resume: true` arg (`opencode/supervisor-impl.ts`).
-
-**The command is `set-goal resume`, never `goal resume`.** `test/manifest.test.mjs`
-bans the literal `/supervisor goal` and `/supervisor:goal` substrings across every
-user-facing surface (see its "no user-facing surface tells anyone to type the
-retired goal command" test) — `set-goal` is the one canonical name, `goal` survives
-only as an internal parser alias. `resume`/`unpause` are recognised the same way
-`clear`/`stop`/`off`/`reset`/`none`/`cancel` already were, via a sibling
-`GOAL_RESUME_ALIASES` set next to `GOAL_CLEAR_ALIASES`.
-
-**Resumable statuses are `paused` and `exhausted`, and nothing else.** `active` is
-already running (an honest `already-active` outcome, not a fabricated success);
-`achieved`/`cleared` are terminal and immediately deleted by
-`clearGoal`/`retireProjectGoal`, so a persisted goal object in either state
-essentially never exists, but the check stays honest either way rather than
-assuming. Every non-resume outcome returns `{resumed:false, reason, status,
-condition}` so the caller can print the goal's ACTUAL current status instead of a
-silent no-op — the same discipline `/supervisor off` failing to persist taught
-this codebase (see the session-store section below).
-
-**Resume sets `mode:'reflection'` and revives the goal.** A goal is now an
-orthogonal attribute recognised in reflection regardless of any `mode==='goal'`
-filter (that filter is GONE — see the two-modes section at the top of this file).
-Resume flips `goal.status` back to `active` and forces `mode:'reflection'` (the
-mode that verifies a goal), so a resumed deadline-exhausted goal is both active
-AND in the mode that checks it. It never sets `mode:'goal'` — that value is no
-longer a mode.
-
-**Resume extends a deadline that has already passed** (to `now +
-DEFAULT_MAX_GOAL_DURATION_MS`) but leaves a still-future deadline (the ordinary
-stuck-pause case) untouched. Without the extension, the very next stop-hook pass
-re-triggers `decideGoalTransition`'s `now >= goal.deadline` branch and
-re-exhausts the goal instantly — turning "resume" into a trap that looks like it
-worked and dies on the next turn.
-
-**Resume resets the attempt counter fully, not just `goal.attempts`.** It
-`delete`s the shared `state.attempts` object (not just zeroes `goal.attempts`),
-so `sessionStore.readAttempts()` reads 0 for whatever turn key comes next —
-consistent with issue #57's fix that `goal.attempts` is a MIRROR of the one
-turn-scoped counter, never a second independently-incremented tally. `lastReason`
-is cleared and `lastTurnKey` is reset to `null` (the same initial value
-`setGoal()` uses), so the very next stop treats it as a brand-new turn.
-
-**Discoverability: every pause site names the recovery command.** `lastReason` —
-the ONE field the Claude Code Stop hook can carry forward, since it has no
-passive user-visible output channel at the exact instant a goal pauses (a
-`{decision:'block'}` reply would force another continuation, defeating the
-pause) — gets `core/goal.mjs`'s `withResumeHint()` appended at both stuck-pause
-sites (`bin/supervisor-on-stop.mjs`, `opencode/supervisor-impl.ts`'s
-`executeSupervisorLoopExit`) and both deadline sites. OpenCode's deadline toasts
-and the `supervisor_loop_exit` tool's own return string get the same hint
-inline. `/supervisor status`, `bin/supervisor.mjs`'s `goal-status` case, and the
-OpenCode `supervisor`/`supervisor_goal` status text all append
-`goalResumeHintSuffix()` whenever the goal is `paused`/`exhausted` — `bin/status.mjs`
-previously printed NO goal detail at all (only `resolveSupervisorMode()`'s
-"effective mode", which — back when `'goal'` was a mode — read `'goal'`
-identically whether the goal was actively pushing or dead-in-the-water paused; it
-now resolves to `reflection` in both cases, so mode alone is even less
-informative about goal status), so that alone was a second, independent
-instance of "shown as if active" this phase fixed.
-
-**One inaccuracy in how this feature was originally described:** the third
-"pause" site named at the start of this work — an active goal standing down
-because the judge says the human must act next (`goal_paused_user_wait` in
-`bin/supervisor-on-stop.mjs`) — never actually persists any status change.
-`goal.status` stays `'active'` on disk; only a transient `verdictRecord.goal =
-'paused'` (a per-turn log line, not state) is written. There is no dead end to
-resume there — the existing "just send another message" flow already reactivates
-it, so `resumeGoal()` correctly reports `already-active` for it and changes
-nothing.
-
-### `test/status-directive.test.mjs` — status/roadmap directive
-
-`STATUS_DIAGRAM_DIRECTIVE` leads with `STATUS_DIRECTIVE_MARKER` and `appendStatusDirectiveToSystem` is idempotent — `experimental.chat.system.transform` fires more than once per user turn on opencode 1.17.9, so a naive push duplicates the directive. `checkStatusCompliance` is deterministic and LLM-free (it runs on the complete path) and fails OPEN: unknown turn start lets any existing `status.md` count. `isStatusDiagramEnabled` is default-OFF — absent/undefined/`false` mean off, only an explicit `true` (`/supervisor status on`) enables.
-
-E2E coverage in `test/e2e-opencode.test.mjs` under `describe("status directive system-prompt injection")` asserts at the fixture LLM, i.e. on the wire: opencode 1.17.9 never populates `AssistantMessage.system` in the REST transcript, so a transcript assertion would pass vacuously. Also pins the FLAT dotted hook key — opencode resolves hooks by literal `hooks[name]` lookup, and a nested `{experimental:{chat:{system:{transform}}}}` object is silently ignored.
-
-### `test/status-goal-composition.test.mjs` — the semantic conflicts between the four fix branches
-
-Every case here passes on each branch alone and fails on the naive union. No textual merge conflict marks any of them.
-
-- **The directive must not smuggle a body into an empty message.** `buildEscalatingFeedback` appends the directive to EVERY message, so `hasFeedbackBody` run over the raw render can never return false — the last-resort empty-injection guard silently became dead code. `stripStatusDirective` removes it before the body check.
-- **`/supervisor:status off` must silence BOTH continuation paths.** The status branch gated only the Claude Code autopilot nudge; the opencode nudge hard-coded the directive and both reflection paths ignored the toggle. `buildEscalatingFeedback` now takes `{ statusDirective }` (default true) and both runtimes pass `isStatusDiagramEnabled(state)`.
-- **The system-prompt gate must work on a cold cache.** `shouldInjectStatusDirective` resolved the session's project from an in-memory `sessionDirCache`, which is empty after every server restart — a restarted server read the SERVER cwd's `.supervisor/disabled` for every pre-existing session. The mapping is now persisted as `SupervisorState.projectDir` and read from the `supervisorStore.load` the gate already performs (no extra I/O, no HTTP round-trip into a mid-request server).
-- **Goal retirement must run BEFORE the status correction's early return.** The correction `return`s out of the completion path; a goal retired after it would survive into every future turn and every future session.
-- **`action: off/on` must still be evaluated before `mode`,** and `status on|off` must toggle the directive only — never the enable axis.
-
-### `test/rubric-prose-evidence.test.mjs` — the judge reads prose, not a tool log
-
-PR #61 made the conversation chain the judge's only input, which left rubric rules asserting things the judge can no longer observe ("the tool commands show ONLY read operations", "write/edit tool calls in tool commands", "no write/tool evidence"). Dead rubric text is worse than none — the judge can only hallucinate compliance against a field it never receives.
-
-The regression guard is a banned-phrase grep over the SHIPPED rubric, plus an equality assertion that its two copies have not drifted: `.agents/supervisor/Patterns.md` (read by `core/reflection-prompt.mjs`, both runtimes' reflection path) and `STATIC_RUBRIC` in `core/assessment.mjs` (→ `DEFAULT_RUBRIC`, read by opencode's `loadRubric()` fallback and the `buildSelfAssessmentPrompt`/`buildJudgePrompt` default). Eight rules were rewritten to test the agent's PROSE instead: the report must name a checkable specific (file path, PR/issue number, command AND what it returned, a count), and vagueness — not a missing tool call — is what makes a claim unverified. Two rules were added: SPECIFICITY TEST and DO NOT INVENT EVIDENCE (never assume a step happened because it is standard practice; never assume it did NOT because an earlier turn omitted it).
-
-`{{signals}}` was also removed from the judge prompt: `detectSignals` derives `test-command`/`gh-pr-*`/`git-push` from the tool command log, so rendering it contradicted `SystemPrompt.md`'s own "You do not see the agent's tool calls or their results".
-
-**NOT in scope:** `core/patterns.json`. That feeds a DIFFERENT judge (`core/judge-core.mjs`, the Stop classifier) with a DIFFERENT input contract — it still receives `tools_available_inferred` (the tool NAMES used), so its tool-referencing rules are not dead.
-
-### `test/session-store.test.mjs` — per-session state layout, session identity, GC
-
-`core/session-store.mjs` is THE single accessor for per-session machine state. `goalStore` (core/goal.mjs) and `supervisorStore` (opencode/supervisor-impl.ts) are now a behavioural facade and an async-signature adapter over it — not two implementations of one on-disk contract, which is the shape that produced every prior drift bug in this repo.
-
-Layout: `.supervisor/sessions/<full session id>/{state.json,verdicts.jsonl}`. Project CONFIG (`.agents/supervisor/*`) is untouched and is NOT sharded per session. Precedence is unchanged — session > project > shipped.
-
-**The bug.** `.supervisor/current_session` is ONE shared file every Stop hook in the project overwrites, so with two sessions in one repo `/supervisor off` disabled whichever stopped LAST, not the caller's. `bin/supervisor.mjs` now resolves the id as `--session <id>` (unique prefix expanded) → `$SUPERVISOR_SESSION_ID` (exported by the Stop hook from its own stdin `session_id`) → `$CLAUDE_SESSION_ID` → `current_session`, and the fallback is ANNOUNCED with the full id plus a warning naming any other recently-active session. An ambiguous id lists candidates and acts on nothing (exit 1).
-
-**Truncation.** The old `verdict_<sid8>.json` / `<sid8>_<ts>.json` keyed on the session id cut to 8 chars — two sessions sharing a prefix shared one verdict file. The new layout uses the full id; the test asserts two same-prefix ids do not collide.
-
-**Migration.** A legacy-only session (`goals/<sid>.json` + `<sid>_attempts.json` + `verdict_<sid>.json` + `disabled`) is read AND migrated forward on first load. The legacy files are deliberately LEFT IN PLACE — deleting them makes a downgrade silently drop an active goal — and GC reclaims them. Tests assert no goal, retry override, flag or disabled entry is lost.
-
-**Attempts moved into `state.json`, which created a new lost-update path:** the hook read `goalState` before `writeAttemptCounter` ran, then `goalStore.save(…{...goalState, goal})` clobbered the counter written in between. Every whole-state `save()` on a hot path in BOTH runtimes is now `sessionStore.mutate()` / `supervisorStore.mutate()` (locked read-modify-write). `test/goal-per-turn.test.mjs` is the regression guard — it drove `goal.attempts` to 1 instead of 7 on the naive version.
-
-**Concurrency.** Atomic write is temp+rename in the same dir, created 0600 so there is no world-readable window. Atomic write alone is NOT sufficient — it prevents a corrupt file, not a lost update — so `mutate()` serialises read-modify-write behind an O_EXCL lockfile with a 10s stale breaker, and degrades to last-writer-wins rather than blocking a turn.
-
-**GC.** `gcSessions()` drops dirs untouched >30 days, then caps at 200 (oldest first); `maybeGcSessions()` runs it from the Stop hook at most once/day per project, best-effort, never blocking, never touching the live session.
-
-### `test/live-validation.mjs` — evidence, not assertions
-
-Nine scenarios, each against its own real `opencode serve` (isolated `$HOME` +
-scratch project under the OS temp dir, `SUPERVISOR_DEBUG=1`), driven over REST.
-It asserts on what the plugin itself produced: its debug log, the files it
-wrote, and the exact bytes it sent to the model. Writes forensic artefacts
-(captured prompts, transcripts, per-request model-call log) next to a
-`report.md`. Latest full-run write-up: `.scratch/live-validation.md` (9/9,
-98 checks). Not a pre-commit gate — a ~9 minute evidence run.
-
-Two things it found that unit tests could not:
-
-- **`isActionlessVerdict` was unreachable on the opencode runtime.**
-  `analyzeSelfAssessmentWithLLM` substitutes
-  `verdict.feedback || "Judge analysis completed"` into `analysis.reason`, and
-  the guard was fed `analysis.reason` — so the blank-feedback arm could never be
-  true, and an empty verdict stood down with the wrong reason. The judge's
-  feedback is now carried through verbatim as `SupervisorAnalysis.rawFeedback`
-  and that is what the guard reads.
-- **`autopilot_exit` silently deleted an active goal.** It was registered
-  plugin-wide, so it was in every session's tool catalog; it called
-  `setAutopilot(false)` unconditionally, which routed through
-  `setMode("reflection")` → `delete state.goal`. It was made a no-op outside
-  autopilot mode as an interim fix, then deleted outright once
-  `supervisor_loop_exit` fully replaced it (see the stop-mechanism section
-  above) — two tools for one job was the drift risk, not just the goal-delete
-  bug. **As of the two-modes refactor the underlying primitive is gone too:**
-  `setMode` no longer deletes the goal under any mode (a goal is an attribute,
-  not a mode), so even a resurrected unconditional `setAutopilot(false)` could
-  not drop a goal now. See the two-modes section at the top.
-
-Both are pinned in `test/goal-lifecycle.test.mjs`.
-
-`test/helpers/live-server.mjs` owns spawn/teardown/health for BOTH this harness
-and the E2E, so they cannot drift on isolation. `waitForHealth` gives every
-attempt its own `AbortSignal` — without one, a single stalled `fetch` blocks
-past the deadline the loop is supposed to enforce (measured: a 302s hang that
-cancelled all 14 E2E tests). `reserveFreePort` holds the port until the moment
-before spawn instead of racing between probe and bind.
-
-### `test/e2e-opencode.test.mjs` — attribute model calls by CONTENT
-
-The status-directive tests used to slice a server-wide list of model calls
-(`getSystemPrompts().slice(before)`) and treat every entry as belonging to the
-session under test. It does not: the supervisor's background status-checkpoint
-correction for an EARLIER session is injected into that other session and
-legitimately carries the directive, so whenever it finished inside the ~500ms
-assertion window the test failed on an unrelated session. Measured 1 failure in
-16 runs; reproduced deterministically by widening the window to 20s (2
-offenders, both the previous session's correction turn). Calls are now matched
-by a per-turn probe string. 20/20 after the fix.
-
-### `test/e2e-cc.mjs` — Claude Code Stop hook
-
-Real hook entry point: Stop payload on stdin, real transcript jsonl, stdout decision contract. `SUPERVISOR_FAKE_JUDGE` makes it deterministic; `SUPERVISOR_CC_LIVE=1` uses the real judge. The goal-achieved case asserts the session goal is CLEARED (not left as `status:'achieved'`) and that `.supervisor/goal-achieved.log` carries the record — clearing must never be silent.
-
-### `test/loop-exit.test.mjs` + `test/loop-exit-parser.test.mjs` — THE stop mechanism
-
-**The agent ends the loop, not the counter.** A fixed per-turn budget (3 for
-reflection, 16 for goal/autopilot) stood the supervisor down mid-task: the cap
-was reached while the work was still half-finished, and the human saw an
-abandoned turn with no explanation. A number chosen in advance cannot know
-whether a task is done.
-
-The stop is now an explicit declaration by the agent, with a reason:
-
-| runtime | signal | why it differs |
-|---|---|---|
-| opencode | `supervisor_loop_exit` tool, `{reason, detail}` | plugin registers tools |
-| Claude Code | `SUPERVISOR_LOOP_EXIT: completed` / `: stuck — why`, alone on its own line | Stop hook has NO tool registry — text sentinel is the only channel |
-
-`reason` is `completed` (task genuinely finished) or `stuck` (the supervisor is
-looping, demanding the impossible, or asking for something already done).
-`stuck` is deliberately available to the agent: the model is the only party
-that can see the loop from inside it.
-
-**One parser, both runtimes** — `parseLoopExitSentinel` (`core/loop-exit.mjs`).
-Line-anchored and fence-stripped, so the sentinel quoted inside the nudge that
-teaches it does not trigger it. `AUTOPILOT_EXIT` remains a **parse-only**
-alias for `completed` — it is deliberately no longer TAUGHT anywhere (no
-nudge, skill, README, or tool description mentions it); the regex is kept
-solely because shipped `skills/*.md` get copied into a user's `~/.config` and
-installed copies have lagged shipped fixes before (the 0.3.1 manifest-bump
-incident), so a stale on-disk skill that still emits the old token must keep
-working. `test/loop-exit-single-signal.test.mjs` is the regression guard: a
-banned-phrase grep over every shipped surface (README, skills, opencode
-commands, the CLI/nudge strings in `bin/*.mjs`, and
-`opencode/supervisor-impl.ts`) asserting none of them teach `AUTOPILOT_EXIT`
-or `autopilot_exit` anymore. Two regexes/tokens for one sentinel is the drift
-shape this repo keeps reproducing; there is exactly one live signal.
-
-**The hint must be runtime-correct or it is dead text.** `buildEscalatingFeedback`
-is shared, so telling a Claude Code agent to "call the supervisor_loop_exit
-tool" names a tool absent from its catalog — the loop then has no reachable
-stop at all. `opts.loopExitStyle` (`'tool'` default | `'sentinel'`) picks the
-wording; CC passes `'sentinel'`. Both variants are filtered out of
-`hasFeedbackBody`'s body check, or appending a line to every message silently
-kills the empty-injection guard — the exact status-directive footgun documented
-above. Arity is unchanged (AGENTS.md pins it; `test/feedback.test.mjs` asserts).
-
-**Side effects are asymmetric on purpose.** `completed` leaves an active goal
-untouched. `stuck` pauses it (status `paused`, condition retained) and appends
-to `.supervisor/loop-exit.log` so a doom loop leaves forensic evidence. Neither
-ever `delete state.goal` — that footgun was hit for real in live validation via
-the predecessor `autopilot_exit` TOOL (opencode/supervisor-impl.ts), which is
-now DELETED. It was a second tool for the same job as `supervisor_loop_exit`,
-registered plugin-wide (so it sat in every session's tool catalog including
-sessions carrying a goal), and it called `setAutopilot(false)` unconditionally —
-which back then routed through `setMode("reflection")` → `delete state.goal` —
-silently destroying an active user goal with no warning. As of the two-modes
-refactor `setMode` no longer deletes the goal at all (a goal is an attribute,
-not a mode), so that exact route is dead code now. `supervisor_loop_exit` only
-touches autopilot state when the session is actually in `autopilot` mode, and
-never deletes a goal outright; `test/goal-lifecycle.test.mjs` and
-`test/loop-exit.test.mjs` pin both.
-
-**The gate is a plain `return`,** not a counter saturation: it is a cheap
-idempotent read of persisted state, so saturating would make it
-indistinguishable from a spent budget and fire the cap branch's side effects
-(`setAutopilot(false)`, goal transitions) on a later idle. See "Eligibility
-gates must NOT saturate the counter" below. A `loopExit` record is keyed to its
-turn, so a stale one from a previous turn never suppresses a new human turn.
-
-### `test/e2e-opencode.test.mjs` → `describe("per-turn attempt budget")` — the runaway circuit breaker
-
-The opencode runtime could inject **at most once per human turn**. Claude Code
-could not — the two had silently diverged, and there was no opencode-path test
-covering a second injection on one turn (`test/e2e-cc.mjs`'s "default runaway
-limit allows a goal loop to inject well past 3" spawns
-`bin/supervisor-on-stop.mjs`, CC only, and
-that passing test is what gave the false confidence).
-
-**The mechanism.** `getLastRelevantUserMessageId` skips supervisor-injected
-messages, so the turn key stays pinned to the last HUMAN message — that is what
-makes a per-turn counter possible, and it stays. What changed is the STOP
-condition. `if (lastUserMsgId === lastReflectedId) return` (a boolean set at 22
-sites, deleted at none, including immediately after a *successful* injection)
-is gone. The remaining counter check is `attempts >= runawayLimit`,
-checked **pre-increment** on both runtimes (opencode
-`currentAttemptCount >= runawayLimit`, Claude Code `attempts >= runawayLimit`) —
-the old opencode check was post-increment, so the real budget was N−1 and
-`/supervisor retry 1` yielded ZERO injections. It is no longer the INTENDED
-stop (see `supervisor_loop_exit` above); it is the runaway circuit breaker that
-bounds the loop when the agent never declares an exit.
-
-**Termination** is proved, not asserted: `settleInjections` always burns a full
-15s quiet window after the last change, i.e. it is a bounded wait for an
-injection N+1 that must never arrive. The counter is monotonic within a turn,
-every injection path writes count+1 *before* prompting (a failed `promptAsync`
-still costs an attempt — fail toward termination), and the turn ends after at
-most `runawayLimit` injections. That bound still holds with the breaker
-set to `RUNAWAY_CEILING`; `supervisor_loop_exit` terminates far earlier in
-practice. The suite is also proven SENSITIVE: re-adding the one deleted
-stand-down line after a successful injection turns "3 injections" into 1.
-
-**Two tiers, one counter.** `attempts` is persisted via `sessionStore`
-(`.supervisor/sessions/<id>/state.json`, locked `mutate()` — the lost-update
-path `test/goal-per-turn.test.mjs` guards) with an in-memory monotonic floor.
-That is not a second stop mechanism: reads take `max(memory, disk)`. Disk gives
-cross-restart and cross-process safety (32 accidental double-injections in the
-forensic sample came from the old in-memory-only map); memory keeps the loop
-bounded if the best-effort disk write fails.
-
-**Eligibility gates must NOT saturate the counter.** Only paths that already
-committed to supervising this turn stand down by writing the budget. The
-subagent gate, `.supervisor/disabled`, and the non-actionable/control-command
-turn gate plain-return — they re-derive the same answer for free on every idle.
-Saturating there made them indistinguishable from a spent budget, and opencode
-raises several `session.idle` events per turn, so a later pass took the
-budget-exhausted branch and fired its SIDE EFFECTS. Measured: `/supervisor
-autopilot` skipped itself as a control command, saturated the counter, and the
-next idle 34ms later called `setAutopilot(false)` — the command disarmed itself
-before the user typed a task.
-
-**`/supervisor …` is never work, in any mode.**
-`shouldSkipReflection` checks `isSupervisorControlTurn` BEFORE the
-goal/autopilot escape hatches — the only rule that does. Autopilot bypasses the
-turn gate by design, so with a real budget it burned the whole thing on its own
-command turn.
-
-**The runaway limit is ONE rule** (`describeRunawayLimit`, core/goal.mjs, with
-`resolveRunawayLimit` as the thin number accessor over it), applied by both
-runtimes: `/supervisor retry N` (session override) > config `maxAttempts` (in
-`~/.config/opencode/supervisor.yaml`) > env (`SUPERVISOR_MAX_ATTEMPTS` ??
-`REFLECTION_CC_MAX_ATTEMPTS`) > `RUNAWAY_CEILING` (**50**) — the SAME for every
-mode, no `mode` parameter. Each tier is parsed by `parseAttemptsValue`: a positive
-integer is **honoured verbatim (no upper clamp** — a number the operator typed is
-never silently rewritten), `unlimited`/`off`/`none`/`0` means **no cap**
-(`Infinity`; every gate is `attempts >= limit` and `x >= Infinity` is always
-false), and a negative/fractional/garbage value is invalid — rejected LOUDLY at
-the CLI/tool, warn-and-fall-through in the config file. The resolved value is then
-reduced to the runtime's platform hard cap (Claude Code passes
-`resolveClaudeCodeHardCap()` = 7 and CANNOT honour `unlimited`; opencode passes
-none). `describeRunawayLimit` returns a DESCRIPTOR — `{limit, requested, unlimited,
-tier, cappedByPlatform, hardCap}` — so the ceiling gate, status text, once-per-turn
-debug line, and the `runaway_ceiling` loop-exit.log record all read the same
-resolution and cannot drift; the log record and status name the resolved limit AND
-the tier that set it, and surface `cappedByPlatform` (esp. when `unlimited` was
-requested but the platform forced it down). **50 is explained + sourced, not
-folklore — and the UNIT matters.** N counts supervisor INJECTIONS (outer-loop
-re-prompts); each injection restarts a whole agent turn of dozens of tool calls,
-so 50 injections ≈ 50 completed agent turns ≈ hundreds-to-thousands of model
-steps — NOT comparable to a framework's per-run cap (LangChain `max_iterations=15`,
-LangGraph `recursion_limit=25`, OpenAI Agents SDK `max_turns=10`, smolagents
-`max_steps=20`, CrewAI `max_iter=25`, Aider `max_reflections=3`, OpenHands
-`max_iteration_per_run=500`); measured against those, 50 is one of the MOST
-PERMISSIVE limits in the ecosystem, effectively unbounded in dollars. It is a
-BACKSTOP set well above observed reality, not a tuned optimum: a 30-day forensic
-sample (59 authoritative last-turn samples, 19 projects; 133-sample same-task
-corroboration) shows legit turns cap at ≤3 injections (p50=3, p90=3, p99≈3);
-everything above ~16 is censored doom-loop saturation, so 50 ≈ 17× the observed
-p99. The long-horizon coding frameworks that tuned a stop moved OFF a step count
-onto a COST budget (SWE-agent `$3`/instance; mini-SWE-agent `step_limit=0` + `$3`;
-Claude Agent SDK ships no turn cap and recommends a USD budget; Anthropic's own
-SWE-bench scaffold has no turn cap) because SUCCESSES LIVE IN THE TAIL (Anthropic
-">100 turns"; arXiv 2510.16786 median 41–58, tail >175, and recommends setting the
-limit at the p75 of your OWN distribution) — a low static cap trades tail success
-for cost (`.scratch/runaway-limit-analysis.md`). The SAME evidence says the RIGHT
-PRIMARY control is a per-turn cost/token budget (opencode exposes per-message
-`cost` + `tokens`), NOT a step count — a mechanism change deliberately left to the
-owner, not made here; the injection cap stays a crude runaway backstop.
-The old per-mode defaults (16 goal/autopilot, 3 reflection), the `[1,100]` clamp,
-and the pile of overlapping helpers (`resolveTurnMaxAttempts` /
-`resolveReflectionMaxAttempts` / `resolveMaxAttempts` / `DEFAULT_MAX_ATTEMPTS` /
-`DEFAULT_REFLECTION_MAX_ATTEMPTS`) are gone — a low default IS the
-premature-stand-down bug, per-mode branches were the drift surface, and a silent
-clamp rewrote the operator. An explicit override at any of the first three tiers
-is a deliberate operator choice and still wins. The value is a **runaway safety
-valve**, not a budget: it never signals completion, and it never leaks into the
-agent-facing nudge (see the guard `test/nudge-no-counter.test.mjs`, which fails if
-a `(n/N)` counter reappears in either nudge template).
-
-### `test/goal-per-turn.test.mjs` — also pins the turn KEY itself
-
-`getMessageSignature` only checked a top-level `msg.id`. opencode's REST
-transcript shape is `{ info: { id, role, time }, parts }` — there is no
-top-level `id` (verified live: `msg.id === undefined`,
-`msg.info.id === "msg_fda79148d001bdPZnwwZoyiPGx"`), so **every** key fell
-through to a `${role}:${time}:${first 20 chars}` composite, with `time.start`
-unset on user messages. "can you please check the alpha module" and "…the beta
-module" both keyed as `user:0:can you please check`, so the second turn
-inherited the first's spent budget and was never supervised — a silent
-supervision hole. Now `info.id` is used.
-
-### `buildEscalatingFeedback` takes no attempt count
-
-It used to accept `attemptCount` and `maxAttempts` and read NEITHER
-(`attemptCount` was never referenced; the `maxAttempts`-derived `effectiveCap`
-was computed and discarded). Both are removed rather than wired up: "one calm
-template, always" is a standing decision here, escalating tone is pressure to
-declare victory, and a silently-ignored parameter is an invitation to display a
-number the code cannot honour. `test/feedback.test.mjs` pins the arity. The
-attempt number is still rendered into the JUDGE's prompt
-(`core/reflection-prompt.mjs`, `core/assessment.mjs`), where it is genuinely
-read. The autopilot nudge still shows `(n/N)` — that counter is persisted now,
-so it counts up truthfully instead of always reading `1/N`.
-
+CLI identity: explicit `--session` (unique prefix expanded) >
+`SUPERVISOR_SESSION_ID` > `CLAUDE_SESSION_ID` > announced local fallback.
+Ambiguity acts on nothing. Full IDs avoid prefix collisions. Never trust the
+shared current_session file as the caller when two sessions share a repo.
+
+Atomic temp+rename alone prevents corruption, not lost updates. Hot-path writes
+use locked `mutate`, never save an earlier whole-state snapshot over a newly
+written counter/flag. O_EXCL locks have a 10s stale breaker and best-effort
+fallback. Legacy layouts migrate on load and are left for retention cleanup.
+GC is best effort, daily at most, excludes the live session, retains 30 days and
+caps at 200 session directories. Project config is not sharded per session.
+
+## Status and independent plainspeak
+
+`statusDiagram` is default **off**; only explicit true enables it. Roadmap
+injection is idempotent, respects disabled/control/child gates and remains
+separate from on/off. At most one status correction per human turn. Retire an
+achieved goal before a status-correction early return.
+
+Plainspeak is independent: default-on OpenCode flag, deterministic-only there;
+CC has a second hook with an optional LLM tiebreak. It defers to active
+session/project goals and a just-injected supervisor verdict. It never spends
+completion attempts and claims its one-rewrite-per-human-turn slot before
+prompting. Respect trailing questions, kill switches and fail-open behavior.
+No-goal must not disable an otherwise eligible style check.
+
+## Validation focus and privacy
+
+Pin contract propagation into the actual judge prompt, no-goal no-judge behavior,
+completed-signal audit, unmet criteria continuation, evidence-based retirement,
+user-goal protection, session-only agent contracts, paused/cleared fallback,
+controls/disable/children, retry counter reset, forensic ceilings, status and
+plainspeak composition. E2E must inspect state and captured model requests, not
+just a reply claiming a goal. Match model calls by per-turn probe content rather
+than slicing a shared asynchronous call list. Strip runner-private
+`NODE_TEST_CONTEXT` from spawned servers and independent checks: otherwise
+nested `node --test` can skip every file with exit 0. Assert real test totals.
+
+Keep unrelated model-routing, training, media, no-progress, prompt and session
+store regressions. Training is local, never auto-commits. Real transcripts,
+`.dataset/`, credentials and trace artifacts stay out of git. CI's privacy guard
+is mandatory; synthetic `evals/*.example.jsonl` fixtures are the limited exception.

@@ -1,16 +1,16 @@
 {
   "name": "agents-supervisor",
-  "description": "Supervisor plugins that catch premature agent stops and re-prompt the agent to finish — for Claude Code and OpenCode.",
+  "description": "Goal-based completion supervision for Claude Code and OpenCode.",
   "owner": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
   "plugins": [
     {
       "name": "supervisor",
       "source": ".",
-      "description": "Catches premature agent stops and re-prompts to finish. Dataset-backed Stop-hook supervisor with /supervisor:train and /supervisor:status. Includes plainspeak, a Stop hook that catches fluffy replies and injects a plain-English rewrite directive.",
-      "version": "0.3.1",
+      "description": "Supervises active goals against acceptance criteria and reported verification evidence. Includes independent plainspeak style checks and local pattern training.",
+      "version": "0.4.0",
       "author": { "name": "dzianisv", "url": "https://github.com/dzianisv" },
       "category": "workflow",
-      "tags": ["agent", "supervisor", "reflection", "stop-hook", "autonomy", "plainspeak", "style"]
+      "tags": ["agent", "supervisor", "goal", "acceptance-criteria", "stop-hook", "plainspeak", "style"]
     }
   ]
 }

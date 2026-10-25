@@ -3,8 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseSupervisorCommand, resolveRunawayLimit, decideGoalTransition,
-  parseRubric, buildGoalRequirementSection, DEFAULT_SUPERVISOR_MODE,
-  resolveSupervisorMode, supervisorStore, SupervisorPlugin,
+  parseRubric, buildGoalRequirementSection, supervisorStore, SupervisorPlugin,
   trackSessionScopedToolSession,
 } from '../opencode/supervisor-impl.ts';
 import { describeRunawayLimit, RUNAWAY_CEILING } from '../core/goal.mjs';
@@ -64,44 +63,35 @@ test('parseSupervisorCommand: goal set/status/clear (+aliases) and retry', () =>
   }
 });
 
-test('parseSupervisorCommand: root supervisor supports mode UX', () => {
+test('parseSupervisorCommand: root controls and removed modes', () => {
   assert.deepEqual(parseSupervisorCommand('supervisor', ''), { kind: 'supervisor-status' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'status'), { kind: 'supervisor-status' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'off'), { kind: 'supervisor-off' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'on'), { kind: 'supervisor-on' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'autopilot'), { kind: 'mode-set', mode: 'autopilot' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'reminder'), { kind: 'mode-set', mode: 'autopilot' });
-  assert.deepEqual(parseSupervisorCommand('supervisor', 'reflection'), { kind: 'mode-set', mode: 'reflection' });
+  for (const removed of ['autopilot', 'reminder', 'reflection']) {
+    assert.deepEqual(parseSupervisorCommand('supervisor', removed), { kind: 'mode-removed' });
+  }
   assert.deepEqual(parseSupervisorCommand('supervisor', 'goal all tests pass'), { kind: 'goal-set', condition: 'all tests pass' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'goal clear'), { kind: 'goal-clear' });
   assert.deepEqual(parseSupervisorCommand('supervisor', 'retry 24'), { kind: 'retry-set', n: 24 });
 });
 
-test('supervisorStore persists mode and resolves legacy autopilot state', async () => {
+test('supervisorStore persists contracts, protects user ownership, and has no mode setters', async () => {
   const d = mkcwd();
-  assert.equal(DEFAULT_SUPERVISOR_MODE, 'reflection');
-  assert.equal(resolveSupervisorMode({}), 'reflection');
-  assert.equal(resolveSupervisorMode({ autopilot: true }), 'autopilot');
-
-  await supervisorStore.setMode(d, 's1', 'autopilot');
-  assert.equal(resolveSupervisorMode(await supervisorStore.load(d, 's1')), 'autopilot');
-
-  await supervisorStore.setAutopilot(d, 's1', false);
-  const reflected = await supervisorStore.load(d, 's1');
-  assert.equal(reflected.mode, 'reflection');
-  assert.equal(reflected.autopilot, false);
-
-  await supervisorStore.setGoal(d, 's1', 'ship it');
-  const goalState = await supervisorStore.load(d, 's1');
-  // Setting a goal forces reflection (the mode that verifies it) — 'goal' is
-  // no longer a mode.
-  assert.equal(goalState.mode, 'reflection');
-  assert.equal(goalState.autopilot, false);
-  assert.equal(goalState.goal?.condition, 'ship it');
-
+  assert.equal(supervisorStore.setMode, undefined);
+  assert.equal(supervisorStore.setAutopilot, undefined);
+  await supervisorStore.setGoal(d, 's1', 'ship it', { acceptanceCriteria: 'Requested tests pass', verification: 'Run requested tests' });
+  const state = await supervisorStore.load(d, 's1');
+  assert.equal(state.mode, undefined);
+  assert.equal(state.autopilot, undefined);
+  assert.equal(state.goal?.source, 'user');
+  assert.equal(state.goal?.acceptanceCriteria, 'Requested tests pass');
+  await assert.rejects(supervisorStore.setGoal(d, 's1', 'agent rewrite', {
+    source: 'agent', replace: true, acceptanceCriteria: 'Rewrite done', verification: 'Inspect rewrite',
+  }), /user.*goal/i);
   await supervisorStore.clearGoal(d, 's1');
-  assert.equal((await supervisorStore.load(d, 's1')).mode, 'reflection');
   assert.equal((await supervisorStore.load(d, 's1')).goal, undefined);
+  assert.equal((await supervisorStore.load(d, 's1')).goalCleared, true);
 });
 
 test('resolveRunawayLimit: sessionOverride > config > env > RUNAWAY_CEILING (50), positive ints honoured verbatim (no clamp), unlimited opt-out', () => {
