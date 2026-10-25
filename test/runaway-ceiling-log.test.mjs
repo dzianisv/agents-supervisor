@@ -124,8 +124,8 @@ describe('Claude Code: hitting the per-turn ceiling writes a runaway_ceiling rec
     const rec = recs[0];
     assert.equal(rec.session, sid);
     assert.equal(rec.reason, 'runaway_ceiling');
-    // Setting a goal now forces reflection (goal is an attribute, not a mode).
-    assert.equal(rec.mode, 'reflection');
+    assert.equal(rec.supervisor, 'goal-based');
+    assert.equal(rec.mode, undefined);
     assert.equal(rec.attempts, 1);
     assert.equal(rec.maxAttempts, 1);
     // NEW: the record names the resolved limit and the tier that set it, so a
@@ -139,6 +139,7 @@ describe('Claude Code: hitting the per-turn ceiling writes a runaway_ceiling rec
   test('a declared `stuck` exit and a ceiling hit are DISTINGUISHABLE in the same log', () => {
     const d = mkcwd();
     const sidStuck = 'ceiling-cc-stuck';
+    goalStore.setGoal(d, sidStuck, 'fix the flaky test');
     const turnsStuck = [
       { type: 'user', message: { role: 'user', content: 'fix the flaky test' } },
       { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'SUPERVISOR_LOOP_EXIT: stuck — judge keeps repeating itself' }] } },
@@ -192,7 +193,14 @@ function createStubClient(sessionId, getMessages) {
   const client = {
     session: {
       create: async () => ({ data: { id: `ses_judge_${sessionId}` } }),
-      messages: async ({ path }) => ({ data: path.id === sessionId ? getMessages() : [] }),
+      messages: async ({ path }) => ({ data: path.id === sessionId ? getMessages() : [
+        { info: { role: 'assistant', id: 'judge_reply', time: { completed: Date.now() } },
+          parts: [{ type: 'text', text: JSON.stringify({
+            status: 'in_progress', confidence: 0.95, stuck: false,
+            remaining_work: ['Test results'], next_steps: ['Run the tests and report results'],
+            needs_user_action: [], evidence: {},
+          }) }] },
+      ] }),
       promptAsync: async ({ path, body }) => {
         promptCalls.push({ sessionId: path.id, body });
         return {};
@@ -209,9 +217,9 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
   beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sup-ceiling-oc-')); });
   afterEach(() => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* */ } });
 
-  test('autopilot capped at maxAttempts=1 logs on the SECOND idle of the same turn', async () => {
+  test('active goal capped at maxAttempts=1 logs on the SECOND idle of the same turn', async () => {
     const SESSION_ID = 'ses_oc_ceiling';
-    goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
+    goalStore.setGoal(tmpDir, SESSION_ID, 'ship the feature and verify tests');
     goalStore.setRetry(tmpDir, SESSION_ID, 1); // runawayLimit = 1
 
     const { client, activePrompts } = createStubClient(SESSION_ID, () => makeMessages('do the thing', 'Working — pass 1.'));
@@ -219,13 +227,15 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
 
     // 1st idle: attempts(0) < max(1) → nudges, attempts becomes 1.
     await plugin.event({ event: { type: 'session.idle', properties: { sessionID: SESSION_ID } } });
-    await new Promise((r) => setTimeout(r, 800));
+    const deadline = Date.now() + 10_000;
+    while (activePrompts().length < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
     assert.equal(activePrompts().length, 1, 'first idle must still nudge — budget not spent yet');
     assert.equal(readLogRecords(tmpDir).length, 0, 'no ceiling record before the budget is actually spent');
 
     // 2nd idle, SAME turn: attempts(1) >= max(1) → ceiling hit.
     await plugin.event({ event: { type: 'session.idle', properties: { sessionID: SESSION_ID } } });
-    await new Promise((r) => setTimeout(r, 800));
+    const capDeadline = Date.now() + 10_000;
+    while (readLogRecords(tmpDir).length < 1 && Date.now() < capDeadline) await new Promise((r) => setTimeout(r, 25));
     assert.equal(activePrompts().length, 1, 'a capped turn must not nudge again');
 
     const recs = readLogRecords(tmpDir);
@@ -233,7 +243,7 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
     const rec = recs[0];
     assert.equal(rec.session, SESSION_ID);
     assert.equal(rec.reason, 'runaway_ceiling');
-    assert.equal(rec.mode, 'autopilot');
+    assert.equal(rec.mode, undefined);
     assert.equal(rec.attempts, 1);
     assert.equal(rec.maxAttempts, 1);
     assert.equal(rec.limit, '1');
@@ -254,7 +264,7 @@ describe('opencode: hitting the per-turn ceiling writes a runaway_ceiling record
     )
 
     // Ceiling hit, via the circuit breaker.
-    goalStore.setMode(tmpDir, SESSION_CEILING, 'autopilot')
+    goalStore.setGoal(tmpDir, SESSION_CEILING, 'ship the feature and verify tests')
     goalStore.setRetry(tmpDir, SESSION_CEILING, 1)
     const { client: clientCeiling } = createStubClient(SESSION_CEILING, () => makeMessages('do it', 'Working — pass 1.'))
     const pluginCeiling = await SupervisorPlugin({ client: clientCeiling, directory: tmpDir })
@@ -287,7 +297,7 @@ describe('source pins: one writer, both call sites', () => {
     const capBlock = ccSrc.slice(ccSrc.indexOf('if (attempts >= runawayLimit) {'), ccSrc.indexOf("msg: 'attempt_cap_reached'"));
     assert.match(capBlock, /appendLoopExitLog\(cwd, \{/);
     assert.match(capBlock, /reason: 'runaway_ceiling'/);
-    const stuckBlock = ccSrc.slice(ccSrc.indexOf('// 4a-0. LOOP EXIT'), ccSrc.indexOf('// 4a. Autopilot fast-path'));
+    const stuckBlock = ccSrc.slice(ccSrc.indexOf('// 4a-0. LOOP EXIT'), ccSrc.indexOf('// 4b. Pre-judge guard'));
     assert.match(stuckBlock, /appendLoopExitLog\(cwd, \{ session: session_id, turnKey, reason, detail, at \}\)/);
     // No hand-rolled fs.mkdirSync/appendFileSync for loop-exit.log left behind.
     assert.equal(/loop-exit\.log[\s\S]{0,120}fs\.appendFileSync/.test(ccSrc), false);
@@ -300,7 +310,7 @@ describe('source pins: one writer, both call sites', () => {
     const capBlock = ocSrc.slice(capStart, ocSrc.indexOf('const context = await buildTaskContext', capStart));
     assert.match(capBlock, /appendLoopExitLog\(directory, \{/);
     assert.match(capBlock, /reason: "runaway_ceiling"/);
-    const stuckBlock = ocSrc.slice(ocSrc.indexOf('const executeSupervisorLoopExit ='), ocSrc.indexOf('// autopilot_exit tool'));
+    const stuckBlock = ocSrc.slice(ocSrc.indexOf('const executeSupervisorLoopExit ='), ocSrc.indexOf('let setSupervisorTool', ocSrc.indexOf('const executeSupervisorLoopExit =')));
     assert.match(stuckBlock, /appendLoopExitLog\(directory, \{ session: sid, turnKey, reason, detail, at \}\)/);
   });
 

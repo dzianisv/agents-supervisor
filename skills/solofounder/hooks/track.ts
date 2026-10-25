@@ -48,7 +48,7 @@ try {
           const branch = git(cwd, "rev-parse --abbrev-ref HEAD");
 
           let goal = "";
-          for (const g of [join(cwd, "goal.md"), join(cwd, ".autopilot", "goal.md")]) {
+          for (const g of [join(cwd, ".agents", "supervisor", "Goal.md"), join(cwd, "goal.md")]) {
             if (existsSync(g)) {
               goal = readFileSync(g, "utf8").slice(0, 600).replace(/\n/g, " ");
               break;

@@ -17,14 +17,24 @@ jobs:
           cache: 'npm'
       - name: Install dependencies
         run: npm ci
-      - name: Unit tests (core + hook + train derivation)
-        run: node --test test/*.test.mjs
+      - name: Install pinned real OpenCode binary
+        run: |
+          npm install --global opencode-ai@1.18.32
+          test "$(opencode --version)" = "1.18.32"
+      - name: Unit tests (E2E excluded)
+        run: npm test
       - name: Claude Code hook e2e (fake judge, no creds)
         run: node test/e2e-cc.mjs
+      - name: Mandatory isolated OpenCode server E2E (sequential, no skips)
+        env:
+          SUPERVISOR_E2E_ALLOW_SKIP: '0'
+        run: npm run test:e2e
       - name: Judge eval (skips without ANTHROPIC creds)
         run: node evals/judge-eval.mjs
       - name: OpenCode plugin syntax check
-        run: node --experimental-strip-types --check opencode/supervisor.ts
+        run: |
+          node --experimental-strip-types --check opencode/supervisor.ts
+          node --experimental-strip-types --check opencode/supervisor-impl.ts
       - name: Privacy guard — no mined data committed
         run: |
           # Convention: evals/<name>.example.jsonl is a small, committed, synthetic

@@ -20,7 +20,7 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 repo="$(git -C "$cwd" config --get remote.origin.url 2>/dev/null || true)"
 branch="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 goal=""
-for g in "$cwd/goal.md" "$cwd/.autopilot/goal.md"; do
+for g in "$cwd/.agents/supervisor/Goal.md" "$cwd/goal.md"; do
   [ -f "$g" ] && { goal="$(head -c 600 "$g" | tr '\n' ' ')"; break; }
 done
 

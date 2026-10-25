@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { loadPatterns, userConfigPath, projectPath } from '../core/patterns.mjs';
 import { CATEGORY_NAMES } from '../core/judge-core.mjs';
 import { injectCategories } from '../core/feedback-core.mjs';
-import { goalStore, resolveSupervisorMode, isStatusDiagramEnabled, goalResumeHintSuffix, describeRunawayLimit, formatRunawayLimit, readConfiguredMaxAttempts, resolveClaudeCodeHardCap } from '../core/goal.mjs';
+import { goalStore, readProjectGoalContract, isStatusDiagramEnabled, goalResumeHintSuffix, describeRunawayLimit, formatRunawayLimit, readConfiguredMaxAttempts, resolveClaudeCodeHardCap } from '../core/goal.mjs';
 import { resolveSessionId, listSessions, sessionStore } from '../core/session-store.mjs';
 
 const cwd = process.cwd();
@@ -29,7 +29,6 @@ console.log();
 
 line('categories', CATEGORY_NAMES(patterns).join(', '));
 line('inject categories', [...injectCategories(patterns)].join(', '));
-line('max inject attempts', patterns?.feedback?.max_inject_attempt ?? 3);
 const meta = patterns?.meta ?? {};
 line('provenance', meta.dataset_size ? `${meta.dataset_size} stops, ${meta.premature_pct}% premature` : '(none)');
 console.log();
@@ -58,12 +57,11 @@ if (allSessions.length > 1) {
   line('sessions in project', `${allSessions.length} (use --session <id> to target one)`);
 }
 
-// Effective supervisor mode (from goal state for current session)
+line('supervisor', 'goal-based');
+// Contract and independent enable axes for the resolved session.
 if (cur) {
   try {
     const goalState = goalStore.load(cwd, cur);
-    const effectiveMode = resolveSupervisorMode(goalState);
-    line('effective mode', effectiveMode);
     // Runaway safety valve actually in effect (retry > config > env > default),
     // reduced to Claude Code's Stop-hook platform cap. Reported honestly: shows
     // `unlimited`, the tier that set it, and whether the platform forced it down
@@ -79,37 +77,54 @@ if (cur) {
       else if (desc.unlimited) valve += ' — no cap; stops only on SUPERVISOR_LOOP_EXIT / no-progress / goal deadline / supervisor off';
       line('runaway valve', valve);
     }
-    // Default-on: absent key reads as 'on'. Toggle with /supervisor:status off.
+    // Default-off; this toggle does not disable goal supervision.
     line('status directive', isStatusDiagramEnabled(goalState) ? 'on' : 'off');
-    // Goal detail — reported HONESTLY as a fact SEPARATE from the mode. A goal
-    // is an orthogonal attribute now (not a mode), so 'effective mode' is only
-    // ever 'autopilot' or 'reflection' and never reveals goal state on its own.
-    // resolveSupervisorMode() ignores goal.status, so a paused or exhausted
-    // goal must be surfaced explicitly here or it becomes a dead end nobody is
-    // told about — see AGENTS.md's goal-resume section.
+    line('autoreview', goalState.autoreview === true ? 'on (OpenCode)' : 'off');
+    line('plainspeak (OpenCode)', goalState.plainspeak === false ? 'off' : 'on');
     if (goalState.goal) {
       const g = goalState.goal;
       line('goal status', g.status);
       line('goal condition', g.condition);
+      line('goal source', g.source ?? 'user');
+      line('acceptance criteria', JSON.stringify(g.acceptanceCriteria ?? []));
+      line('verification', JSON.stringify(g.verification ?? ''));
       line('goal attempts', String(g.attempts));
       if (g.lastReason) line('goal last reason', g.lastReason);
       const hint = goalResumeHintSuffix(g);
       if (hint) console.log(hint.trim());
     } else {
-      line('goal status', '(none)');
+      const project = goalState.goalCleared === true ? null : readProjectGoalContract(cwd);
+      line('goal status', project ? 'active (project fallback)' : '(none — no completion supervision)');
+      if (project) {
+        line('goal condition', project.condition);
+        line('goal source', 'user (project)');
+        line('acceptance criteria', JSON.stringify(project.acceptanceCriteria));
+        line('verification', JSON.stringify(project.verification));
+      }
     }
   } catch {
-    line('effective mode', '(unknown)');
-    line('status directive', 'on (default)');
+    line('goal status', '(unreadable)');
+    line('status directive', 'off (default)');
   }
 } else {
-  line('effective mode', 'reflection (default — no session)');
-  line('status directive', 'on (default — no session)');
+  const project = readProjectGoalContract(cwd);
+  line('goal status', project ? 'project goal available (no session)' : '(none — no completion supervision)');
+  if (project) {
+    line('goal condition', project.condition);
+    line('goal source', 'user (project)');
+    line('acceptance criteria', JSON.stringify(project.acceptanceCriteria));
+    line('verification', JSON.stringify(project.verification));
+  }
+  line('status directive', 'off (default — no session)');
+  const desc = describeRunawayLimit({ config: readConfiguredMaxAttempts(() => {}), hardCap: resolveClaudeCodeHardCap() });
+  line('runaway valve', `${formatRunawayLimit(desc.limit)} injections/turn (tier: ${desc.tier})` +
+    (desc.cappedByPlatform ? ` — reduced from ${desc.unlimited ? 'unlimited' : desc.requested} by Claude Code cap ${desc.hardCap}` : ''));
 }
 
 let disabled = [];
 try { disabled = readFileSync(path.join(stateDir, 'disabled'), 'utf8').split('\n').map((l) => l.trim()).filter(Boolean); } catch { /* none */ }
 line('session disabled?', cur && disabled.includes(cur) ? 'YES (supervisor off for this session)' : 'no');
+line('plainspeak (CC)', process.env.PLAINSPEAK_DISABLED === '1' || existsSync(path.join(cwd, '.plainspeak', 'disabled')) ? 'off' : 'on');
 
 // Judge reachability — written by bin/supervisor-on-stop.mjs on every
 // assessment attempt: 'ok' after a successful judge call (real or fake),

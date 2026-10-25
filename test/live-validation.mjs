@@ -28,6 +28,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, 
 import { join } from "node:path"
 import { execSync } from "node:child_process"
 import { createHash } from "node:crypto"
+import { goalStore } from "../core/goal.mjs"
 import {
   startLiveServer, createSession, sendMessage, getMessages,
   waitForDebug, waitForFixture, settleSupervisor, hasOpencode, REPO_ROOT,
@@ -211,7 +212,7 @@ function buildResponder(hooks = {}) {
       return { text: hooks.selfAssess ? hooks.selfAssess(ctx) : SELF_ASSESS_PROSE }
     }
     if (fullText.includes("DERIVE SUPERVISOR GOAL")) {
-      return { text: JSON.stringify({ goal: "all tests pass", falsifiable: true, rationale: "runnable" }) }
+      return { text: JSON.stringify({ goal: "all tests pass", falsifiable: true, acceptance_criteria: "All requested tests pass", verification: "Run npm test and inspect exit code 0", rationale: "runnable" }) }
     }
     if (fullText.includes("CLASSIFY TASK ROUTING")) return { text: JSON.stringify({ category: "backend" }) }
     if (fullText.includes("REVIEW SUPERVISOR COMPLETION")) return { text: "Review looks good." }
@@ -229,8 +230,15 @@ function buildResponder(hooks = {}) {
     // A real `/supervisor …` slash command: let the shipped fixture's routing
     // table turn it into the tool call the real command template asks for.
     if (/^\/?supervisor\b/i.test(prompt.trim())) return null
-    // Any other tool-enabled turn (most often a supervisor-injected
-    // continuation or status correction). Answer in prose.
+    // Requested work owns a session-only contract before execution.
+    if (/^(add|implement|refactor|fix|wire|cap|now (also |add|write|run))/i.test(prompt.trim()) && ctx.systemText.includes("<!-- supervisor:goal-ownership -->") && !ctx.systemText.includes("## GOAL (mandatory completion requirement)")) {
+      return { tool: "supervisor_goal", args: {
+        condition: prompt.trim(), source: "agent",
+        acceptanceCriteria: "Requested change is implemented and its validation tests pass",
+        verification: "Run the requested tests and report their passing results",
+      } }
+    }
+    // Other tool-enabled turns answer in prose.
     //
     // DELIBERATELY NOT the shipped fixture's fallback, which calls
     // `supervisor_loop_exit` whenever that tool is offered — and it is
@@ -321,6 +329,10 @@ async function scenario1(s) {
   try {
     const session = await createSession(server.baseUrl)
     for (const t of S1_TURNS) {
+      goalStore.setGoal(server.projectDir, session.id, t.user, {
+        acceptanceCriteria: "The requested step is complete with observable evidence",
+        verification: "Inspect the reported artifact and test results",
+      })
       await sendMessage(server.baseUrl, session.id, t.user, 120_000, { model: server.model })
       // Let the supervisor pass for THIS turn finish before sending the next
       // one — see settleSupervisor's docstring for the race it avoids.
@@ -786,6 +798,7 @@ async function scenario7(s) {
   })
   try {
     const session = await createSession(server.baseUrl)
+    goalStore.setStatusDiagram(server.projectDir, session.id, true)
     const before = server.fixture.getRequests().length
     await sendMessage(server.baseUrl, session.id,
       `Add a changelog entry and commit it. ${PROBE}`, 120_000, { model: server.model })
@@ -969,6 +982,8 @@ async function scenario9(s) {
       s.artefact("s9-migrated-state.json", state)
       s.ok("the legacy GOAL survived the migration", state?.goal?.condition === LEGACY_GOAL,
         JSON.stringify(state).slice(0, 400))
+      s.ok("removed execution flags were discarded", state.mode === undefined && state.autopilot === undefined, JSON.stringify(state))
+      s.ok("legacy goals are user-owned", state.goal?.source === "user", JSON.stringify(state.goal))
       s.ok("the legacy retry override survived the migration", state?.maxAttempts === 9,
         JSON.stringify(state).slice(0, 400))
       s.ok("the legacy per-turn attempt counter survived the migration",

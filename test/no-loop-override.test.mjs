@@ -27,6 +27,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { SupervisorPlugin } from "../opencode/supervisor-impl.ts"
 import { statePath, ensureSessionDir, sessionStore } from "../core/session-store.mjs"
+import { goalStore } from "../core/goal.mjs"
 
 const ACTIVE_SESSION_ID = "ses_loopcheck123"
 const EPHEMERAL_PREFIX = "ses_judge_loop_"
@@ -137,7 +138,7 @@ function createMockClient(messages, selfAssessmentResponse) {
   }
 }
 
-describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
+describe("removed mode: a legacy flag cannot supervise without a goal", () => {
   let tmpDir
 
   beforeEach(() => {
@@ -145,9 +146,9 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
     ephemeralCounter = 0
   })
 
-  test("loop-like tool activity (9x identical git status) still produces the calm static nudge, never STOP text", async () => {
+  test("loop-like tool activity without a goal requests no judge and injects nothing", async () => {
     const messages = makeLoopyMessages()
-    const { client, getActiveSessionPrompts } = createMockClient(messages, makeIncompleteAssessment())
+    const { client, getActiveSessionPrompts, getEphemeralPrompts } = createMockClient(messages, makeIncompleteAssessment())
 
     ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
     writeFileSync(
@@ -160,25 +161,18 @@ describe("autopilot: never emits a deterministic STOP/loop verdict", () => {
     await new Promise((r) => setTimeout(r, 300))
 
     const activePrompts = getActiveSessionPrompts()
-    assert.ok(activePrompts.length > 0, "autopilot should have injected a nudge")
-
-    const nudgeText = activePrompts[0]?.body?.parts?.[0]?.text || ""
-    assert.doesNotMatch(nudgeText, /STOP: Planning Loop Detected/)
-    assert.doesNotMatch(nudgeText, /STOP: Action Loop Detected/)
-    assert.doesNotMatch(nudgeText, /\bSTOP\b/)
-    assert.doesNotMatch(nudgeText, /DO NOT:/)
-    assert.doesNotMatch(nudgeText, /Start coding NOW/)
-    assert.match(nudgeText, /Autopilot/)
-    assert.match(nudgeText, /supervisor_loop_exit/)
+    assert.equal(activePrompts.length, 0, "a legacy flag must not activate a judge-less nudge")
+    assert.equal(getEphemeralPrompts().length, 0, "no goal means no completion judge")
   })
 })
 
-describe("reflection: judge verdict is the sole completion/progress authority", () => {
+describe("goal supervisor: judge verdict is the completion/progress authority", () => {
   let tmpDir
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-reflection-"))
+    tmpDir = mkdtempSync(join(tmpdir(), "sup-noloop-goal-"))
     ephemeralCounter = 0
+    goalStore.setGoal(tmpDir, ACTIVE_SESSION_ID, 'Fix auth.ts and run the requested tests')
   })
 
   test("loop-like tool activity + judge says incomplete → calm generic feedback, never a scripted STOP script", async () => {
@@ -232,10 +226,7 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     // loop-like TELEMETRY can override a "complete" verdict. It must not.
     // The status path's own behaviour is covered by the next test.
     ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
-    writeFileSync(
-      statePath(tmpDir, ACTIVE_SESSION_ID),
-      JSON.stringify({ statusDiagram: false })
-    )
+    sessionStore.mutate(tmpDir, ACTIVE_SESSION_ID, (s) => { s.statusDiagram = false })
 
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
@@ -257,7 +248,9 @@ describe("reflection: judge verdict is the sole completion/progress authority", 
     const { client, getActiveSessionPrompts } = createMockClient(messages, makeCompleteAssessment())
 
     // No status.md in tmpDir and the final assistant text has no roadmap
-    // block => non-compliant. statusDiagram is left absent, i.e. default ON.
+    // block => non-compliant. statusDiagram is default OFF, so opt in explicitly.
+    ensureSessionDir(tmpDir, ACTIVE_SESSION_ID)
+    sessionStore.mutate(tmpDir, ACTIVE_SESSION_ID, (s) => { s.statusDiagram = true })
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })
     await plugin.event({ event: { type: "session.idle", properties: { sessionID: ACTIVE_SESSION_ID } } })
     await new Promise((r) => setTimeout(r, 5000))

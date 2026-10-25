@@ -17,7 +17,7 @@ import { goalStore, isStatusDiagramEnabled } from '../core/goal.mjs';
 
 // ---------------------------------------------------------------------------
 // The status/roadmap directive must ride along with EVERY supervisor
-// continuation prompt (autopilot nudge + reflection feedback) so the roadmap
+// goal continuation prompt so the roadmap
 // survives context compaction. These tests pin its content and its position
 // (always last).
 // ---------------------------------------------------------------------------
@@ -219,24 +219,24 @@ test('buildStatusCorrectionMessage is short, scoped, and ends with the directive
 });
 
 // ---------------------------------------------------------------------------
-// Toggle: `statusDiagram` is DEFAULT-ON. Absent key => on. Only explicit
-// false disables. Both runtimes read the same key off the same file.
+// Toggle: `statusDiagram` is DEFAULT-OFF. Absent key => off. Only explicit
+// true (`/supervisor status on`) enables. Both runtimes read the same key off the same file.
 // ---------------------------------------------------------------------------
 
 describe('statusDiagram toggle', () => {
-  test('isStatusDiagramEnabled treats absent/undefined/true as ON', () => {
-    assert.equal(isStatusDiagramEnabled({}), true, 'absent key must default ON');
-    assert.equal(isStatusDiagramEnabled({ statusDiagram: undefined }), true);
-    assert.equal(isStatusDiagramEnabled({ statusDiagram: true }), true);
-    assert.equal(isStatusDiagramEnabled(undefined), true);
-    assert.equal(isStatusDiagramEnabled(null), true);
+  test('isStatusDiagramEnabled treats absent/undefined/false as OFF', () => {
+    assert.equal(isStatusDiagramEnabled({}), false, 'absent key must default OFF');
+    assert.equal(isStatusDiagramEnabled({ statusDiagram: undefined }), false);
+    assert.equal(isStatusDiagramEnabled({ statusDiagram: false }), false);
+    assert.equal(isStatusDiagramEnabled(undefined), false);
+    assert.equal(isStatusDiagramEnabled(null), false);
   });
 
-  test('only an explicit false disables it', () => {
-    assert.equal(isStatusDiagramEnabled({ statusDiagram: false }), false);
-    // Truthiness traps: these are NOT false, so they must stay ON.
-    assert.equal(isStatusDiagramEnabled({ statusDiagram: 0 }), true);
-    assert.equal(isStatusDiagramEnabled({ statusDiagram: '' }), true);
+  test('only an explicit true enables it', () => {
+    assert.equal(isStatusDiagramEnabled({ statusDiagram: true }), true);
+    // Truthiness traps: these are NOT true, so they must stay OFF.
+    assert.equal(isStatusDiagramEnabled({ statusDiagram: 1 }), false);
+    assert.equal(isStatusDiagramEnabled({ statusDiagram: 'on' }), false);
   });
 
   test('setStatusDiagram(false) persists and load() reads it back', (t) => {
@@ -244,8 +244,8 @@ describe('statusDiagram toggle', () => {
     t.after(() => rmSync(cwd, { recursive: true, force: true }));
     const sid = 'ses_statustoggle';
 
-    // Fresh session: nothing on disk, gate reads default-on.
-    assert.equal(isStatusDiagramEnabled(goalStore.load(cwd, sid)), true);
+    // Fresh session: nothing on disk, gate reads default-off.
+    assert.equal(isStatusDiagramEnabled(goalStore.load(cwd, sid)), false);
 
     goalStore.setStatusDiagram(cwd, sid, false);
     assert.equal(goalStore.load(cwd, sid).statusDiagram, false);

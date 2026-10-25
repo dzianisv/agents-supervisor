@@ -3,12 +3,10 @@
  * opencode/supervisor.ts). Used by the Claude Code Stop hook (bin/supervisor-on-stop.mjs)
  * and the CC goal/retry CLI (bin/supervisor-goal.mjs).
  *
- * A "goal" is a user-set condition the agent must demonstrably meet before the
- * supervisor lets it stop. While a goal is active the goal is injected into the
- * judge prompt as a mandatory completion requirement. A goal does NOT raise any
- * per-turn "budget" — the loop stops when the agent declares an exit
- * (supervisor_loop_exit / SUPERVISOR_LOOP_EXIT), and the only numeric bound is
- * the runaway safety valve shared by every mode (see resolveRunawayLimit).
+ * A goal is a completion contract: outcome, acceptance criteria and verification.
+ * Both runtimes check it before accepting completion; no goal means no completion
+ * supervision. An agent's completed signal requests the audit, not an unchecked
+ * exit. Stuck/manual stops and the runaway valve remain safety controls.
  *
  * State: <cwd>/.supervisor/sessions/<sessionId>/state.json (mode 0600) — see
  * core/session-store.mjs, which owns the layout, migration, atomicity and GC.
@@ -25,22 +23,30 @@ import { sessionStore } from './session-store.mjs';
 export { sessionStore } from './session-store.mjs';
 
 // The deadline is a safety backstop against a goal outliving the session that
-// set it — NOT the loop's stop control. The loop stops when the agent declares
-// an exit (supervisor_loop_exit / SUPERVISOR_LOOP_EXIT); the only numeric bound
-// is the runaway safety valve (resolveRunawayLimit), which force-stops the turn
+// set it — NOT the loop's stop control. Completion still requires the goal
+// audit; stuck declarations stand down. The only numeric bound is the
+// runaway safety valve (resolveRunawayLimit), which force-stops the turn
 // after at most that many injections. A short wall-clock ceiling adds nothing
 // but a silent death for any goal a human is still actively working on. It used
 // to be 30 minutes, which killed long-running goals mid-drive with no verdict
 // and no message. 30 days is effectively unbounded for a human-turn-gated loop.
 export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
-// TWO modes only. A goal is no longer a mode — it is an ORTHOGONAL ATTRIBUTE
-// of the session (`state.goal`), enforced in reflection mode and carried as
-// context in autopilot. 'goal' survives ONLY as a deprecated INPUT alias
-// (CLI/tool `mode: 'goal'`) that maps to reflection+goal, and as a persisted
-// value migrated forward at load time (see core/session-store.mjs); it is
-// never a valid stored `state.mode`.
-export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'reflection']);
-export const DEFAULT_SUPERVISOR_MODE = 'reflection';
+// There is one supervisor: an active goal is checked before completion.
+// No goal means no completion supervision. Old mode flags are stripped by
+// session-store on load; there is no judge-less continuation path.
+export const GOAL_OWNERSHIP_MARKER = '<!-- supervisor:goal-ownership -->';
+export const GOAL_OWNERSHIP_DIRECTIVE = `${GOAL_OWNERSHIP_MARKER}
+<goal_ownership>
+Before starting multi-step work the user requested, call supervisor_goal to inspect the current goal. If none exists, infer the requested outcome and declare it with condition, acceptanceCriteria (observable end states), verification (specific commands or observations), and source: "agent" before working. Infer only the user's requested scope; a goal does not grant permission to merge, deploy, delete, or spend money.
+Keep agent-created goals scoped to this session. If the user redirects the work, replace only your own goal with replace: true; preserve user-set goals. Plain questions, one-shot answers, supervisor commands and cancelled work need no goal.
+Work toward every acceptance criterion. Surface concrete evidence in your final report. Call supervisor_loop_exit with reason: "completed" only when all criteria are evidenced; it requests a completion audit, not permission to skip verification. If genuinely stuck, use reason: "stuck" and explain the blocker.
+</goal_ownership>`;
+
+/** Idempotent because OpenCode may transform the system more than once per turn. */
+export function appendGoalOwnershipDirectiveToSystem(system) {
+  if (!Array.isArray(system) || system.some((text) => String(text).includes(GOAL_OWNERSHIP_MARKER))) return;
+  system.push(GOAL_OWNERSHIP_DIRECTIVE);
+}
 // Shared cap on a goal condition's length. Single source of truth for BOTH
 // runtime surfaces: parseSupervisorCommand (CC CLI) and executeSupervisorGoal
 // (OpenCode tool) must truncate to the exact same value before the condition
@@ -73,23 +79,12 @@ const GOAL_CLEAR_ALIASES = new Set(['clear', 'stop', 'off', 'reset', 'none', 'ca
 // condition with no indication that was necessary. `resume`/`unpause` are the
 // explicit recovery verbs; see resumeGoal() below.
 const GOAL_RESUME_ALIASES = new Set(['resume', 'unpause']);
-const SUPERVISOR_MODE_SET = new Set(SUPERVISOR_MODES);
-const AUTOPILOT_COMPAT_ALIASES = new Set(['static', 'reminder', 'auto-reminder']);
+const REMOVED_MODE_COMMANDS = new Set(['autopilot', 'reflection', 'static', 'reminder', 'auto-reminder', 'mode']);
 // Statuses resumeGoal() will revive. 'active' is already running (nothing to
 // resume); 'achieved'/'cleared' are terminal and immediately deleted by
 // clearGoal/retireProjectGoal, so a persisted goal object in either state
 // essentially never exists — but the check stays honest either way.
 const GOAL_RESUMABLE_STATUSES = new Set(['paused', 'exhausted']);
-
-export function resolveSupervisorMode(state = {}) {
-  if (SUPERVISOR_MODE_SET.has(state.mode)) return state.mode;
-  // A persisted legacy `mode:'goal'` (or any unknown value) is NOT a mode any
-  // more — a goal is an attribute. session-store normalises it to 'reflection'
-  // on load, but resolve here too so a raw/un-normalised state still maps
-  // correctly. Autopilot flag wins if set; everything else is reflection.
-  if (state.autopilot === true) return 'autopilot';
-  return DEFAULT_SUPERVISOR_MODE;
-}
 
 /**
  * The runaway safety valve ceiling. This is NOT a budget and NOT a completion
@@ -305,8 +300,7 @@ export function parseSupervisorCommand(name, args) {
     if (lower === 'status') return { kind: 'supervisor-status' };
     if (lower === 'off') return { kind: 'supervisor-off' };
     if (lower === 'on') return { kind: 'supervisor-on' };
-    if (lower === 'autopilot' || AUTOPILOT_COMPAT_ALIASES.has(lower)) return { kind: 'mode-set', mode: 'autopilot' };
-    if (lower === 'reflection') return { kind: 'mode-set', mode: lower };
+    if (REMOVED_MODE_COMMANDS.has(lower)) return { kind: 'mode-removed' };
     // `set-goal` is the canonical name on both runtimes; bare `goal` is kept as
     // a legacy alias only (it was the user-facing name until it collided with
     // Claude Code's native /goal — see .agents/knowledgebase/command-surface.md).
@@ -339,13 +333,7 @@ export function parseSupervisorCommand(name, args) {
     // rather than silently rewriting a number the operator typed (2a).
     return { kind: 'retry-invalid', raw: trimmed };
   }
-  if (name === 'autopilot') {
-    const lower = trimmed.toLowerCase();
-    if (lower === '' || lower === 'on' || lower === 'true' || lower === 'start') return { kind: 'autopilot-on' };
-    if (lower === 'off' || lower === 'false' || lower === 'stop' || lower === 'exit') return { kind: 'autopilot-off' };
-    if (lower === 'status') return { kind: 'autopilot-status' };
-    return { kind: 'autopilot-on' };
-  }
+  if (REMOVED_MODE_COMMANDS.has(name)) return { kind: 'mode-removed' };
   if (name === 'autoreview') {
     const lower = trimmed.toLowerCase();
     if (lower === '' || lower === 'status') return { kind: 'autoreview-status' };
@@ -356,42 +344,36 @@ export function parseSupervisorCommand(name, args) {
   return { kind: 'unknown', name };
 }
 
-/** Prompt fragment marking the goal a MANDATORY completion requirement (or '' if blank). */
-export function buildGoalRequirementSection(condition) {
+/** Shared contract rendered into both judge input and agent continuation context. */
+export function buildGoalRequirementSection(condition, contract = {}) {
   const trimmed = (condition ?? '').trim();
   if (!trimmed) return '';
+  const criteria = String(contract.acceptanceCriteria || trimmed).trim();
+  const verification = String(contract.verification || '').trim();
   return `## GOAL (mandatory completion requirement)
 
-MANDATORY: The following user-set goal condition MUST be demonstrably met before the task can be considered complete:
+MANDATORY: The following goal condition MUST be demonstrably met before the task can be considered complete:
 
   "${trimmed}"
 
-This is an ADDITIONAL requirement on top of the existing workflow gates (tests, build, PR, CI checks) — it does not replace them. The task is NOT complete until this condition is satisfied AND all normal completion criteria are met.
+Acceptance criteria — every criterion must be met:
+${criteria}
+${verification ? `\nVerification — the report must name these checks AND their results:\n${verification}\n` : ''}
+Preserve the user's scope and permissions. Judge completion against this contract and applicable project requirements; do not invent extra deliverables such as a PR, merge or deployment that were not requested.
 
-Evidence rule: a claim that this goal condition is met must be backed by evidence already surfaced in the transcript — commands run and their output, tests actually executed, artefacts produced. A bare assertion that the condition is satisfied does NOT count as evidence.`;
+Evidence rule: use concrete evidence surfaced in the conversation's prose (paths, commands AND results, URLs or artifact IDs). You do not see tool calls or their results independently. Bare assertions do not prove an acceptance criterion. Missing evidence means unverified, not achieved.`;
 }
 
 /**
- * Append an active goal condition to an autopilot continuation nudge as
- * working CONTEXT. Shared by BOTH runtimes (the Claude Code Stop hook and the
- * OpenCode session.idle handler) so the two nudges cannot drift — duplicated
- * prompt logic across the runtimes is this repo's most-repeated bug shape.
- *
- * IMPORTANT: in autopilot the supervisor does NOT run the judge, so this goal
- * is context only — it is never independently verified. (Use reflection mode
- * if you want the goal actually checked.) The nudge presents it as the
- * objective to keep working toward; the "not verified" caveat lives in the
- * user-facing docs, not in the agent-facing nudge.
- *
- * Returns the nudge unchanged when the condition is blank. The appended block
- * carries real body text, so it never turns an otherwise-empty message into a
- * spuriously non-empty one — but the autopilot nudge always has a body anyway
- * and never rides the hasFeedbackBody empty-injection guard.
+ * The contract and applicable instructions define required checks. Legacy task
+ * heuristics must not force an unrelated PR/build/test workflow over that scope.
+ * Keep conversation/routing data, but leave requirement judgment to the contract.
  */
-export function appendGoalContextToNudge(nudge, condition) {
-  const trimmed = (condition ?? '').trim();
-  if (!trimmed) return nudge ?? '';
-  return `${nudge}\n\nKeep working toward the user-set goal for this session:\n\n  "${trimmed}"`;
+export function buildGoalAssessmentContext(context) {
+  if (!context) return context;
+  return { ...context, requiresTests: false, requiresBuild: false, requiresPR: false,
+    requiresCI: false, requiresLocalTests: false, requiresLocalTestsEvidence: false,
+    pushedToDefaultBranch: false };
 }
 
 /**
@@ -467,13 +449,8 @@ export function goalResumeHintSuffix(goal) {
  * next), and restamps lastTurnKey to null so the very next stop treats this
  * as a brand-new turn (same initial value setGoal() uses).
  *
- * Forces mode back to 'reflection' and autopilot off: a resumed goal must be
- * VERIFIED, and only reflection runs the judge. The OpenCode deadline path
- * sets mode:'reflection' on exhaustion already; forcing it here means a
- * resumed goal is always active AND checked, regardless of what mode the
- * session was left in. (There is no 'goal' mode any more — a goal is an
- * attribute keyed off goal.status, so no special mode is needed to make it
- * visible to the runtimes.)
+ * A resumed goal always goes through the completion judge. Obsolete execution
+ * flags and old loop exits are discarded so they cannot bypass that check.
  *
  * If the OLD deadline has already passed, resume extends it by
  * maxDurationMs from now — otherwise the very next stop-hook pass re-triggers
@@ -522,8 +499,9 @@ export function resumeGoal(cwd, sessionId, opts = {}) {
       lastTurnKey: null,
       deadline,
     };
-    state.mode = 'reflection';
-    state.autopilot = false;
+    delete state.mode;
+    delete state.autopilot;
+    delete state.loopExit;
     delete state.attempts;
     outcome = { resumed: true, previousStatus, status: 'active', condition: goal.condition };
     return state;
@@ -531,18 +509,44 @@ export function resumeGoal(cwd, sessionId, opts = {}) {
   return outcome;
 }
 
+/** Compare the audited contract, ignoring progress counters that change mid-turn. */
+export function sameGoalContract(expected, current) {
+  if (!expected || !current) return false;
+  return ['id', 'condition', 'acceptanceCriteria', 'verification', 'source', 'startedAt', 'status']
+    .every((key) => expected[key] === current[key]);
+}
+
 // --- per-session store (sync) ---------------------------------------------
 //
 // The on-disk layer moved to core/session-store.mjs — ONE accessor shared by
 // BOTH runtimes (`goalStore` here, `supervisorStore` in
 // opencode/supervisor-impl.ts). `goalStore` is now a thin behavioural facade
-// over it: this file owns the GOAL semantics (what setGoal/setMode mean),
+// over it: this file owns GOAL semantics (declaration, clear and resume),
 // session-store.mjs owns the layout, migration, atomicity and GC. There is no
 // second implementation of either half.
 //
 // Layout (see session-store.mjs): <cwd>/.supervisor/sessions/<sessionId>/state.json,
 // mode 0600. Legacy <cwd>/.supervisor/goals/<sessionId>.json is read and
 // migrated forward transparently on first load.
+
+function createGoalState(condition, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const source = opts.source ?? 'user';
+  if (!['user', 'agent'].includes(source)) throw new Error('Goal source must be user or agent');
+  const text = String(condition ?? '').trim().slice(0, GOAL_CONDITION_MAX_LEN);
+  if (!text) throw new Error('Goal condition must not be empty');
+  const acceptanceCriteria = String(opts.acceptanceCriteria ?? text).trim().slice(0, GOAL_CONDITION_MAX_LEN);
+  const verification = String(opts.verification ?? '').trim().slice(0, GOAL_CONDITION_MAX_LEN);
+  if (source === 'agent' && (!String(opts.acceptanceCriteria ?? '').trim() || !verification)) {
+    throw new Error('Agent goals require acceptance criteria and verification');
+  }
+  return {
+    id: crypto.randomUUID(), condition: text, acceptanceCriteria, verification, source,
+    status: 'active', attempts: 0, tokenBaseline: opts.tokenBaseline ?? 0,
+    startedAt: now, deadline: now + (opts.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS),
+    lastReason: '', lastTurnKey: null,
+  };
+}
 
 export const goalStore = {
   load(cwd, sessionId) {
@@ -552,57 +556,68 @@ export const goalStore = {
     sessionStore.save(cwd, sessionId, state);
   },
   setGoal(cwd, sessionId, condition, opts = {}) {
-    const now = opts.now ?? Date.now();
-    const maxDurationMs = opts.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS;
+    const goal = createGoalState(condition, opts);
     return sessionStore.mutate(cwd, sessionId, (state) => {
-      state.goal = {
-        condition, status: 'active', attempts: 0,
-        tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
-        // lastTurnKey: fingerprint of the human turn the attempts count belongs
-        // to. null until the first stop observes one — see the per-turn reset in
-        // bin/supervisor-on-stop.mjs.
-        deadline: now + maxDurationMs, lastReason: '', lastTurnKey: null,
-      };
-      // A goal is an ATTRIBUTE, not a mode. Setting one forces REFLECTION
-      // (not the retired 'goal' mode) because a goal is only ever VERIFIED in
-      // reflection — autopilot never runs the judge. Setting a goal is a
-      // strong "I want this checked" signal, so guarantee it is checked rather
-      // than silently leaving an autopilot session where the goal is mere
-      // context. To run autopilot WITH a goal-as-context, set the goal first,
-      // then switch to autopilot (which now KEEPS the goal).
-      state.mode = 'reflection';
-      state.autopilot = false;
+      if (goal.source === 'agent' && !state.goal && !state.goalCleared && readProjectGoalContract(opts.projectDir ?? cwd)) {
+        throw new Error('A user-set project goal is already active; agent declarations cannot shadow it');
+      }
+      if (goal.source === 'agent' && state.goal) {
+        if (state.goal.source !== 'agent') throw new Error('A user-set goal cannot be replaced by the agent');
+        if (!opts.replace) throw new Error('A goal is already set; use replace only when the user redirects your own goal');
+      }
+      state.goal = goal;
+      delete state.mode;
+      delete state.autopilot;
+      delete state.loopExit;
+      delete state.goalCleared;
       return state;
     });
+  },
+  /** Pause only the audited declaration; materialize an unchanged project fallback atomically. */
+  pauseGoal(cwd, sessionId, { expectedGoal, projectGoal, projectDir = cwd, reason = '' } = {}) {
+    let paused = false;
+    const state = sessionStore.mutate(cwd, sessionId, (s) => {
+      if (expectedGoal) {
+        if (!sameGoalContract(expectedGoal, s.goal)) return;
+      } else {
+        if (s.goal || s.goalCleared || !projectGoal || !sameGoalContract(projectGoal, readProjectGoalContract(projectDir))) return;
+        s.goal = createGoalState(projectGoal.condition, projectGoal);
+      }
+      if (s.goal.status !== 'active') return;
+      s.goal = { ...s.goal, status: 'paused', lastReason: withResumeHint(reason || 'agent reported stuck') };
+      paused = true;
+    });
+    return { paused, state };
+  },
+  /** Commit an audit only to its exact declaration, logging BEFORE removing state. */
+  completeGoal(cwd, sessionId, { expectedGoal, projectDir = cwd, reason = '', source = 'supervisor:session-goal-achieved' } = {}) {
+    let achieved = false;
+    const state = sessionStore.mutate(cwd, sessionId, (s) => {
+      if (!sameGoalContract(expectedGoal, s.goal) || s.goal.status !== 'active') return;
+      const goal = s.goal;
+      const logged = goal.source === 'agent'
+        ? recordGoalAchieved(projectDir, { condition: goal.condition, acceptanceCriteria: goal.acceptanceCriteria,
+          verification: goal.verification, goalId: goal.id, goalSource: goal.source, sessionId, source, reason })
+        : retireProjectGoal(projectDir, { condition: goal.condition, contract: goal, sessionId, source, reason }).logged;
+      if (!logged) return;
+      delete s.goal;
+      s.goalCleared = true;
+      achieved = true;
+    });
+    return { achieved, state };
   },
   clearGoal(cwd, sessionId) {
     return sessionStore.mutate(cwd, sessionId, (state) => {
       delete state.goal;
-      state.mode = DEFAULT_SUPERVISOR_MODE;
-      state.autopilot = false;
+      state.goalCleared = true;
+      delete state.mode;
+      delete state.autopilot;
       return state;
     });
   },
   /** See resumeGoal() above — kept as a goalStore method for API parity with setGoal/clearGoal. */
   resumeGoal(cwd, sessionId, opts = {}) {
     return resumeGoal(cwd, sessionId, opts);
-  },
-  setMode(cwd, sessionId, mode) {
-    if (!SUPERVISOR_MODE_SET.has(mode)) throw new Error(`Invalid supervisor mode: ${JSON.stringify(mode)}`);
-    return sessionStore.mutate(cwd, sessionId, (state) => {
-      state.mode = mode;
-      state.autopilot = mode === 'autopilot';
-      // A goal is an ATTRIBUTE, orthogonal to the mode — a mode switch NEVER
-      // drops it. This deletion used to live here (`if (mode !== 'goal')
-      // delete state.goal`) and was the single most dangerous line in the
-      // two-modes refactor: AGENTS.md documents that `delete state.goal` has
-      // silently destroyed users' goals before. A goal now dies ONLY on an
-      // explicit clear (clearGoal) or on achievement-retirement.
-      return state;
-    });
-  },
-  setAutopilot(cwd, sessionId, enabled) {
-    return goalStore.setMode(cwd, sessionId, enabled ? 'autopilot' : DEFAULT_SUPERVISOR_MODE);
   },
   setRetry(cwd, sessionId, n) {
     return sessionStore.mutate(cwd, sessionId, (state) => {
@@ -612,9 +627,8 @@ export const goalStore = {
   },
   /**
    * Mirror of the OpenCode-side supervisorStore.setStatusDiagram so both
-   * runtimes read the same on-disk key. ABSENT MEANS ON — only an explicit
-   * `false` disables the status.md/roadmap directive, so every session
-   * written before this key existed keeps the feature. Read it through
+   * runtimes read the same on-disk key. ABSENT MEANS OFF — only an explicit
+   * `true` enables the status.md/roadmap directive. Read it through
    * isStatusDiagramEnabled(), never as a bare truthiness test.
    */
   setStatusDiagram(cwd, sessionId, enabled) {
@@ -663,11 +677,12 @@ export const goalStore = {
 };
 
 /**
- * Default-on gate for the status directive. `undefined` (never toggled) and
- * `true` both mean on. Shared by both runtimes.
+ * Default-OFF gate for the status directive. Only an explicit
+ * `/supervisor status on` (`statusDiagram: true`) enables it; `undefined`
+ * (never toggled) and `false` both mean off. Shared by both runtimes.
  */
 export function isStatusDiagramEnabled(state) {
-  return state?.statusDiagram !== false;
+  return state?.statusDiagram === true;
 }
 
 /**
@@ -739,8 +754,14 @@ export function extractGoalCondition(content) {
  *
  * Best-effort: never throws. A failure here must not block goal-set.
  */
-export function writeProjectGoal(cwd, condition) {
+export function writeProjectGoal(cwd, condition, contract = {}) {
   const trimmed = (condition ?? '').slice(0, GOAL_CONDITION_MAX_LEN);
+  const acceptanceCriteria = String(contract.acceptanceCriteria ?? '').trim().slice(0, GOAL_CONDITION_MAX_LEN);
+  const verification = String(contract.verification ?? '').trim().slice(0, GOAL_CONDITION_MAX_LEN);
+  const structured = verification || (acceptanceCriteria && acceptanceCriteria !== trimmed);
+  const body = structured
+    ? `## Goal Condition\n${trimmed}\n\n## Acceptance Criteria\n${acceptanceCriteria || trimmed}\n\n## Verification\n${verification}\n`
+    : trimmed;
   const dir = projectGoalDir(cwd);
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -748,14 +769,16 @@ export function writeProjectGoal(cwd, condition) {
     return; // can't even make the dir — give up, best effort
   }
   try {
-    const entry = JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, condition: trimmed }) + '\n';
+    const entry = JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, condition: trimmed,
+      ...(structured ? { acceptanceCriteria: acceptanceCriteria || trimmed, verification } : {}),
+    }) + '\n';
     fs.appendFileSync(path.join(dir, 'goal-history.jsonl'), entry, 'utf8');
   } catch {
     /* history append failed — still attempt the current-pointer write below */
   }
   try {
     const tmp = path.join(dir, `Goal.${process.pid}.${process.hrtime.bigint()}.tmp`);
-    fs.writeFileSync(tmp, trimmed, 'utf8');
+    fs.writeFileSync(tmp, body, 'utf8');
     fs.renameSync(tmp, path.join(dir, 'Goal.md'));
   } catch {
     /* best effort, same failure contract as the code this replaces */
@@ -788,14 +811,26 @@ function resolveExistingProjectGoalPath(cwd) {
  * file wins when both exist. Returns '' when neither file exists, is
  * unreadable, or parses to an empty condition. Never throws.
  */
-export function readProjectGoalCondition(cwd) {
+export function extractGoalContract(content) {
+  const condition = extractGoalCondition(content);
+  if (!condition) return null;
+  const text = String(content).replace(/<!--[\s\S]*?-->/g, '');
+  const section = (name) => text.match(new RegExp(`##\\s+${name}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, 'i'))?.[1]?.trim() || '';
+  return { condition, acceptanceCriteria: section('Acceptance\\s+Criteria') || condition, verification: section('Verification'), source: 'user' };
+}
+
+export function readProjectGoalContract(cwd) {
   const p = resolveExistingProjectGoalPath(cwd);
-  if (!p) return '';
+  if (!p) return null;
   try {
-    return extractGoalCondition(fs.readFileSync(p, 'utf8'));
+    return extractGoalContract(fs.readFileSync(p, 'utf8'));
   } catch {
-    return '';
+    return null;
   }
+}
+
+export function readProjectGoalCondition(cwd) {
+  return readProjectGoalContract(cwd)?.condition || '';
 }
 
 /**
@@ -977,8 +1012,10 @@ ${agentsBlock}
 
 Return JSON only, no prose:
 {
-  "goal": "a single concise, objectively checkable sentence, e.g. 'All tests in test/ pass and a PR is open with green CI'",
+  "goal": "a single concise, objectively checkable sentence, e.g. 'Invalid login input is rejected and valid input signs in'",
   "falsifiable": true or false,
+  "acceptance_criteria": "the observable end states, every one required for completion",
+  "verification": "specific commands or observations and the results that would prove the criteria",
   "rationale": "one sentence explaining why this is falsifiable"
 }
 
@@ -987,9 +1024,14 @@ Rules:
   reading a file, or observing a concrete artifact (tests passing, a PR
   merged, a specific behavior working). Do NOT write a vague aspiration
   ("improve the code", "make it better").
-- If you cannot derive a concrete, falsifiable goal from the context, set
-  "falsifiable": false and leave "goal" as an empty string — do NOT invent one.
-- Keep "goal" under 400 characters.`;
+- Infer only work the user actually requested. A plain question, greeting,
+  one-shot answer, supervisor control command, cancelled task or synthetic
+  continuation is not a new goal. An agent's promise cannot expand the user's scope.
+- Define acceptance criteria and verification BEFORE treating an objective as a goal.
+  Do not invent permission or a requirement to open a PR, merge or deploy.
+- If no unfinished multi-step task has a concrete, falsifiable outcome, set
+  "falsifiable": false and leave "goal" empty — do NOT invent one.
+- Keep "goal" under 400 characters and each contract field under 4000.`;
 }
 
 /**
@@ -1017,8 +1059,12 @@ export function parseDerivedGoalResponse(text) {
   if (condition.length < GOAL_DERIVATION_MIN_LEN) return null;
   if (condition.length > GOAL_CONDITION_MAX_LEN) return null;
   if (containsInjectionArtifact(condition)) return null;
+  const acceptanceCriteria = typeof parsed.acceptance_criteria === 'string' ? parsed.acceptance_criteria.trim() : '';
+  const verification = typeof parsed.verification === 'string' ? parsed.verification.trim() : '';
+  if (!acceptanceCriteria || !verification) return null;
+  if ([acceptanceCriteria, verification].some((text) => text.length > GOAL_CONDITION_MAX_LEN || containsInjectionArtifact(text))) return null;
   const rationale = typeof parsed.rationale === 'string' ? parsed.rationale.trim().slice(0, 500) : '';
-  return { condition, rationale };
+  return { condition, acceptanceCriteria, verification, rationale };
 }
 
 // --- goal retirement (a goal that has been achieved must DIE) --------------
@@ -1093,7 +1139,7 @@ export function readGoalAchievedLog(cwd) {
  * See DELETION SAFETY RULE above. Best-effort: never throws.
  *
  * @param {string} cwd project directory (the SESSION's project, never the server cwd)
- * @param {{ condition: string, sessionId?: string, source?: string, reason?: string }} opts
+ * @param {{ condition: string, contract?: object, sessionId?: string, source?: string, reason?: string }} opts
  * @returns {{ removed: string[], skipped: string[], logged: boolean }}
  */
 export function retireProjectGoal(cwd, opts = {}) {
@@ -1120,12 +1166,16 @@ export function retireProjectGoal(cwd, opts = {}) {
     seen.add(key);
     let onDisk;
     try {
-      onDisk = extractGoalCondition(fs.readFileSync(p, 'utf8'));
+      onDisk = extractGoalContract(fs.readFileSync(p, 'utf8'));
     } catch {
       continue; // unreadable — leave it alone
     }
-    // rule 2: only a file that still holds the judged condition
-    if (onDisk === condition) candidates.push(p);
+    // The same headline with NEW acceptance criteria is a different contract.
+    const judged = opts.contract ?? {};
+    const sameContract = onDisk?.condition === condition
+      && onDisk.acceptanceCriteria === (judged.acceptanceCriteria || condition).trim()
+      && onDisk.verification === (judged.verification || '').trim();
+    if (sameContract) candidates.push(p);
     else result.skipped.push(p);
   }
 
@@ -1134,10 +1184,12 @@ export function retireProjectGoal(cwd, opts = {}) {
     sessionId: opts.sessionId ?? null,
     source: opts.source ?? 'unknown',
     reason: (opts.reason ?? '').slice(0, 500),
+    ...(opts.contract ? { acceptanceCriteria: opts.contract.acceptanceCriteria, verification: opts.contract.verification } : {}),
     removed: candidates,
     skipped: result.skipped,
   });
 
+  if (!result.logged) return result; // no silent deletion when the audit log failed
   for (const p of candidates) {
     try {
       fs.unlinkSync(p);

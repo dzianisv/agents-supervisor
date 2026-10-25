@@ -61,7 +61,12 @@ function createStubClient(getMessages) {
   const client = {
     session: {
       create: async () => ({ data: { id: 'ses_judge_noprogress' } }),
-      messages: async ({ path }) => ({ data: path.id === SESSION_ID ? getMessages() : [] }),
+      messages: async ({ path }) => ({ data: path.id === SESSION_ID ? getMessages() : [
+        { info: { role: 'assistant', id: 'judge_reply', time: { completed: Date.now() } }, parts: [{ type: 'text', text: JSON.stringify({
+          complete: false, severity: 'MEDIUM', feedback: 'The auth fix is still unverified',
+          missing: ['Auth test evidence'], next_actions: ['Run the auth tests'], requires_human_action: false,
+        }) }] },
+      ] }),
       promptAsync: async ({ path, body }) => {
         promptCalls.push({ sessionId: path.id, body: { ...body } });
         return {};
@@ -92,7 +97,7 @@ describe('opencode no-progress gate — repeated identical replies', () => {
   });
 
   test('two identical replies still nudge; the THIRD stands the supervisor down', async () => {
-    goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
+    goalStore.setGoal(tmpDir, SESSION_ID, 'Auth fix passes tests');
     const REPLY = 'Same. Standing by.';
     const { client, activePrompts } = createStubClient(() => makeMessages(REPLY));
     const plugin = await SupervisorPlugin({ client, directory: tmpDir });
@@ -124,13 +129,11 @@ describe('opencode no-progress gate — repeated identical replies', () => {
       'the no-progress gate must not advance the per-turn attempt counter',
     );
 
-    // autopilot must remain armed — the no-progress gate is not a budget
-    // exhaustion, so it must not disarm autopilot the way the ceiling does.
-    assert.equal(goalStore.load(tmpDir, SESSION_ID).autopilot, true);
+    assert.equal(goalStore.load(tmpDir, SESSION_ID).goal?.status, 'active');
   });
 
   test('a different reply in between resets the counter — no false stand-down', async () => {
-    goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
+    goalStore.setGoal(tmpDir, SESSION_ID, 'Auth fix passes tests');
     let reply = 'Working on the auth fix.';
     const { client, activePrompts } = createStubClient(() => makeMessages(reply));
     const plugin = await SupervisorPlugin({ client, directory: tmpDir });
@@ -144,7 +147,7 @@ describe('opencode no-progress gate — repeated identical replies', () => {
   });
 
   test('lastReplyHash / replyRepeatCount persist through the SAME per-session state file as Claude Code', async () => {
-    goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
+    goalStore.setGoal(tmpDir, SESSION_ID, 'Auth fix passes tests');
     const REPLY = 'Same. Standing by.';
     const { client } = createStubClient(() => makeMessages(REPLY));
     const plugin = await SupervisorPlugin({ client, directory: tmpDir });
@@ -165,8 +168,8 @@ describe('opencode no-progress gate — a declared loop exit is never swallowed'
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
-  test('supervisor_loop_exit still suppresses injection even with a repeated final reply on record', async () => {
-    goalStore.setMode(tmpDir, SESSION_ID, 'autopilot');
+  test('stuck still suppresses injection even with a repeated final reply on record', async () => {
+    goalStore.setGoal(tmpDir, SESSION_ID, 'Auth fix passes tests');
     const REPLY = 'Same. Standing by.';
     const { client, activePrompts } = createStubClient(() => makeMessages(REPLY));
     const plugin = await SupervisorPlugin({ client, directory: tmpDir });
@@ -178,7 +181,7 @@ describe('opencode no-progress gate — a declared loop exit is never swallowed'
     assert.equal(activePrompts().length, 2);
 
     // The agent now declares the loop over for this turn.
-    const res = await plugin.tool.supervisor_loop_exit.execute({ reason: 'completed' }, { sessionID: SESSION_ID });
+    const res = await plugin.tool.supervisor_loop_exit.execute({ reason: 'stuck' }, { sessionID: SESSION_ID });
     assert.match(String(res.title), /Supervision loop ended/);
 
     // A THIRD idle (which would ALSO independently satisfy the no-progress
@@ -188,7 +191,7 @@ describe('opencode no-progress gate — a declared loop exit is never swallowed'
     assert.equal(activePrompts().length, 2, 'no injection after a declared exit');
 
     const state = sessionStore.load(tmpDir, SESSION_ID);
-    assert.equal(state.loopExit.reason, 'completed');
+    assert.equal(state.loopExit.reason, 'stuck');
     assert.equal(state.loopExit.turnKey, TURN_ONE);
   });
 

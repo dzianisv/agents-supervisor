@@ -8,8 +8,9 @@ description: Set or check the supervisor retry budget (max continuation attempts
 Control the last-resort runaway safety valve: how many times the supervisor may
 re-prompt the agent inside ONE human turn before it stands down to avoid an
 unbounded loop. This is NOT a budget the agent is meant to spend — the intended
-stop is the agent declaring `supervisor_loop_exit` (OpenCode) / outputting
-`SUPERVISOR_LOOP_EXIT: completed` (Claude Code). The valve only bounds a runaway.
+stop is evidence-based achievement of the active goal. A completed
+`supervisor_loop_exit` (OpenCode) / `SUPERVISOR_LOOP_EXIT: completed` (Claude Code)
+requests that audit; it cannot bypass it. The valve only bounds a runaway.
 
 ## Steps
 
@@ -26,6 +27,6 @@ node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" retry "${ARGUMENTS}"
 - An invalid value (negative, fractional, non-numeric) is rejected with a clear
   message and leaves the current limit unchanged.
 
-Default is 50 (`RUNAWAY_CEILING`), the same in every mode; on Claude Code the
+Default is 50 (`RUNAWAY_CEILING`); on Claude Code the
 resolved limit is reduced to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), and
 `unlimited` cannot be honoured there — the CLI says so. Relay the CLI output.

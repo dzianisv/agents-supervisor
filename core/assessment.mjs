@@ -230,12 +230,14 @@ Return JSON only:
 }`
 }
 
-export function parseSelfAssessmentJson(text) {
+export function parseSelfAssessmentJson(text, { requireStatus = false } = {}) {
   if (typeof text !== 'string') return null
   const jsonMatch = text.match(/\{[\s\S]*\}/)
   if (!jsonMatch) return null
   try {
-    return JSON.parse(jsonMatch[0])
+    const parsed = JSON.parse(jsonMatch[0])
+    if (requireStatus && !['complete', 'in_progress', 'blocked', 'stuck', 'waiting_for_user'].includes(parsed?.status)) return null
+    return parsed
   } catch {
     return null
   }

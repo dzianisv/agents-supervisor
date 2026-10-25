@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { loadRubricMarkdown, loadParsedRubric, formatRubricMarkdown } from '../core/rubric-loader.mjs'
 import { buildSelfAssessmentPrompt, parseRubric, DEFAULT_RUBRIC } from '../core/assessment.mjs'
 import { buildReflectionPrompt } from '../core/reflection-prompt.mjs'
+import { buildGoalRequirementSection } from '../core/goal.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SHIPPED_DEFAULTS_DIR = join(ROOT, '.agents', 'supervisor')
@@ -16,6 +17,24 @@ async function makeTmpDir() {
   await mkdir(dir, { recursive: true })
   return dir
 }
+
+test('custom templates cannot omit the mandatory goal contract or duplicate it', async () => {
+  const dir = await makeTmpDir()
+  const contract = { acceptanceCriteria: 'Both valid and invalid inputs are checked', verification: 'node --test login.mjs returns 2 passing tests' }
+  const section = buildGoalRequirementSection('Login validation works', contract)
+  try {
+    const promptDir = join(dir, '.agents', 'supervisor')
+    await mkdir(promptDir, { recursive: true })
+    for (const template of ['CUSTOM TEMPLATE', 'CUSTOM TEMPLATE\n{{goalSection}}']) {
+      await writeFile(join(promptDir, 'SystemPrompt.md'), template)
+      const prompt = await buildReflectionPrompt({ directory: dir, context: { taskSummary: 'Fix login', conversationChain: 'user: Fix login\nassistant: Done' }, lastAssistantText: 'Done', attemptCount: 1, goalSection: section })
+      assert.ok(prompt.includes(section))
+      assert.equal(prompt.split(section).length - 1, 1)
+      assert.ok(prompt.includes(contract.acceptanceCriteria))
+      assert.ok(prompt.includes(contract.verification))
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
 
 test('loadRubricMarkdown returns null when no .supervisor/rubric.md exists', async () => {
   const dir = await makeTmpDir()

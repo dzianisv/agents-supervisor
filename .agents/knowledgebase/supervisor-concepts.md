@@ -1,64 +1,35 @@
 # Supervisor Concepts
 
-## Classification
+## One goal supervisor
 
-The supervisor classifies stops into categories from the shared pattern set. README lists these categories:
+There are no selectable execution modes. Without an active session or project goal, no completion judge or task continuation runs. Status and plainspeak remain independent features.
 
-- `complete`
-- `waiting_for_user_legitimate`
-- `tool_available_punt`
-- `summary_drift_stop`
-- `genuinely_stuck`
-- `working`
+A goal contains an outcome (`condition`), observable `acceptanceCriteria`, a `verification` plan, provenance (`source: user | agent`), and lifecycle metadata. New declarations have unique IDs so an old audit cannot clear, pause or overwrite a replacement.
 
-Only categories representing actionable unfinished work should produce continuation feedback. Legitimate completion or legitimate user waits are left alone.
+- OpenCode receives an idempotent system directive to declare a goal before requested multi-step work, using `supervisor_goal`. Plain questions and cancelled work need no goal.
+- With no goal, calling that tool without a condition can derive a falsifiable contract from the task context. Invalid derivations set nothing and report failure.
+- Agent goals stay session-only. Agent replacement requires an explicit redirect and cannot overwrite a user goal.
+- Explicit user goals can persist to `.agents/supervisor/Goal.md`, including their criteria and verification. Legacy lower-case files remain readable; inferred goals never create them.
+- Clearing a session goal sets a tombstone, preventing a stale project file from reactivating it.
 
-## Pattern Resolution
+## Completion and stopping
 
-`core/patterns.mjs` deep-merges patterns in this order:
+An active goal is checked against conversation evidence on idle/Stop. The judge reads prose, not raw tool results: reports must name specific commands and results, paths or artifact IDs. A verification plan is not evidence that its checks ran.
 
-1. Shipped defaults: `core/patterns.json`.
-2. User overrides: `~/.config/agents-supervisor/patterns.json`.
-3. Project overrides: `<cwd>/.supervisor/patterns.json`.
+`supervisor_loop_exit` on OpenCode and `SUPERVISOR_LOOP_EXIT: completed` on Claude Code request completion; they cannot bypass an active goal's audit. A `stuck` declaration pauses the exact goal and retains its contract for explicit resume. Genuine human dependencies stand supervision down without claiming achievement.
 
-Arrays and scalars replace wholesale during merge. Objects merge recursively. `/supervisor:train` writes learned patterns outside shipped defaults.
+`goalStore.completeGoal` and `goalStore.pauseGoal` use locked, identity-checked mutations. Achievement is logged before state is cleared. Agent completion cannot delete a project goal, even when its text happens to match.
 
-## Goal Loop
+## Safety valve
 
-> User-facing name is `/supervisor:set-goal` on **both** runtimes. Claude Code has a native `/goal` command a bare-named skill would shadow; OpenCode doesn't, but one name across runtimes beats a per-runtime split (the split silently reappeared once already — see `command-surface.md`). Internal identifiers keep the `goal` name on both surfaces — `core/goal.mjs`, the `goalStore` object, and the `supervisor_goal` tool. NOTE: `goal` is NO LONGER a supervisor mode — a goal is an orthogonal session attribute (`state.goal`) carried by either the `reflection` or `autopilot` mode. The string `'goal'` survives only as a deprecated INPUT alias for `reflection` (kept so stale skills/commands don't hard-error).
+The per-human-turn counter limits supervisor injections, not tool calls. `describeRunawayLimit` resolves retry override > config > environment > default 50. Positive integers are honored; `unlimited`/0 removes the cap on OpenCode. Claude Code reduces it to its platform cap, currently 7, and reports that reduction. Exhausting a turn does not mean the goal is achieved. A deadline can exhaust a goal; resume retains the contract and renews an expired deadline.
 
-- A goal is a user-set completion condition the agent must demonstrably satisfy before the supervisor lets it stop. It is an attribute, not a mode: setting one puts the session in `reflection` (the mode that verifies it). In `reflection` the judge grades against it; in `autopilot` its condition rides along as CONTEXT on the nudge but is NEVER verified (accepted trade-off — autopilot never runs the judge).
-- Goal commands parse through shared logic in `core/goal.mjs` and equivalent OpenCode logic in `opencode/supervisor.ts`.
-- Goal state is stored under `.supervisor/goals/<sessionId>.json` (per-session). A separate project-level goal persists across sessions in `.agents/supervisor/Goal.md` (manually set, takes precedence) or lower-case `.agents/supervisor/goal.md` (see `writeProjectGoal`/`readProjectGoalCondition` in `core/goal.mjs`), with every write also appended to `goal-history.jsonl` so concurrent writers never silently lose a condition.
-- On OpenCode, `/supervisor:set-goal` invoked with no condition and no existing session/project goal makes a bounded LLM call (`deriveGoalWithLLM`/`buildGoalDerivationPrompt` in `core/goal.mjs` + `opencode/supervisor-impl.ts`) to derive a concise, falsifiable goal from the task context, persisting it to `goal.md` only on success (`parseDerivedGoalResponse` requires `falsifiable: true` and rejects prompt-injection artifacts). If derivation fails or is invalid, no default is fabricated — the goal is left unset with an explicit request to set it manually.
-- The attempt counter is a **runaway safety valve**, not a budget the agent is meant to spend: the intended stop is the agent's own `supervisor_loop_exit` / `SUPERVISOR_LOOP_EXIT:` declaration. It defaults to `RUNAWAY_CEILING = 50` — explained + sourced, not folklore. THE UNIT matters: it counts supervisor INJECTIONS (outer-loop re-prompts), and each injection restarts a whole agent turn of dozens of tool calls, so 50 injections ≈ 50 completed agent turns ≈ hundreds-to-thousands of model steps — NOT comparable to a framework's per-run cap (LangChain `max_iterations=15`, OpenAI Agents SDK `max_turns=10`, OpenHands `max_iteration_per_run=500`); measured against those it is one of the most permissive limits in the ecosystem. A 30-day forensic sample shows real legit turns cap at ≤3 injections (p50=3, p99≈3), so 50 ≈ 17× the observed p99 — a backstop set well above reality, not a tuned optimum (see `.scratch/runaway-limit-analysis.md`). It is the SAME in every mode (no per-mode defaults) and fully configurable — `/supervisor:retry N` (session) > `maxAttempts:` in `~/.config/opencode/supervisor.yaml` > `SUPERVISOR_MAX_ATTEMPTS` env > default — where a positive integer is honoured verbatim (no upper clamp) and `unlimited`/`off`/`none`/`0` removes the cap entirely. On Claude Code the resolved limit is reduced to 7 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` minus one), which is surfaced in status + debug when it forces the requested value (esp. `unlimited`) down. Tune it with `/supervisor:retry N`. One function resolves it: `describeRunawayLimit` in `core/goal.mjs` (with `resolveRunawayLimit` as the thin number accessor). The evidence says the RIGHT primary control would be a per-turn cost/token budget (opencode exposes per-message `cost` + `tokens`) — a mechanism change left to the owner, not made here.
-- Goal state can become active, achieved, or exhausted.
-- A goal exhausts when the runaway safety valve or deadline is reached.
-- `buildGoalRequirementSection` injects the goal as a mandatory evidence-backed completion requirement.
+## Patterns and configuration
 
-## Autopilot
+Pattern precedence: shipped `core/patterns.json` → user `~/.config/agents-supervisor/patterns.json` → project `.supervisor/patterns.json`. Training writes local overrides, not shipped defaults.
 
-- Autopilot is available on both Claude Code and OpenCode.
-- In autopilot mode the supervisor skips judge evaluation unconditionally and sends a static, calm nudge on every idle — the fast-path is gated only by `mode === "autopilot"` plus the runaway-valve check, never by any loop check. If a goal is active, its condition is appended to that nudge as context (via `appendGoalContextToNudge`), but autopilot never verifies it.
-- Autopilot stops when the agent declares `supervisor_loop_exit` (OpenCode tool call) / outputs `SUPERVISOR_LOOP_EXIT: completed` (Claude Code sentinel) or the runaway safety valve trips. Those are the ONLY two ways autopilot stops. (`core/loop-exit.mjs` keeps a parse-only legacy alias for stale installed skill copies — not taught here or anywhere else shipped.)
-- Autopilot state uses the same per-session `.supervisor/goals/<sessionId>.json` store.
+Both runtimes use `core/reflection-prompt.mjs` to load project/shipped `SystemPrompt.md`, `Patterns.md` and `User.md`, plus project-only `Goal.md`. The internal module name is not a mode. Project rubric overrides replace the default rubric.
 
-## Tool-Activity Telemetry
+## Privacy
 
-- There is no deterministic repetitive-behavior verdict mechanism in the codebase anymore — the pure functions that used to compute a boolean "read-heavy without progress" / "repeated command" verdict in `core/evaluation.mjs` have been fully removed (two were dead code never called by anything; the remaining one's boolean verdict was never consumed by any caller).
-- What remains is `summarizeToolActivity(messages)` in `core/evaluation.mjs` — a pure, stateless counter that returns only `{ readCount, writeCount, totalTools }` over a bounded, recent slice of tool calls. It makes no judgment and returns no verdict of any kind.
-- `describeToolActivity(stats)` turns those counts into one neutral, factual sentence (e.g. "Recent tool activity (informational only, not a verdict): 9 tool calls — 0 write-type, 9 read-only."). That sentence is threaded through `TaskContext.toolActivityNote` and may enrich the autopilot nudge text and the reflection judge's prompt as non-binding context — it never changes what the nudge says or what the judge/feedback decides.
-- The reflection judge's own verdict (`analysis.severity`/`reason`/`missing`/`nextActions`, or the self-assessment `status`/`confidence`) remains the sole authority for completion/progress feedback text (`core/feedback.mjs`'s `buildEscalatingFeedback`). Tool-activity telemetry cannot flip or replace it.
-
-## Rubric And Prompt Configuration
-
-- OpenCode rubric precedence is project `.supervisor/rubric.md`, then global `~/.config/opencode/supervisor/rubric.md`, then embedded defaults.
-- `opencode/supervisor.ts` supports custom supervisor prompt files such as `.supervisor.md` or `supervisor.md` in the project directory.
-- Tool-provided supervisor guidance can be set through the OpenCode `set_supervisor` tool.
-- Preferred model and routing configuration are read from `~/.config/opencode/supervisor/config.yaml` when present.
-
-## Privacy Boundary
-
-- Training data is mined into `.dataset/`, which is intended to stay private and git-ignored.
-- CI includes a privacy guard to prevent private datasets, transcripts, or non-example JSONL files from being tracked.
-- Learned user-local patterns are not committed upstream by the training flow.
+Machine state lives in `.supervisor/sessions/<full session id>/`. Mined data and transcripts remain gitignored. CI rejects private datasets, transcripts and non-example JSONL files.

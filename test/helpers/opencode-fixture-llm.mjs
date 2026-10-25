@@ -56,15 +56,15 @@ export function parseSupervisorRouting(rawText) {
   if (lower === "status off") return { tool: "supervisor", args: { action: "status off" } }
   if (lower === "on") return { tool: "supervisor", args: { action: "on" } }
   if (lower === "off") return { tool: "supervisor", args: { action: "off" } }
-  if (lower === "reflection") return { tool: "supervisor", args: { mode: "reflection" } }
-  if (lower === "autopilot") return { tool: "supervisor", args: { mode: "autopilot" } }
+  if (lower === "reflection" || lower === "autopilot") return { tool: "supervisor", args: { action: lower } }
   if (lower === "autoreview on") return { tool: "supervisor_autoreview", args: { enabled: true } }
   if (lower === "autoreview off") return { tool: "supervisor_autoreview", args: { enabled: false } }
   if (lower.startsWith("set-goal") || lower.startsWith("goal")) {
     const rest = withoutSlash.slice(lower.startsWith("set-goal") ? 8 : 4).trim()
-    if (rest.toLowerCase() === "clear") return { tool: "supervisor", args: { action: "goal", clear: true } }
-    if (rest === "") return { tool: "supervisor", args: { action: "goal" } }
-    return { tool: "supervisor", args: { action: "goal", condition: rest } }
+    if (rest.toLowerCase() === "clear") return { tool: "supervisor_goal", args: { clear: true, source: "user" } }
+    if (rest.toLowerCase() === "resume") return { tool: "supervisor_goal", args: { resume: true } }
+    if (rest === "") return { tool: "supervisor_goal", args: {} }
+    return { tool: "supervisor_goal", args: { condition: rest, source: "user", acceptanceCriteria: rest, verification: "Run the requested checks and inspect their results." } }
   }
   if (lower.startsWith("retry")) {
     const rest = withoutSlash.slice(5).trim().toLowerCase()
@@ -122,11 +122,12 @@ function collectSystemText(messages) {
  * force an incomplete judge verdict so a continuation is actually injected,
  * or an actionless one so the stand-down guard fires. It runs BEFORE all the
  * default branches below and only takes effect when it returns a non-null
- * value, so passing no options leaves this fixture byte-for-byte the same
+ * value. Async responders can hold a request to exercise real concurrency
+ * races; passing no options keeps the same default response behavior. The
  * deterministic thing test/e2e-opencode.test.mjs has always used.
  *
  * @param {object} [opts]
- * @param {(ctx: {body: object, messages: object[], fullText: string, systemText: string, lastText: string, hasTools: boolean, index: number}) => ({text: string}|{tool: string, args: object}|null|undefined)} [opts.responder]
+ * @param {(ctx: {body: object, messages: object[], fullText: string, systemText: string, lastText: string, hasTools: boolean, index: number}) => ({text: string}|{tool: string, args: object}|null|undefined|Promise<object|null|undefined>)} [opts.responder]
  * @returns {Promise<{ port: number, baseURL: string, getRequests: () => object[], getSystemPrompts: () => string[], close: () => Promise<void> }>}
  */
 export function startFixtureLlmServer(opts = {}) {
@@ -137,7 +138,7 @@ export function startFixtureLlmServer(opts = {}) {
   const server = createServer((req, res) => {
     let body = ""
     req.on("data", (c) => { body += c })
-    req.on("end", () => {
+    req.on("end", async () => {
       counter++
 
       if (req.url === "/v1/models") {
@@ -202,7 +203,7 @@ export function startFixtureLlmServer(opts = {}) {
       if (typeof opts.responder === "function") {
         let decision = null
         try {
-          decision = opts.responder({
+          decision = await opts.responder({
             body: data,
             messages,
             fullText,
@@ -230,7 +231,9 @@ export function startFixtureLlmServer(opts = {}) {
       //    This is what test/e2e-opencode.test.mjs assertions inspect.
       if (last && last.role === "tool") {
         const toolText = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "")
-        finishWithText(toolText || "Done.")
+        finishWithText(fullText.includes("E2E_CONTRACT_WORKFLOW") && toolText.includes("VALIDATION_EXIT=")
+          ? `Ran node --test validation.test.mjs.\n${toolText}`
+          : toolText || "Done.")
         return
       }
 
@@ -249,13 +252,19 @@ export function startFixtureLlmServer(opts = {}) {
       //    direct analytical question, tools or not.
       if (fullText.includes("DERIVE SUPERVISOR GOAL")) {
         finishWithText(JSON.stringify({
-          goal: "All tests in test/ pass and npm test exits with status 0",
+          goal: "Invalid login input is rejected and valid input signs in",
           falsifiable: true,
+          acceptance_criteria: "Invalid login input is rejected; valid login input signs in.",
+          verification: "Run login validation tests and inspect both invalid-input rejection and valid-input success.",
           rationale: "Checkable by running the test suite and inspecting its exit code.",
         }))
         return
       }
-      if (fullText.includes("SELF-ASSESS SUPERVISOR")) {
+      if (fullText.includes("SELF-ASSESS SUPERVISOR") || lastTextContent(messages).trimStart().startsWith("# Reflection Prompt")) {
+        if (fullText.includes("E2E_CONTRACT_WORKFLOW")) {
+          finishWithText("Audit the requested criteria against the evidence in the conversation.")
+          return
+        }
         finishWithText(JSON.stringify({
           task_summary: "Fixture-driven E2E exercise",
           task_type: "other",
@@ -274,6 +283,12 @@ export function startFixtureLlmServer(opts = {}) {
         return
       }
       if (fullText.includes("ANALYZE SUPERVISOR")) {
+        if (fullText.includes("E2E_CONTRACT_WORKFLOW")) {
+          const hasContract = fullText.includes("Acceptance criteria — every criterion must be met:") && fullText.includes("validation.test.mjs passes") && fullText.includes("Verification — the report must name these checks AND their results:")
+          const complete = hasContract && fullText.includes("Ran node --test validation.test.mjs.") && fullText.includes("VALIDATION_EXIT=0") && /pass\s+2/.test(fullText)
+          finishWithText(JSON.stringify({ complete, severity: complete ? "NONE" : "MEDIUM", feedback: complete ? "Reported validation command passed." : "Validation criterion remains unmet.", missing: complete ? [] : ["Passing validation test evidence"], next_actions: complete ? [] : ["Implement validation and run node --test validation.test.mjs; report results"], requires_human_action: false }))
+          return
+        }
         finishWithText(JSON.stringify({
           complete: true,
           severity: "NONE",
@@ -309,12 +324,31 @@ export function startFixtureLlmServer(opts = {}) {
         return
       }
 
-      // Any other tool-enabled turn (e.g. an autopilot continuation nudge
-      // injected into the active session by the supervisor's own
-      // session.idle handler) — never fabricate an unrelated tool call.
-      // Prefer a graceful, deterministic exit: call supervisor_loop_exit if
-      // it's offered (ends the autopilot loop immediately); otherwise just
-      // stop. The predecessor `autopilot_exit` tool no longer exists.
+      if (lastText.includes("E2E_NO_GOAL")) {
+        finishWithText("No goal declared.")
+        return
+      }
+      if (lastText.includes("E2E_REPLACE_USER")) {
+        callTool("supervisor_goal", { condition: "Agent attempted replacement", acceptanceCriteria: "Replacement exists", verification: "Inspect state", source: "agent", replace: true })
+        return
+      }
+      if (fullText.includes("E2E_CONTRACT_WORKFLOW") && lastText.includes("## Supervisor:")) {
+        const repair = fullText.includes("VALIDATION_EXIT=1")
+          ? "cat > validation.mjs <<'JS'\nexport function isValid(value) { return typeof value === 'string' && value.trim().length > 0; }\nJS\n"
+          : ""
+        callTool("bash", { command: `${repair}node --test validation.test.mjs; rc=$?; printf '\\nVALIDATION_EXIT=%s\\n' \"$rc\"; exit \"$rc\"`, description: "Implement and check validation" })
+        return
+      }
+      // Model-owned contracts are declared before requested multi-step work.
+      if (/^(implement|add|refactor|build|fix)\b/i.test(lastText.trim()) && !lastText.includes("E2E_DERIVE_ONLY") && collectSystemText(messages).includes("<!-- supervisor:goal-ownership -->") && !collectSystemText(messages).includes("## GOAL (mandatory completion requirement)")) {
+        callTool("supervisor_goal", {
+          condition: lastText.trim(), source: "agent",
+          acceptanceCriteria: lastText.includes("E2E_CONTRACT_WORKFLOW") ? "isValid rejects empty input, accepts non-empty strings, and validation.test.mjs passes." : "Requested change is implemented and validation tests pass.",
+          verification: lastText.includes("E2E_CONTRACT_WORKFLOW") ? "Run node --test validation.test.mjs; report the exit code and test totals." : "Inspect the requested change and run validation tests; record passing results.",
+        })
+        return
+      }
+      // Completion is only a report: an active contract still needs its judge.
       const hasExitTool = (data.tools || []).some((t) => t?.function?.name === "supervisor_loop_exit")
       if (hasExitTool) {
         callTool("supervisor_loop_exit", { reason: "completed" })

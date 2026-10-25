@@ -12,10 +12,16 @@ Report the current supervisor state for this project.
 1. Run the status reporter:
 
    ```bash
-   node "${CLAUDE_PLUGIN_ROOT}/bin/status.mjs"
+   node "${CLAUDE_PLUGIN_ROOT}/bin/supervisor.mjs" status "${ARGUMENTS}"
    ```
 
+   Empty arguments inspect state. `on`/`off` toggles only the default-off
+   status/roadmap directive, never the supervisor enable axis.
+
    It prints:
+   - Goal-based supervisor, actual goal status/condition/source, acceptance
+     criteria, verification and paused/exhausted resume hint.
+   - Effective runaway valve, tier, and Claude Code platform reduction.
    - Effective pattern source layering (shipped ⊕ user-config ⊕ project) and which
      files are actually present.
    - Category list + inject categories currently in effect.

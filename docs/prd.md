@@ -1,122 +1,85 @@
-# Product Requirements Document: agents-supervisor
+# Product requirements — goal-only supervisor (0.4.0)
 
-**Version:** 1.0  
-**Date:** 2026-06-27  
-**Status:** Active
+## Outcome
 
----
+Multi-step coding work continues toward a clear acceptance contract, without
+judging plain questions or running an unconditional continuation loop. One
+supervisor serves OpenCode and Claude Code using shared completion logic.
 
-## Problem
+## User journey
 
-AI coding agents stop prematurely. The agent reaches a point where it could continue — a tool is available, the task is incomplete, the next step is obvious — but it exits the session anyway. The user returns to a half-finished state and must manually re-engage. This is friction that degrades trust in agentic workflows and wastes developer time.
+1. OpenCode: the agent declares a session-only `supervisor_goal` before
+   multi-step work, with condition, observable acceptance criteria, verification
+   plan and `source=agent`. Plain questions need no goal. The same contract fields
+   are returned by existing no-condition LLM derivation.
+2. A user may set an explicit goal on either runtime using
+   `/supervisor:set-goal <condition>`. CC relies on this explicit CLI path, not
+   model goal tools. CLI contract options can specify criteria and verification.
+3. Status shows the actual contract and ownership, lifecycle, retry valve,
+   enable flags, and paused/exhausted recovery instruction.
+4. Idle/Stop with an active session or inherited project goal audits evidence.
+   Unmet criteria with actionable next steps can trigger continuation. With no
+   active goal, no completion judge or completion continuation runs.
+5. Completion requires the existing judge's evidence check. A completed tool or
+   CC sentinel is a request for audit, not a bypass. Stuck can pause with forensic
+   logging; clear and resume remain explicit user controls.
 
-The inverse problem also exists: agents loop. They re-read the same files, re-plan, or repeat the same commands without making progress.
+## Required behavior
 
----
+- No public mode split, retired execution tools, skills or mode commands. Stale
+  CLI invocations explain removal and fail nonzero without mutating state.
+- Goal fields: condition, acceptanceCriteria, verification, source (`user|agent`)
+  plus lifecycle fields. Missing legacy source means user. Strip obsolete
+  execution keys during state load without losing goals or flags.
+- User-owned goals cannot be overwritten by automatic inference or an agent.
+  Replacing an agent-owned goal requires explicit replacement and user redirection.
+- Agent goals are session-only. Explicit user goals may retain project condition
+  persistence including criteria and verification. Session goal overrides
+  `Goal.md`, which overrides legacy `goal.md`.
+  Paused/inactive or cleared sessions must not reactivate stale project fallback.
+- Achievement retires only the matching full project contract after writing
+  durable evidence; concurrent replacements survive. Judge errors never achieve
+  goals and fail open without blocking the runtime.
+- Preserve enable axes, controls, root/child/judge/plan/abort gates, per-human-turn
+  counter, no-progress and content-free-feedback guards, roadmap toggles, and
+  independent plainspeak. No goal does not mean no style checking.
+- Retry is a runaway valve, not completion: default 50 injections, configurable
+  session > file > env > default; CC effective hard cap normally 7, reported
+  honestly even when unlimited was requested. Spending it leaves the goal active
+  for the next human turn. Stuck/deadline preserve a resumable contract.
+- A goal never grants permission for merges, destructive actions, deployment or
+  spending. Continuation must never change the active session model.
 
-## Goals
+## Evidence and limitations
 
-1. Detect when an agent stops prematurely and re-inject a continuation prompt automatically.
-2. Detect when an agent is looping and surface or interrupt the loop.
-3. Support a user-defined completion condition (goal mode) that keeps the agent running until evidence of completion is found.
-4. Support an autopilot mode (OpenCode) that removes judge latency entirely and re-prompts on every idle.
-5. Run on both Claude Code (hook-based) and OpenCode (plugin-based) without diverging classification logic.
-6. Allow users to improve classification accuracy by training against their own session data — locally, never upstream.
+The judge reads conversation prose and concrete reported specifics: paths,
+commands **and results**, URLs, artifact IDs. It does not independently inspect
+raw tool evidence. Every acceptance criterion must be evidenced; bare assertions
+are insufficient. This release adds no deterministic test-command gate and does
+not guarantee correct verification or eventual completion. Automatic declaration
+is prompt-directed and may be omitted by a model; status and real-server state
+assertions are necessary to observe it.
 
----
+## Distribution and privacy
 
-## Non-Goals
+Both Claude marketplace and OpenCode plugin installs remain supported. Bump
+plugin/marketplace to 0.4.0. Remove retired source skill/command files; manual
+command copies require explicit documented cleanup where no installer exists.
+Training writes local learned patterns, never commits data upstream. Selected
+conversation prose reaches the configured judge LLM; transcripts, credentials,
+mined datasets and real trace artifacts never belong in git.
 
-- Does not store training data, transcripts, or raw JSONL in git.
-- Does not require internet access (all classification logic runs locally; the judge LLM call is the only external dependency).
-- Does not set `.model` in continuation prompts — this would violate OpenCode's session model contract.
-- Does not replace the agent's core reasoning or generate task-specific guidance; it only decides whether to re-prompt.
-- Does not guarantee task completion — the agent declares the loop over (`supervisor_loop_exit` / `SUPERVISOR_LOOP_EXIT:`); a runaway safety valve only bounds a loop that never declares an exit.
+## Validation and success
 
----
+Run unit/integration tests, CC hook E2E, then real isolated OpenCode E2E
+**sequentially**. **Never commit/push plugin changes without the passing mandatory
+real-server E2E gate.** No missing-binary skip counts as success. Verify supported
+commands/tools register and removed ones do not. Inspect actual contracts and
+captured judge input, not prose claims alone. Capture a real-model task trace
+when routing/credentials allow, outside git.
 
-## Users
-
-**Primary:** Individual developers using Claude Code or OpenCode for multi-step coding tasks who want the agent to self-recover from premature stops without manual intervention.
-
-**Secondary:** Teams that want consistent agent behavior across projects via shared pattern overrides committed to a repo.
-
----
-
-## Core Requirements
-
-### Stop Classification
-
-The classifier assigns every agent stop to one of six categories:
-
-| Category | Triggers re-prompt |
-|---|---|
-| `complete` | No |
-| `waiting_for_user_legitimate` | No |
-| `working` | No |
-| `tool_available_punt` | Yes |
-| `summary_drift_stop` | Yes |
-| `genuinely_stuck` | Yes |
-
-Classification uses `core/patterns.json` (anti-pattern rules mined from real sessions). The pattern stack is three-layer: shipped defaults → user-local overrides → project overrides.
-
-### Re-Prompting
-
-When a stop triggers re-prompting, the supervisor injects a continuation message into the active session. The injection is runtime-specific:
-- **Claude Code:** via the `Stop` hook in `bin/supervisor-on-stop.mjs`, which reads the session transcript and calls back into the session.
-- **OpenCode:** via `opencode/supervisor.ts`, which listens to `session.idle` events and calls the OpenCode `session.chat` API.
-
-Both runtimes share classification logic from the core module.
-
-### Goal Mode
-
-User sets a completion condition: `/supervisor:set-goal <natural-language condition>`. The supervisor evaluates each stop against the condition (via LLM judge). Re-prompting continues until the condition is evidenced in the session or the retry budget exhausts. Goal state persists across stops within the session.
-
-### Autopilot Mode (OpenCode only)
-
-`/supervisor autopilot` skips judge evaluation. The supervisor re-prompts on every idle event until the agent emits a recognized done signal or the budget exhausts. Intended for fully unattended runs.
-
-### Tool-Activity Telemetry
-
-A bounded, non-binding counter (`summarizeToolActivity` in `core/evaluation.mjs`) tallies read vs. write tool calls in recent turns and produces a factual, informational-only note (`describeToolActivity`). This note may enrich the autopilot nudge text and the reflection judge's prompt as contextual telemetry, but it never itself decides completion/progress or emits a stop verdict — the reflection judge's own verdict remains the sole authority for that.
-
-### Trainer
-
-`/supervisor:train` (both runtimes) mines the user's local session history, derives updated anti-pattern weights, and writes to a user-local patterns file. Never writes to the shipped `core/patterns.json` or any git-tracked path.
-
-### Privacy Guard
-
-CI enforces that no training data, transcripts, or raw JSONL is committed. This is a hard boundary — not advisory.
-
-### Install Paths
-
-Both marketplace install (URL-based) and local install (file path) must work for each runtime.
-
----
-
-## Quality Attributes
-
-- **Latency:** Classification and re-prompt injection must complete within the hook timeout window of the respective runtime. No blocking I/O on the critical path beyond the LLM judge call.
-- **Reliability:** A crash in the supervisor must not crash the agent session. The hook/plugin must fail open (agent stops normally if supervisor errors).
-- **Privacy:** Zero session data leaves the machine unless the user explicitly invokes the judge LLM. Training data never reaches git.
-- **Portability:** Core classification logic (`core/patterns.json` + shared engine) must work identically on both runtimes with no runtime-specific forks.
-- **Configurability:** Pattern overrides at user and project scope must not require modifying shipped files.
-
----
-
-## Success Metrics
-
-- Premature stops that would have required manual re-engagement are detected and re-prompted automatically, reducing user interruptions.
-- False positive rate (re-prompting on legitimate stops) stays low enough that users do not disable the plugin.
-- Trainer workflow produces measurably improved classification accuracy on the user's own session corpus.
-- No training data or transcripts appear in git history (enforced by CI, not convention).
-
----
-
-## Out of Scope
-
-- GUI or dashboard for session monitoring.
-- Cross-machine sync of training data or pattern overrides.
-- Support for runtimes other than Claude Code and OpenCode.
-- Agent-authored task planning, subtask decomposition, or tool orchestration.
-- Alerting, notifications, or integrations with external services.
+Success means fewer manual re-engagements for contracted work without imposing
+completion work on no-goal turns, preserving all termination/scope safeguards,
+and observing evidence checks before retirement. Perfect verification, a new
+scheduler/store, autonomous permissions, cost-budget controls, and new runtime
+support are out of scope.

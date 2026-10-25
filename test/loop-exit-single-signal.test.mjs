@@ -97,18 +97,16 @@ describe('shipped text teaches exactly one loop-exit signal', () => {
     assertNoBannedPhrase(readIfExists('docs/tdd.md'), 'docs/tdd.md')
   })
 
-  test('bin/supervisor.mjs (autopilot toast/CLI text)', () => {
+  test('bin/supervisor.mjs (CLI text)', () => {
     assertNoBannedPhrase(readIfExists('bin/supervisor.mjs'), 'bin/supervisor.mjs')
   })
 
-  test('bin/supervisor-on-stop.mjs (the autopilot nudge string)', () => {
+  test('CC runtime uses the shared sentinel parser and has no unverified nudge path', () => {
     const text = readIfExists('bin/supervisor-on-stop.mjs')
-    // AUTOPILOT_EXIT may appear in a code COMMENT describing the retired
-    // signal, but must never appear inside the actual nudge STRING sent to
-    // the agent. Isolate the nudge literal and check it in isolation.
-    const nudgeMatch = /const baseNudge = `[\s\S]*?`;/.exec(text)
-    assert.ok(nudgeMatch, 'could not locate the autopilot baseNudge template literal')
-    assertNoBannedPhrase(nudgeMatch[0], 'bin/supervisor-on-stop.mjs baseNudge')
+    assert.ok(text, 'CC entry point must exist')
+    assert.match(text, /parseLoopExitSentinel\(ctx\.final_assistant_text\)/)
+    assertNoBannedPhrase(text, 'bin/supervisor-on-stop.mjs')
+    assert.doesNotMatch(text, /const baseNudge\s*=/, 'removed judge-less nudge must not survive')
   })
 
   test('opencode/supervisor-impl.ts (tool descriptions and toggle-response strings)', () => {
