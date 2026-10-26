@@ -82,4 +82,45 @@ Success means fewer manual re-engagements for contracted work without imposing
 completion work on no-goal turns, preserving all termination/scope safeguards,
 and observing evidence checks before retirement. Perfect verification, a new
 scheduler/store, autonomous permissions, cost-budget controls, and new runtime
-support are out of scope.
+support are out of scope for 0.4.0.
+
+## During-work focus checks and native Pi support — locally verified, delivery pending <!-- issue #72 -->
+
+### User and usage
+
+- Developer whose agent substitutes a convenient subtask or wrong target for the
+  requested outcome during a long task.
+- Load the native Pi extension explicitly; assign the task once. The existing
+  goal contract preserves the original operator request and acceptance criteria.
+- Before proposed tools run, the supervisor checks their relation to that request.
+  Clear drift is blocked with one concrete correction. Necessary prerequisites
+  and authorized temporary work remain possible without replacing the mission.
+- At settlement, the same supervisor audits completion. A ticket, an old tenant,
+  an existing account or missing observations cannot substitute for the requested
+  outcome. Unknown evidence stays unknown.
+
+### Acceptance criteria
+
+- [x] A real Pi run/replay blocks the wrong action before its observable effect,
+  recovers the original task and produces its independently checked result.
+- [x] Legitimate prerequisites, explicit redirection and authorized temporary work
+  are permitted; status questions do not replace or restart the task.
+- [x] The request survives compaction/resume. Branch changes, aborts and newer user
+  instructions invalidate old decisions; foreign/delegated sessions are not adopted.
+- [x] Missing/ambiguous judgments return control visibly rather than certify
+  alignment, completion or a weaker replacement goal. No unlimited retry loop.
+- [x] Decisions, latency and added model usage are observable without logging
+  credentials or committing private conversation traces.
+- [x] Existing unit, Claude Code and mandatory real OpenCode suites remain green.
+
+### Boundaries
+
+Pi is the first mid-work adapter; OpenCode/Claude Code keep their existing
+completion behavior. Reuse the existing goal, session store and completion
+helpers. No second scheduler, observer fleet, model router, KPI service, AgentPod
+operations, global configuration changes or consumer-Muse-style security boundary.
+The guard is fallible workflow assistance, not a sandbox or a proof of delivery.
+One bounded model check per proposed tool batch adds cost and latency; nested or
+changed calls need their own decision. Implementation and selected-profile local
+validation are complete; PR/CI and merge authorization remain separate.
+See [validation evidence and limits](focus-validation.md).

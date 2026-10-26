@@ -13,6 +13,7 @@ Run sequentially, never concurrently:
 ```sh
 npm test
 node test/e2e-cc.mjs
+npm run test:pi
 export PATH="$HOME/.opencode/bin:$PATH"
 node --experimental-strip-types --test test/e2e-opencode.test.mjs
 ```
@@ -29,6 +30,8 @@ script with a fake judge by default; `SUPERVISOR_CC_LIVE=1` enables real calls.
 
 - `opencode/supervisor.ts` loads `opencode/supervisor-impl.ts`.
 - `bin/supervisor-on-stop.mjs` is the CC stdin → stdout adapter.
+- `pi/supervisor.ts` is the explicitly loaded native Pi adapter; `core/focus*.mjs`
+  adds session-only focus policy/metadata to the same canonical store.
 - `core/goal.mjs`, `core/reflection-prompt.mjs`, assessment/evaluation/feedback,
   task context, transcript, no-progress and loop-exit modules are shared logic.
 - `bin/supervisor.mjs` dispatches the explicit CC goal CLI; `bin/status.mjs`
@@ -69,7 +72,7 @@ mark achievement. Stuck may still pause and return control.
 - **No model switching:** continuation `client.session.promptAsync` must never
   contain `.model`. Judge sessions can use configured routing or the current
   session's model fallback; do not change the active agent's model.
-- Judge evidence is alternating user/assistant **prose**, not raw tool calls,
+- Completion-judge evidence is alternating user/assistant **prose**, not raw tool calls,
   command logs, results, or derived tool signals. Preserve `buildConversationChain`
   ordering, budgets and explicit truncation markers. Evidence is reported paths,
   URLs, commands **and results**, not “done.” Do not claim independent/perfect
@@ -91,6 +94,21 @@ mark achievement. Stuck may still pause and return control.
 - Skip supervisor and foreign Stop-hook feedback as human input (`isMeta`,
   `Stop hook feedback:` and shared non-human helpers); they must not become
   task context, goal seeds, or new human turns.
+
+## Native Pi focus boundary
+
+Supported: Pi 1.2.0, one trusted owner, supervisor as FIRST input observer and no
+later argument mutators. This is workflow assistance, not a hostile-host fence.
+Focus checks use exact proposed arguments plus bounded tool observations; this
+is distinct from the unchanged prose-only completion audit. Current model/auth,
+30s/2,000 output-token bounds; unknown/error holds visibly, never permits work.
+Revoke prepared native permissions on input/goal/branch changes. Keep completion
+candidates memory-only until matching `agent_settled(aborted:false)`. Later
+permissions require active ancestry; adoption retains active restrictions, not
+abandoned permissions. Never auto-replay a cancelled native queued input.
+`npm run test:pi` proves native wiring; `npm run test:pi:live` separately requires
+real focus decisions/recovery and independent sandbox effects. Preserve every
+attempt privately; deterministic providers do not prove semantic reliability.
 
 ## Counters and no-progress
 
