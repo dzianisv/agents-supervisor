@@ -25,6 +25,8 @@ jobs:
         run: npm test
       - name: Claude Code hook e2e (fake judge, no creds)
         run: node test/e2e-cc.mjs
+      - name: Mandatory native Pi E2E (local fixture provider, no credentials)
+        run: npm run test:pi
       - name: Mandatory isolated OpenCode server E2E (sequential, no skips)
         env:
           SUPERVISOR_E2E_ALLOW_SKIP: '0'
@@ -35,6 +37,11 @@ jobs:
         run: |
           node --experimental-strip-types --check opencode/supervisor.ts
           node --experimental-strip-types --check opencode/supervisor-impl.ts
+      - name: Pi extension syntax check
+        run: |
+          for file in pi/*.ts; do
+            node --experimental-strip-types --check "$file"
+          done
       - name: Privacy guard — no mined data committed
         run: |
           # Convention: evals/<name>.example.jsonl is a small, committed, synthetic

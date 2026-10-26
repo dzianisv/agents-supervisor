@@ -1,8 +1,9 @@
 # agents-supervisor
 
-Goal-based completion supervision for **OpenCode** and **Claude Code**. One
+Goal-based supervision for **OpenCode**, **Claude Code**, and **Pi**. One
 supervisor, no selectable execution modes. An active goal tells the judge what
-must be finished; unmet requirements can trigger a continuation.
+must be finished; unmet requirements can trigger a continuation. Pi also checks
+proposed tool actions against the original request before they execute.
 
 **No active session or project goal means no completion judge and no completion
 continuation.** Plainspeak is a separate, independently gated style feature.
@@ -34,9 +35,52 @@ For a local clone use `file:///absolute/path/to/agents-supervisor/opencode/super
 Restart OpenCode to load the plugin. Remove that entry to disable the plugin.
 The real-server CI gate uses OpenCode **1.18.32**.
 
+### Pi (native extension)
+
+Use Pi **1.2.0** with an explicit extension path; no global installation is needed:
+
+```sh
+pi --no-extensions -e /absolute/path/to/agents-supervisor/pi/supervisor.ts
+```
+
+The supported profile has one trusted native owner: load the supervisor before
+any input transformer/consumer, with no later tool-argument-mutating handlers.
+Earlier hidden transformations and arbitrary extension I/O cannot be fenced.
+This is workflow assistance, **not a security sandbox**.
+
+Pi exposes `supervisor_goal`, `supervisor_loop_exit`, and `/supervisor`:
+`status`, `set-goal TEXT`, `clear`, `resume`, `on`, `off`, `retry N`, and
+`adopt <active-user-entry-id>`. Agent declarations are validated against the
+operator request and stay session-only. Explicit Pi goals also stay session-only
+unless a JSON `set-goal` includes `persist:true`. JSON accepts only `condition`,
+`acceptanceCriteria`, `verification`, and boolean `persist`; put task constraints
+in those contract fields. An inherited project goal or uncorrelated branch needs
+explicit adoption; historical authority is not guessed. If the previous original
+is a command receipt or is missing, restate the full contract with `set-goal`
+rather than silently dropping its scope through adoption.
+
+With an anchored goal, Pi checks each proposed tool batch using the current
+session model/auth; changed or nested calls need another check. Clear drift is
+blocked with a correction. Uncertainty, malformed output, errors and timeouts
+hold the work and return control without marking completion. Each check is
+bounded to **30 seconds / 2,000 output tokens**; declaration and completion
+audits add calls too. Added usage/latency is journaled in the session verdicts;
+native totals can omit settlement usage, and unavailable cost is not zero.
+
+Status-only questions do not restart work. Legitimate prerequisites and explicitly
+authorized detours retain the original task. Goal declaration/replacement and
+sibling work must be separate batches. Cancelling prepared work may leave a
+native queued input awaiting **explicit resume**; the extension never replays it.
+Print mode explains holds/redirects on stderr; an intentional abort exits nonzero.
+Completion is committed only at a matching, non-aborted native settlement.
+Navigating away from accepted later instructions requires explicit re-adoption:
+active restrictions survive adoption; abandoned permissions do not.
+Pi does not install the separate CC/OpenCode plainspeak hooks or status-file
+checkpoint enforcement; its status toggle controls continuation feedback.
+
 ## Start with a completion contract
 
-### OpenCode: the agent declares the goal
+### OpenCode and Pi: the agent declares the goal
 
 Ask for multi-step work normally, for example:
 
@@ -86,7 +130,7 @@ goal by inferring one in CC.
 
 ## Commands
 
-Both runtimes support:
+OpenCode and Claude Code support:
 
 | Command | Effect |
 |---|---|
@@ -119,8 +163,10 @@ tool calls or independent tool results. It can be mistaken; this release does
 - CC completion signal: `SUPERVISOR_LOOP_EXIT: completed`, alone on its own line.
 
 With an active goal, either signal requests the evidence audit; it cannot bypass
-it or mark the goal achieved. A failed/unreachable judge fails open without
-marking achievement. No active goal requires no completion audit.
+it or mark the goal achieved. On OpenCode/CC, a failed/unreachable judge fails
+open without marking achievement. Pi instead holds on audit uncertainty; its
+`supervisor_loop_exit` also requests an audit, never direct retirement. No active
+goal requires no completion audit.
 
 The `stuck` reason remains an escape hatch: it pauses the contract, keeps it
 visible for explicit resume, and appends forensic evidence to
@@ -130,12 +176,13 @@ unchanged replies can also stand supervision down without pretending success.
 
 ## Lifecycle and safety
 
-Session goals override project goals. Explicit user goals also save their
+Session goals override project goals. OpenCode/CC explicit user goals also save their
 **contract** to `.agents/supervisor/Goal.md` for future sessions, including
 separate acceptance criteria and verification when supplied. `Goal.md` wins over the legacy
 lower-case `goal.md`. Agent-owned contracts are session-only. Paused or cleared
-session goals never silently reactivate through a project fallback. Clearing a
-session does not delete another session's shared project configuration.
+session goals never silently reactivate through a project fallback. Pi persists
+a user contract only with explicit JSON `persist:true`; its default is session-only.
+Clearing a session does not delete another session's shared project configuration.
 
 Achievement retires only a project file still matching the judged condition,
 with an audit record in `.supervisor/goal-achieved.log` before deletion. A paused
@@ -227,6 +274,7 @@ Run these **sequentially**, not in parallel:
 ```sh
 npm test
 node test/e2e-cc.mjs
+npm run test:pi
 export PATH="$HOME/.opencode/bin:$PATH"
 node --experimental-strip-types --test test/e2e-opencode.test.mjs
 ```
@@ -240,8 +288,12 @@ it includes E2E and launches it concurrently with unit files.
 Syntax checks: `node --experimental-strip-types --check opencode/supervisor.ts`
 and the same command for `opencode/supervisor-impl.ts`. `npm run test:cc` is the
 real CC hook entry point with a fake judge by default, not a live `claude -p`
-session. Set `SUPERVISOR_CC_LIVE=1` for real judge calls. Optional:
-`npm run eval`, `npm run eval:plainspeak` (synthetic cases by default).
+session. Set `SUPERVISOR_CC_LIVE=1` for real judge calls. `npm run test:pi` runs
+sequential native lifecycle/tool/CLI/TUI tests with deterministic providers; those
+prove wiring, not semantic reliability. `npm run test:pi:live` separately runs
+real-model sandbox trials, with forced proposals labeled as replays and private
+evidence outside git. Optional: `npm run eval`, `npm run eval:plainspeak`
+(synthetic cases by default).
 
 ## License
 
