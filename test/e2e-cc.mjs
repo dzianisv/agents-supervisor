@@ -1,0 +1,443 @@
+#!/usr/bin/env node
+/**
+ * e2e-cc.mjs — end-to-end test of the Claude Code Stop hook (bin/supervisor-on-stop.mjs).
+ *
+ * Exercises the REAL hook entry point exactly as Claude Code invokes it: a Stop
+ * payload on stdin, a real transcript jsonl on disk, and the hook's stdout
+ * decision contract. Deterministic by default via SUPERVISOR_FAKE_JUDGE; set
+ * SUPERVISOR_CC_LIVE=1 to classify with the real judge LLM (needs Claude Code
+ * OAuth or ANTHROPIC_API_KEY).
+ *
+ * Run: node test/e2e-cc.mjs   (also `npm run test:cc`)
+ */
+
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { sessionStore } from '../core/session-store.mjs';
+import { goalStore, readGoalAchievedLog, resolveClaudeCodeHardCap } from '../core/goal.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HOOK = path.join(HERE, '..', 'bin', 'supervisor-on-stop.mjs');
+const LIVE = process.env.SUPERVISOR_CC_LIVE === '1';
+
+let pass = 0;
+let fail = 0;
+function check(name, fn) {
+  try {
+    fn();
+    console.log(`✔ ${name}`);
+    pass++;
+  } catch (e) {
+    console.error(`✖ ${name}\n  ${e.message}`);
+    fail++;
+  }
+}
+
+function mkSession(turns) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sup-e2e-'));
+  const tp = path.join(dir, 'transcript.jsonl');
+  fs.writeFileSync(tp, turns.map((t) => JSON.stringify(t)).join('\n'));
+  return { dir, tp };
+}
+
+/** Invoke the hook as CC does: payload on stdin → returns {code, stdout, verdict}. */
+function runHook(payload, env = {}) {
+  const r = spawnSync('node', [HOOK], {
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  });
+  const verdict = sessionStore.lastVerdict(payload.cwd, payload.session_id);
+  return { code: r.status, stdout: (r.stdout || '').trim(), verdict };
+}
+
+const driftTurns = [
+  { type: 'user', message: { role: 'user', content: 'add a /health endpoint and verify it' } },
+  { type: 'assistant', message: { role: 'assistant', content: [
+    { type: 'tool_use', name: 'Edit', input: {} },
+    { type: 'text', text: 'I added the route to server.js. Next step: run the tests to verify it.' },
+  ] } },
+];
+
+const completeTurns = [
+  { type: 'user', message: { role: 'user', content: 'what is 2+2?' } },
+  { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '4.' }] } },
+];
+
+const fakeEnv = (cat) => (LIVE ? {} : { SUPERVISOR_FAKE_JUDGE: `${cat}:0.95` });
+
+check('summary_drift_stop → injects {decision:block} + writes verdict', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  goalStore.setGoal(dir, 'e2e-drift', 'health endpoint implemented and tested');
+  const payload = { session_id: 'e2e-drift', cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block');
+  assert.match(out.reason, /run the full test suite|run required verification|next concrete tool action/i);
+  assert.ok(verdict && verdict.injected === true, 'verdict.injected should be true');
+});
+
+check('plain question without goal → no judge, no inject, clean exit', () => {
+  const { dir, tp } = mkSession(completeTurns);
+  const payload = { session_id: 'e2e-done', cwd: dir, transcript_path: tp,
+    last_assistant_message: '4.' };
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('complete'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict, null);
+  assert.equal(fs.existsSync(path.join(dir, '.supervisor', 'health.json')), false);
+});
+
+check('stop_hook_active alone no longer suppresses supervision (per-turn counter is the gate)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  goalStore.setGoal(dir, 'e2e-loop', 'health endpoint implemented and tested');
+  const payload = { session_id: 'e2e-loop', cwd: dir, transcript_path: tp,
+    stop_hook_active: true, last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block', 'the second Stop of a blocked chain must still be supervised');
+});
+
+check('per-turn injection cap: attempts at cap for the same turn → no inject', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const stateDir = path.join(dir, '.supervisor');
+  fs.mkdirSync(stateDir, { recursive: true });
+  goalStore.setGoal(dir, 'e2e-cap', 'health endpoint implemented and tested');
+  sessionStore.writeAttempts(dir, 'e2e-cap', 7, driftTurns[0].message.content);
+  const payload = { session_id: 'e2e-cap', cwd: dir, transcript_path: tp,
+    stop_hook_active: true, last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'at the per-turn cap the hook must stand down');
+});
+
+check('new user turn resets the budget: stale turn_key at cap → still injects', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const stateDir = path.join(dir, '.supervisor');
+  fs.mkdirSync(stateDir, { recursive: true });
+  goalStore.setGoal(dir, 'e2e-reset', 'health endpoint implemented and tested');
+  sessionStore.writeAttempts(dir, 'e2e-reset', 7, 'a previous, different user turn');
+  const payload = { session_id: 'e2e-reset', cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block', 'a new real user message must reset the per-turn budget');
+});
+
+check('parse failure (fail-open) → no inject, no verdict written', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  goalStore.setGoal(dir, 'e2e-parse-fail', 'health endpoint implemented and tested');
+  const payload = { session_id: 'e2e-parse-fail', cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { code, stdout, verdict } = runHook(payload, LIVE ? {} : { SUPERVISOR_FAKE_JUDGE: 'PARSE_ERROR' });
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'a garbled judge response must never inject');
+  assert.equal(verdict, null, 'fail-open exits before any verdict is written');
+});
+
+check('permission-seeking question cannot bypass an active goal audit', () => {
+  const questionTurns = [
+    { type: 'user', message: { role: 'user', content: 'add a /health endpoint and verify it' } },
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'Edit', input: {} },
+      { type: 'text', text: 'I added the route. Should I run the requested tests?' },
+    ] } },
+  ];
+  const { dir, tp } = mkSession(questionTurns);
+  goalStore.setGoal(dir, 'e2e-trailing-q', 'health endpoint implemented and tested');
+  const payload = { session_id: 'e2e-trailing-q', cwd: dir, transcript_path: tp,
+    last_assistant_message: questionTurns[1].message.content[1].text };
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('summary_drift_stop'));
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(stdout).decision, 'block', 'a question mark does not satisfy requested verification');
+  assert.equal(verdict.injected, true, 'the active goal audit must run');
+});
+
+check('genuine human-only dependency stands down without marking the goal achieved', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-human-only';
+  goalStore.setGoal(dir, sid, 'Deploy only after the user grants production access');
+  const { code, stdout, verdict } = runHook({ session_id: sid, cwd: dir, transcript_path: tp,
+    last_assistant_message: 'Production authorization is missing. Can you grant the required permission?' }, fakeEnv('waiting_for_user_legitimate'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict.injected, false);
+  assert.equal(goalStore.load(dir, sid).goal.status, 'active');
+});
+
+// Vary the assistant's final text per iteration. A real budget exercise looks
+// like this: the agent IS pushed and DOES say something new each time, it just
+// never finishes. Replaying one byte-identical reply would instead exercise the
+// no-progress gate (see below), which is a different mechanism and would cap
+// this at NO_PROGRESS_REPEAT_THRESHOLD injections regardless of the budget.
+function driftTurnsWithText(text) {
+  return [
+    driftTurns[0],
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'Edit', input: {} },
+      { type: 'text', text },
+    ] } },
+  ];
+}
+
+// The counter is now a RUNAWAY CIRCUIT BREAKER (core/goal.mjs RUNAWAY_CEILING
+// = 50), not the intended stop — the agent ends the loop with the loop-exit
+// sentinel (covered below). So this case pins the breaker with an EXPLICIT
+// budget instead of relying on the old default of 3.
+check('attempt cap → stops injecting after max attempts', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-cap';
+  goalStore.setGoal(dir, sid, 'health endpoint implemented and tested');
+  goalStore.setRetry(dir, sid, 3);
+  let blocks = 0;
+  for (let i = 0; i < 5; i++) {
+    const text = `I added the route to server.js (pass ${i}). Next step: run the tests to verify it.`;
+    fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+    const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+    if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
+  }
+  assert.equal(blocks, 3, `expected 3 injects (max), got ${blocks}`);
+});
+
+check('no-progress gate → 8 identical replies stand down on the 3rd', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-no-progress';
+  goalStore.setGoal(dir, sid, 'health endpoint implemented and tested');
+  // Big budget so the ONLY thing that can stop this loop is the gate.
+  goalStore.setRetry(dir, sid, 16);
+  const text = 'Same. Standing by.';
+  fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+  const decisions = [];
+  for (let i = 0; i < 8; i++) {
+    const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+    decisions.push(!!(stdout && JSON.parse(stdout).decision === 'block'));
+  }
+  // reply 1: no prior hash → inject. reply 2: repeat 1 (< threshold) → inject.
+  // reply 3 onward: repeat >= 2 → stand down, forever.
+  assert.deepEqual(decisions.slice(0, 2), [true, true], 'first repeat must still be pushed');
+  assert.deepEqual(decisions.slice(2), [false, false, false, false, false, false],
+    'from the 3rd identical reply on, the gate must stand down every time');
+});
+
+// ── Goal loop (Claude Code side) ──────────────────────────────────────────
+
+check('goal active + judge complete → goal achieved, no inject', () => {
+  const { dir, tp } = mkSession(completeTurns);
+  const sid = 'e2e-goal-done';
+  goalStore.setGoal(dir, sid, 'the answer is given');
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: '4.' };
+  const { code, stdout, verdict } = runHook(payload, fakeEnv('complete'));
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'no inject when goal achieved');
+  assert.equal(verdict?.goal, 'achieved');
+  // An achieved goal must DIE, not linger as status:'achieved'. Leaving it in
+  // the session store kept mode/goal bookkeeping alive for a condition that
+  // was already satisfied, and the project file resurrected it in the next
+  // session. The session goal is therefore cleared outright.
+  assert.equal(goalStore.load(dir, sid).goal, undefined, 'session goal must be cleared, not left as achieved');
+  // Clearing it must never be silent: the achievement is recorded durably in
+  // .supervisor/goal-achieved.log BEFORE anything is removed.
+  const log = readGoalAchievedLog(dir);
+  assert.ok(
+    log.some((r) => r.condition === 'the answer is given'),
+    `achievement must be recorded durably. goal-achieved.log was:\n${JSON.stringify(log)}`
+  );
+});
+
+check('goal active + premature stop → goal-continue inject (mentions goal)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-goal-cont';
+  goalStore.setGoal(dir, sid, 'all tests pass');
+  const payload = { session_id: sid, cwd: dir, transcript_path: tp,
+    last_assistant_message: driftTurns[1].message.content[1].text };
+  const { stdout, verdict } = runHook(payload, fakeEnv('summary_drift_stop'));
+  const out = JSON.parse(stdout);
+  assert.equal(out.decision, 'block');
+  assert.match(out.reason, /Goal not yet met: "all tests pass"/);
+  assert.equal(verdict?.goal, 'continue');
+});
+
+check('default runaway limit allows a goal loop to inject well past 3 (a 4th time)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-goal-budget';
+  goalStore.setGoal(dir, sid, 'keep going');
+  let blocks = 0;
+  for (let i = 0; i < 4; i++) {
+    // The agent must MOVE between pushes. One human message → one turn key, so
+    // varying only the assistant text keeps this inside a single turn (what the
+    // runaway limit is scoped to) while modelling an agent that answers each
+    // injection. Replaying one frozen reply is the stuck-agent scenario the
+    // no-progress gate exists to stop — covered by its own case above.
+    const text = `I added the route to server.js. Next step ${i + 1}: run the tests to verify it.`;
+    fs.writeFileSync(tp, [
+      driftTurns[0],
+      { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'tool_use', name: 'Edit', input: {} },
+        { type: 'text', text },
+      ] } },
+    ].map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+    const { stdout } = runHook(payload, fakeEnv('summary_drift_stop'));
+    if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
+  }
+  // The shared runaway ceiling is clamped to CC's HARD_CAP=7, so four
+  // injections are within the effective valve.
+  assert.equal(blocks, 4, `default runaway limit should allow >3 injects, got ${blocks}`);
+});
+
+check('retry unlimited on Claude Code is CLAMPED to the platform cap and SAYS so (never silently pretends)', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  const sid = 'e2e-unlimited-cc';
+  goalStore.setGoal(dir, sid, 'keep going');       // a goal so the loop keeps pushing
+  goalStore.setRetry(dir, sid, 'unlimited');        // operator explicitly asks for NO cap
+  const cap = resolveClaudeCodeHardCap();           // 7 = CLAUDE_CODE_STOP_HOOK_BLOCK_CAP - 1
+  let blocks = 0;
+  for (let i = 0; i < cap + 2; i++) {               // drive PAST the cap in one turn
+    const text = `Working, step ${i + 1}. Next: run the tests to verify it.`;
+    fs.writeFileSync(tp, [
+      driftTurns[0],
+      { type: 'assistant', message: { role: 'assistant', content: [
+        { type: 'tool_use', name: 'Edit', input: {} },
+        { type: 'text', text },
+      ] } },
+    ].map((t) => JSON.stringify(t)).join('\n'));
+    const payload = { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text };
+    const { stdout } = runHook(payload, { ...fakeEnv('summary_drift_stop'), SUPERVISOR_DEBUG: '1' });
+    if (stdout && JSON.parse(stdout).decision === 'block') blocks++;
+  }
+  // Claude Code physically cannot honour `unlimited` — the Stop hook is capped
+  // by the platform — so the loop still stops at HARD_CAP, NOT forever.
+  assert.equal(blocks, cap, `unlimited must still be clamped to the CC platform cap ${cap}, got ${blocks}`);
+  // The ceiling record names the resolved limit, the tier that set it, and that
+  // the platform forced the requested `unlimited` down — surfaced, not silent.
+  const recs = fs.readFileSync(path.join(dir, '.supervisor', 'loop-exit.log'), 'utf8')
+    .trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const ceiling = recs.find((r) => r.reason === 'runaway_ceiling');
+  assert.ok(ceiling, 'a runaway_ceiling record must be written when the platform cap is hit');
+  assert.equal(ceiling.maxAttempts, cap);
+  assert.equal(ceiling.limit, String(cap));
+  assert.equal(ceiling.limitTier, 'retry');
+  assert.equal(ceiling.requested, 'unlimited');
+  assert.equal(ceiling.cappedByPlatform, true);
+  assert.equal(ceiling.platformHardCap, cap);
+  // The debug log states the cap explicitly, naming Claude Code as its source.
+  const debug = fs.readFileSync(path.join(dir, '.supervisor', 'debug.log'), 'utf8');
+  assert.match(debug, /runaway_limit_platform_capped/);
+  assert.match(debug, /Claude Code caps the Stop hook/);
+});
+
+// ── Loop exit sentinel (the CC mirror of the supervisor_loop_exit tool) ────
+
+/** driftTurns with a custom assistant text — the sentinel rides in the reply. */
+function sentinelSession(text) {
+  const { dir, tp } = mkSession(driftTurns);
+  fs.writeFileSync(tp, driftTurnsWithText(text).map((t) => JSON.stringify(t)).join('\n'));
+  return { dir, tp, text };
+}
+
+check('completed without goal → no judge and no completion verdict', () => {
+  const { dir, tp, text } = sentinelSession('Done.\nSUPERVISOR_LOOP_EXIT: completed');
+  const sid = 'e2e-loopexit-done';
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '', 'the sentinel must stand the supervisor down, not block');
+  assert.equal(verdict, null);
+  assert.equal(fs.existsSync(path.join(dir, '.supervisor', 'health.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, '.supervisor', 'loop-exit.log')), false,
+    'completed must NOT write the doom-loop log');
+});
+
+check('completed sentinel with an unmet goal still runs the evidence audit and continues', () => {
+  const { dir, tp, text } = sentinelSession('All set.\nSUPERVISOR_LOOP_EXIT: completed');
+  const sid = 'e2e-loopexit-unverified';
+  goalStore.setGoal(dir, sid, 'health endpoint verified', {
+    acceptanceCriteria: 'success and failure tests pass', verification: 'npm test: report count and result',
+  });
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(stdout).decision, 'block');
+  assert.equal(verdict?.goal, 'continue');
+  assert.equal(goalStore.load(dir, sid).goal.status, 'active');
+  assert.equal(fs.existsSync(path.join(dir, '.supervisor', 'health.json')), true);
+});
+
+check('completed sentinel with judge-confirmed evidence retires the goal', () => {
+  const { dir, tp, text } = sentinelSession('npm test: 42 passed, zero failures.\nSUPERVISOR_LOOP_EXIT: completed');
+  const sid = 'e2e-loopexit-verified';
+  goalStore.setGoal(dir, sid, 'all tests pass');
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('complete'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict?.goal, 'achieved');
+  assert.equal(goalStore.load(dir, sid).goal, undefined);
+});
+
+check('loop-exit sentinel (stuck) → pauses the goal, KEEPS it, writes .supervisor/loop-exit.log', () => {
+  const { dir, tp, text } = sentinelSession('Blocked.\nSUPERVISOR_LOOP_EXIT: stuck — the supervisor keeps demanding a merged PR');
+  const sid = 'e2e-loopexit-stuck';
+  goalStore.setGoal(dir, sid, 'all tests pass');
+  const { code, stdout, verdict } = runHook(
+    { session_id: sid, cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, '');
+  assert.equal(verdict?.loop_exit, 'stuck');
+  const goal = goalStore.load(dir, sid).goal;
+  assert.ok(goal, 'the goal must NOT be deleted by a loop exit');
+  assert.equal(goal.condition, 'all tests pass', 'the condition must be retained');
+  assert.equal(goal.status, 'paused');
+  const logPath = path.join(dir, '.supervisor', 'loop-exit.log');
+  assert.ok(fs.existsSync(logPath), 'stuck must leave forensic evidence');
+  const rec = JSON.parse(fs.readFileSync(logPath, 'utf8').trim().split('\n').pop());
+  assert.equal(rec.session, sid);
+  assert.equal(rec.reason, 'stuck');
+  assert.match(rec.detail, /merged PR/);
+});
+
+check('loop-exit sentinel mentioned mid-sentence does NOT stand the supervisor down', () => {
+  const text = 'I will output SUPERVISOR_LOOP_EXIT: completed once the tests pass. Next step: run them.';
+  const { dir, tp } = sentinelSession(text);
+  goalStore.setGoal(dir, 'e2e-loopexit-inline', 'health endpoint implemented and tested');
+  const { stdout } = runHook(
+    { session_id: 'e2e-loopexit-inline', cwd: dir, transcript_path: tp, last_assistant_message: text },
+    fakeEnv('summary_drift_stop'),
+  );
+  assert.equal(JSON.parse(stdout).decision, 'block', 'a passing mention must not end the loop');
+});
+
+check('CC-rendered feedback names the SENTINEL, never the tool', () => {
+  const { dir, tp } = mkSession(driftTurns);
+  goalStore.setGoal(dir, 'e2e-hint', 'health endpoint implemented and tested');
+  const { stdout } = runHook(
+    { session_id: 'e2e-hint', cwd: dir, transcript_path: tp,
+      last_assistant_message: driftTurns[1].message.content[1].text },
+    fakeEnv('summary_drift_stop'),
+  );
+  const reason = JSON.parse(stdout).reason;
+  assert.match(reason, /SUPERVISOR_LOOP_EXIT: completed/);
+  assert.doesNotMatch(reason, /supervisor_loop_exit tool/,
+    'Claude Code has no tool registry — naming the tool is a dead instruction');
+});
+
+console.log(`\n${pass} passed, ${fail} failed${LIVE ? ' (LIVE judge)' : ' (fake judge)'}`);
+process.exit(fail === 0 ? 0 : 1);

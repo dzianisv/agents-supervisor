@@ -1,0 +1,7 @@
+pr|stage|result|duration_s|timestamp|notes
+14|review|READY|285|2026-06-18T23:32:29Z|Root cause fixed, CI green, regression tests included
+14|merge|success|5|2026-06-18T23:32:29Z|squash merged
+16|review|READY|289|2026-06-18T23:32:29Z|Unification complete, CI green, 155 tests pass
+16|fix|success|120|2026-06-18T23:32:29Z|Rebased after PR14 merge, resolved 2 conflicts
+16|merge|success|5|2026-06-18T23:32:29Z|squash merged
+main|ci-watch|success|17|2026-06-18T23:32:29Z|CI green on main after both merges

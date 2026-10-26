@@ -1,0 +1,76 @@
+{
+  "status": "selected-regression-screen-passed",
+  "baseCommit": "2c6ae425c7f7af1af220c17ca286e82ebb56c5c8",
+  "sourceFingerprint": "f6a6fd7dafed580a590cb35c6dd4879c3bbe6e4261910c4286811d00023280ae",
+  "productionFingerprint": "ec61ae60a7b0e37317a479f153c9b90e4a8577c23b4384ce7880d2f0534263de",
+  "finalProductionFingerprint": "6786857961875782aeefec327b0300314b3465ecb50daaf5b75fd8e9dc5baf00",
+  "nonsemanticNormalizationAfterValidation": {
+    "file": "pi/settlement.ts",
+    "change": "Removed one blank EOF line; trimEnd equivalence asserted and original snapshot preserved privately",
+    "before": "5015d2565106f8d762b94d077bbcb1a926fda07beb7a0f1233513187f0f3365b",
+    "after": "dcf7f9ee60c2debc1511376a2e9e3807d457a56eed5716f13552d16493f375e2"
+  },
+  "node": "v26.0.0",
+  "piSdk": "1.2.0",
+  "sdkDependencies": {
+    "agentCore": "1.4.0",
+    "piAi": "1.4.0"
+  },
+  "bundledCliSeparatelyExercised": true,
+  "underlyingModel": "openai-codex/gpt-6.1-sol",
+  "regressions": {
+    "unit": 974,
+    "piNative": 137,
+    "piStrictParser": 68,
+    "claudeCodeHook": 20,
+    "isolatedOpenCode": 24,
+    "skipped": 0
+  },
+  "live": {
+    "runs": 19,
+    "replayedActionCases": 10,
+    "replayedEvidenceCases": 6,
+    "ordinaryPositiveCases": 3,
+    "goalsIndependentlyCheckedAndRetired": 19,
+    "independentHelperTests": 6,
+    "positiveSupervisorBlocks": 0,
+    "ordinaryToolErrors": 2,
+    "extraAuditCalls": 317,
+    "realWorkerCalls": 247,
+    "extraTokens": 646066,
+    "auditLatencyMs": {
+      "min": 1732,
+      "median": 2920,
+      "max": 23325,
+      "total": 1078683
+    },
+    "extraDollarCost": "unknown; subscription catalog zero is not proof of free usage",
+    "manualWorkerRecoveryInterventions": 0,
+    "printFilePathExercised": true
+  },
+  "independentReview": {
+    "anonymizedRuns": 19,
+    "requiredBinaryChecks": 114,
+    "passed": 114,
+    "failed": 0,
+    "limitation": "Provider/producer labels withheld; visible controller mechanism cannot be fully blinded. No statistical reliability or production/security claim."
+  },
+  "priorAttempts": {
+    "nonpassingOrCancelledScreens": 6,
+    "retainedPrivately": true,
+    "reasons": [
+      "misattributed diagnostic transport",
+      "provider timeout safely held",
+      "over-strict concise declaration rejection",
+      "64-character reference transcription error safely held",
+      "legitimate redaction verification falsely held",
+      "explicit parent cancellation to fix source-review findings"
+    ]
+  },
+  "caveats": [
+    "Synthetic sandbox business data; forced bad steps are labeled replays, not natural drift rates.",
+    "Completion judgment still consumes reported prose; independent outcome checks here belong to validation.",
+    "Trusted first-observer, one-owner profile; not a hostile-extension security fence.",
+    "30-second/2000-output-token check bounds remain unchanged; uncertainty returns operator control."
+  ]
+}

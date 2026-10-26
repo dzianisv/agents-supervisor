@@ -1,0 +1,96 @@
+[
+  {
+    "info": {
+      "id": "msg_fd9c44b6a0015Np15ez5W7zA4e",
+      "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+      "role": "user",
+      "time": {
+        "created": 1786064948074
+      },
+      "summary": {
+        "diffs": []
+      },
+      "agent": "build",
+      "model": {
+        "providerID": "test-fixture",
+        "modelID": "fixture-model"
+      }
+    },
+    "parts": [
+      {
+        "id": "prt_fd9c44b6f0010adi6E1le6c9qZ",
+        "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+        "messageID": "msg_fd9c44b6a0015Np15ez5W7zA4e",
+        "type": "text",
+        "text": "Wire up the metrics exporter in src/metrics.ts and test it. LIVEVAL_S8_WORK"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_fd9c44c55001nQOyoqbFLHUuzu",
+      "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+      "role": "assistant",
+      "time": {
+        "created": 1786064948309,
+        "completed": 1786064949376
+      },
+      "parentID": "msg_fd9c44b6a0015Np15ez5W7zA4e",
+      "modelID": "fixture-model",
+      "providerID": "test-fixture",
+      "mode": "build",
+      "agent": "build",
+      "path": {
+        "cwd": "/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s8-pVkNva",
+        "root": "/"
+      },
+      "cost": 0,
+      "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "id": "prt_fd9c45072001Tmsxc21OkTs1vT",
+        "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+        "messageID": "msg_fd9c44c55001nQOyoqbFLHUuzu",
+        "type": "step-start"
+      },
+      {
+        "id": "prt_fd9c45074001oGZEAJKayNo9EW",
+        "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+        "messageID": "msg_fd9c44c55001nQOyoqbFLHUuzu",
+        "type": "text",
+        "text": "Done — applied the change in src/ and ran the suite: 12/12 passing.",
+        "time": {
+          "start": 1786064949364,
+          "end": 1786064949366
+        }
+      },
+      {
+        "id": "prt_fd9c45079001QsVROlUjB6vmf2",
+        "sessionID": "ses_0263bb4a5ffeXxVxVxPB5IOWdx",
+        "messageID": "msg_fd9c44c55001nQOyoqbFLHUuzu",
+        "type": "step-finish",
+        "reason": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        }
+      }
+    ]
+  }
+]

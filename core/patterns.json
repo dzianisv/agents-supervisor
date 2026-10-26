@@ -1,0 +1,413 @@
+{
+  "version": 1,
+  "meta": {
+    "dataset_size": 285,
+    "premature_pct": 78,
+    "source": "mined real agent stops where the user replied",
+    "note": "Shipped defaults. v3.1 adds passive_watch_locally_pollable antipattern + 3 few-shots (V/W/X). User-local overrides at .supervisor/patterns.json or ~/.config/agents-supervisor/patterns.json take precedence."
+  },
+  "categories": [
+    {
+      "name": "complete",
+      "inject": false,
+      "description": "task is done; assistant delivered the answer or finished the requested work WITH evidence."
+    },
+    {
+      "name": "waiting_for_user_legitimate",
+      "inject": false,
+      "description": "assistant asks a question that ONLY the user can answer (OAuth/2FA/captcha/credential retrieval, or a genuine preference the user must supply)."
+    },
+    {
+      "name": "tool_available_punt",
+      "inject": true,
+      "description": "assistant punts to the user about something the available tools could resolve. The assistant has tools like Bash, WebFetch, browser MCP, etc., yet asks the user instead of trying."
+    },
+    {
+      "name": "summary_drift_stop",
+      "inject": true,
+      "description": "assistant wrote a summary/plan with a \"next step\" and STOPPED before doing it. e.g., \"I've created the file. Next step: run the tests.\" (without running them.)"
+    },
+    {
+      "name": "genuinely_stuck",
+      "inject": true,
+      "description": "assistant stopped mid-thought or without clear conclusion; no question, no summary, just halted. Often a short response."
+    },
+    {
+      "name": "working",
+      "inject": false,
+      "description": "rarely a stop; only assign if the final turn is clearly mid-action (e.g., \"Running tests now...\") with no closure."
+    }
+  ],
+  "antipatterns": [
+    {
+      "name": "permission_seeking",
+      "weight_pct": 40,
+      "maps_to": "tool_available_punt",
+      "rule": "PERMISSION-SEEKING (most common, ~40%): the response ends by asking to do work it can already do — \"Want me to…?\", \"Would you like me to…?\", \"Should I…?\", \"Shall I proceed?\", or \"Try running it now\"/\"Please run X and confirm\" (deferring a check the agent could run itself). DECISIVE TEST: if the final turn is a yes/no or \"want me to X?\" question AND X is something the agent can do with its own tools AND X carries no irreversible risk → classify as tool_available_punt. Asking is only legitimate before a destructive/irreversible action (delete prod data, force-push, send an irreversible external message) → classify as waiting_for_user_legitimate."
+    },
+    {
+      "name": "stopped_with_todos",
+      "weight_pct": 30,
+      "maps_to": "summary_drift_stop",
+      "rule": "STOPPED-WITH-TODOS (~30%): the response lists \"Remaining Tasks\"/\"Next steps\"/\"Still TODO\"/\"What I did NOT do\"/\"Outstanding Work\" or names a verify/run/check/create-PR step as \"next\" — then stops without doing it. FIRST-OCCURRENCE IS SUFFICIENT: do NOT wait for a second signal; 98% of these are premature (user says \"continue\"). TERMINAL-POSITION TEST: the list appears in the LAST ~40% of the response with NO subsequent tool calls or execution following it. A mid-response \"here's what I did\" followed by actual execution is process narration (complete), not a stop-with-todos. Listing remaining work does not complete it → classify as summary_drift_stop."
+    },
+    {
+      "name": "false_complete",
+      "maps_to": "summary_drift_stop",
+      "rule": "FALSE-COMPLETE: claims \"done\"/\"complete\"/\"ready\"/\"all tasks complete\" but the CORE requested action never happened, a required check was skipped, or there is no evidence. An empty/no-text response on an action task is NEVER complete. For an \"add a <feature>\" task, writing files is not enough — code must be wired in AND verified (test/build/run); \"ready to use\" with no integration is incomplete → classify as summary_drift_stop (not complete)."
+    },
+    {
+      "name": "analysis_no_implementation",
+      "maps_to": "summary_drift_stop",
+      "rule": "ANALYSIS-NO-IMPLEMENTATION (planning loop): the task requires code changes (fix/implement/add/create/build/refactor, or a GitHub issue URL) but the response only read/grepped/explored/recommended — the tools show ONLY read operations (read, grep, git log/status) and ZERO writes (edit, write, build, commit). Reading is not doing → classify as summary_drift_stop; if it halted mid-investigation with no plan, genuinely_stuck. A task mixing 'investigate' with 'fix/implement', or referencing a GitHub issue, is a CODING task, not research."
+    },
+    {
+      "name": "retry_loop",
+      "maps_to": "genuinely_stuck",
+      "rule": "RETRY-LOOP: the agent repeats the same failing approach (same command / same edit / same deploy) across turns without changing strategy. Repeating a failed action is not progress → genuinely_stuck; the nudge should force a different approach or an explicit blocker statement."
+    },
+    {
+      "name": "verification_deferral",
+      "maps_to": "summary_drift_stop",
+      "rule": "VERIFICATION-DEFERRAL: agent wrote/edited code (write/edit tool calls present in tool commands) but the response ends without running tests, build, or lint — and the task type requires verification (fix/implement/add/create/build/refactor). The agent should run verification before stopping → classify as summary_drift_stop."
+    },
+    {
+      "name": "legitimate_stop",
+      "maps_to": "waiting_for_user_legitimate",
+      "rule": "LEGITIMATE STOP (do NOT flag as premature): genuine human-only block (OAuth consent, 2FA code, credential/API-key retrieval, captcha) → waiting_for_user_legitimate. Genuine completion WITH evidence (commands+output, tests passing, PR/CI verified) → complete; do not invent missing work."
+    },
+    {
+      "name": "closing_delivery_dominates",
+      "maps_to": "complete",
+      "rule": "CLOSING DELIVERY DOMINATES intermediate planning phrases. A long turn often narrates the agent's process — \"Let me check X. Now let me read Y. Let me apply the fixes.\" — and THEN ends with a DELIVERED RESULT (committed PRs, test pass counts, verdict text, code-review checklist with FAIL/PASS, status report, error message returned to user, imperative guidance to the user like \"Try X\" / \"Use /clear\"). When the SAME turn ends on delivery, the intermediate \"Let me\" phrases were process narration of work that has now FINISHED — the turn is complete. Only mark drift if the turn ENDS on the unfinished action with NO subsequent result. Read the FINAL paragraph of the assistant text before deciding on intermediate signals."
+    },
+    {
+      "name": "passive_watch_locally_pollable",
+      "maps_to": "tool_available_punt",
+      "rule": "PASSIVE WATCH of a locally-pollable bg task is a punt. STRICT TRIGGERS — apply only when the closing text contains one of: 'Watching <task-id>' (where the task-id looks like a job id, e.g. starts with `b` + alphanum), 'X in flight', 'iter N in flight', 'monitoring <pid>', 'waiting for the build/CI/job <id>'. AND the agent has Bash or Read or gh in its tool list. Decisive test: would re-reading a local file or running a single `Bash`/`gh pr checks` command tell the agent whether the watched thing is done? If yes → `tool_available_punt`. Do NOT confuse with: (a) AUTONOMOUS report-back from a subagent/webhook/external service (still `complete`); (b) `Want me to do X?` style permission questions (those are `permission_seeking` → `tool_available_punt` already, via a different rule); (c) `Looking at the dashboard at X` user-directed guidance (still `complete`). This rule fires ONLY on the explicit watching-bg-task pattern."
+    },
+    {
+      "name": "imperative_guidance_to_user",
+      "maps_to": "complete",
+      "rule": "IMPERATIVE GUIDANCE TO USER is delivery, not drift. Sentences like \"Try X\", \"Use /clear\", \"Run npm test\", \"Check the log at /var/log/foo\", \"Look at the dashboard\" directed AT THE USER (not narrating agent self-action) are GUIDANCE — complete. Drift requires first-person commitment from the agent itself (\"I will run\", \"Let me now\", numbered self-plan). Imperatives are advice for the user to act; not a paused agent task."
+    },
+    {
+      "name": "capability_offer_vs_commitment",
+      "maps_to": "complete",
+      "rule": "CAPABILITY OFFER IS NOT COMMITMENT. \"I can do X\" / \"Next I can run X\" / \"If you want, I can X\" / \"I could update the doc\" is an OFFER extended to the user — the agent is not committed to acting and the turn is COMPLETE. Drift requires committed action (\"I will run\", \"Let me now\", \"Next I'll\", numbered execution plan). Distinguish: capability/permissive (\"can\", \"could\", \"if you want\") = complete; commitment/imperative (\"will\", \"let me now\", \"now I'll\") = drift."
+    }
+  ],
+  "evidence_rules": [
+    "A completion claim needs evidence, but a concise summary IS evidence: 'test suite: 3 passed' or 'build ok' counts — do NOT demand full stdout.",
+    "A write/edit tool call IS evidence that a file was created or changed — do not demand a follow-up cat/read to 'prove' it.",
+    "For 'make it work' / 'pass the tests' / 'fix the bug' tasks, completion REQUIRES execution output (tests/build/run), not just code written or 'ready to use'.",
+    "Calibrate severity to the actual change: touching a file named auth/security is not itself a vulnerability or a BLOCKER."
+  ],
+  "few_shots": [
+    {
+      "label": "A — complete",
+      "note": "user-directed guidance is NOT drift",
+      "final": "Deployed. To disable later: flip the flag in config.ts. Watch the dashboard over the next few days for the drop in error rate.",
+      "output": {
+        "category": "complete",
+        "reason": "shipped + user-directed guidance, no agent next action",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "B — summary_drift_stop",
+      "note": "agent-claimed next step",
+      "final": "I've created the file. Next I'll run the tests and commit.",
+      "output": {
+        "category": "summary_drift_stop",
+        "reason": "claimed agent next step (tests + commit) but stopped",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "C — complete",
+      "note": "AUTONOMOUS report-back: external system will notify on its own",
+      "final": "Monitor armed via cron — will email when nightly batch fails. Standing down.",
+      "output": {
+        "category": "complete",
+        "reason": "status delivered, monitoring is external/autonomous — agent does not need to re-check",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "D — waiting_for_user_legitimate",
+      "note": "only-user-can-answer preference",
+      "final": "Which do you prefer — single comprehensive post or series?",
+      "output": {
+        "category": "waiting_for_user_legitimate",
+        "reason": "asks user preference no tool can answer",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "E — tool_available_punt",
+      "note": "tool could answer",
+      "tools": "Bash, Read, Grep, WebFetch",
+      "final": "What does the PR description say? Paste it here and I'll review.",
+      "output": {
+        "category": "tool_available_punt",
+        "reason": "WebFetch/gh CLI could pull PR description without asking user",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "F — genuinely_stuck",
+      "note": "no closure",
+      "final": "Continuing.",
+      "output": {
+        "category": "genuinely_stuck",
+        "reason": "single-word non-closure, no summary or question",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "G — complete",
+      "note": "terse acknowledgement is a delivery",
+      "final": "Ignored — stale monitor noise.",
+      "output": {
+        "category": "complete",
+        "reason": "terse acknowledgement, no open action",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "H — summary_drift_stop",
+      "note": "numbered next-step list, none executed",
+      "final": "1. Run the tests. 2. Commit with feat(byok): ... 3. Open PR with test evidence.",
+      "output": {
+        "category": "summary_drift_stop",
+        "reason": "numbered execution plan the agent owns, no step taken",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "I — tool_available_punt",
+      "note": "permission to update reversible artifact when agent has Edit/WebFetch",
+      "tools": "Bash, Read, Edit, WebFetch",
+      "final": "If you want, I can patch this now in one pass. Want me to?",
+      "output": {
+        "category": "tool_available_punt",
+        "reason": "Edit/Bash available; agent could just patch instead of asking",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "J — tool_available_punt",
+      "note": "Bash available, asks user for shell state",
+      "tools": "Bash, Read, Edit",
+      "final": "What does `git status` show in your worktree?",
+      "output": {
+        "category": "tool_available_punt",
+        "reason": "Bash could run git status directly",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "K — complete",
+      "note": "subagents running, will autonomously surface findings on return",
+      "final": "PR #1376 merged. 3 worktree subagents still running (homepage CTA, bot one-tap, Sentry triage). They'll surface findings when they return.",
+      "output": {
+        "category": "complete",
+        "reason": "PR shipped; subagents will autonomously report — agent has no poll-able state to check",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "L — complete",
+      "note": "system error message, not a stuck agent",
+      "final": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.",
+      "output": {
+        "category": "complete",
+        "reason": "system status delivered, no agent action open",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "M — complete",
+      "note": "subagent fan-out, agent passive this turn",
+      "final": "Subagent is running — probing RSS feeds and sitemaps. I'll share findings when it reports back.",
+      "output": {
+        "category": "complete",
+        "reason": "dispatched subagent + passive wait",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "N — complete",
+      "note": "'I can do X' is offer, not commitment",
+      "final": "UI updated, tests pass. Next I can run the full pre-merge suite if you want.",
+      "output": {
+        "category": "complete",
+        "reason": "work delivered + capability offer ('I can'), no committed next action",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "O — complete",
+      "note": "present-tense process narration that delivers a finding",
+      "final": "I'm checking whether the blocked conclusion missed usable context. Looked at the last 3 turns — no missed context, conclusion stands.",
+      "output": {
+        "category": "complete",
+        "reason": "present-tense narration that delivered a concrete finding",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "P — complete",
+      "note": "next-steps list as user hand-off, no 'I will'",
+      "final": "Shipped. Next steps for you: 1. Verify in staging 2. Roll out to prod 3. Monitor error rate.",
+      "output": {
+        "category": "complete",
+        "reason": "next-steps list directed at user, no agent commitment",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "Q — summary_drift_stop",
+      "note": "'Let me now' + cut-off mid-action, NO closing result",
+      "final": "Let me apply all 3 fixes now. First I need to update auth.ts... Now I need to add the validation step...",
+      "output": {
+        "category": "summary_drift_stop",
+        "reason": "committed action ('Let me') + mid-action with no closing result",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "R — complete",
+      "note": "multi-step process narration that ENDS with delivery — closing dominates",
+      "final": "Let me read the file. Now let me check the webhook URL. Let me apply all 3 fixes. ... All 1241 unit tests pass, TypeScript compiles clean. Fixes committed and pushed to PR #1043.",
+      "output": {
+        "category": "complete",
+        "reason": "closing delivery (tests pass + PR pushed) overrides intermediate 'Let me' phrases",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "S — complete",
+      "note": "imperative guidance to user, not agent self-action",
+      "final": "Autocompact thrashing. Try reading in smaller chunks, or use /clear to start fresh.",
+      "output": {
+        "category": "complete",
+        "reason": "imperative guidance directed at user, not agent commitment",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "T — complete",
+      "note": "present-tense process narration ENDS with verdict — closing dominates",
+      "final": "I'm checking whether the blocked conclusion missed usable context. ... Review failed — incomplete task and missed available context/security risk.",
+      "output": {
+        "category": "complete",
+        "reason": "checklist + verdict delivered; intermediate 'I'm checking' was process narration",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "U — summary_drift_stop",
+      "note": "terminal-position todo list, first occurrence sufficient",
+      "final": "## Summary\nI've investigated the CI failure and identified the root cause.\n\n## Next Steps\n1. Fix the failing assertion in auth.test.ts\n2. Run the test suite locally\n3. Push and verify CI passes",
+      "output": {
+        "category": "summary_drift_stop",
+        "reason": "terminal-position numbered plan — first occurrence, agent owns all steps, none executed",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "V — tool_available_punt",
+      "note": "passive watch of LOCAL bg task agent could poll right now",
+      "tools": "Bash, Read, Edit",
+      "final": "Iter 34 dispatched with timeout fix (commit 69e6e5b0e). Watching b64muauzo.\nRun tally: iter 30 FAIL, 31 PASS, 32 FAIL, 33 PASS. Iter 34 with the fix in flight.",
+      "output": {
+        "category": "tool_available_punt",
+        "reason": "watching a bash bg task id; agent has Bash + Read to poll the task output now instead of sitting idle",
+        "confidence": 0.9
+      }
+    },
+    {
+      "label": "W — tool_available_punt",
+      "note": "watching a CI run agent could poll via gh",
+      "tools": "Bash",
+      "final": "PR #1403 pushed. Waiting for CI to finish so I can confirm the green build.",
+      "output": {
+        "category": "tool_available_punt",
+        "reason": "agent has Bash + gh — could run `gh pr checks 1403 --watch` or single poll instead of just sitting",
+        "confidence": 0.85
+      }
+    },
+    {
+      "label": "X — complete",
+      "note": "passive watch with NO local poll path — external system will notify",
+      "tools": "Bash, Read",
+      "final": "Posted the bug report to the vendor's portal. They'll email when triaged. Nothing for me to poll on this side.",
+      "output": {
+        "category": "complete",
+        "reason": "report-back is external + autonomous; agent has no tool that could check the vendor's queue",
+        "confidence": 0.9
+      }
+    }
+  ],
+  "feedback": {
+    "max_inject_attempt": 3,
+    "inject_categories": [
+      "summary_drift_stop",
+      "tool_available_punt",
+      "genuinely_stuck",
+      "verification_deferral"
+    ],
+    "templates": {
+      "summary_drift_stop": {
+        "reasons": [
+          "summary_drift: plan written but not executed",
+          "summary_drift: second inject — still not executing",
+          "summary_drift: final inject before session close"
+        ],
+        "messages": [
+          "You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands.",
+          "Second time triggering this. You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands. Stop narrating. Start doing.",
+          "Third inject. You wrote a plan and named a next step. Execute it now. {stepClause} Do not write another summary or plan — make tool calls, write code, run commands. If this approach is not working, try a different one. No more plans — next response must be a tool call or code. Session closes after this."
+        ]
+      },
+      "tool_available_punt": {
+        "reasons": [
+          "tool_available_punt: agent deferred to user instead of using tools",
+          "tool_available_punt: second inject — still deferring",
+          "tool_available_punt: final inject before session close"
+        ],
+        "messages": [
+          "You have these tools: {toolList}. Use them yourself instead of asking the user OR sitting idle on work you could poll. If you can answer with a tool, answer. If you're watching a bg task / CI / job, poll it now — `Read` its output file, `Bash` to check its status, or `gh pr checks` for CI. Do not just wait.",
+          "We did this once. You still have those tools: {toolList}. Use them now. If you're watching something, run the poll command. If you punted to the user, take the action yourself. Do not ask — act.",
+          "Third inject. Tools available: {toolList}. If this approach keeps failing, try a different tool or strategy. If you're stuck watching a bg task, say explicitly what is blocking the poll. Otherwise the session will close. Make a tool call in your next response."
+        ]
+      },
+      "genuinely_stuck": {
+        "reasons": [
+          "genuinely_stuck: agent stopped without explicit blocker or action",
+          "genuinely_stuck: second inject — still no action or stated blocker",
+          "genuinely_stuck: final inject before session close"
+        ],
+        "messages": [
+          "You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence.",
+          "Second time. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If you are blocked, say exactly what is blocking you and what you already tried. If you are not blocked, make a tool call.",
+          "Third inject. You stopped mid-thought. Either: (a) state explicitly what is blocking and what you have tried, OR (b) take the next concrete action — make a tool call, write code, run a command. No more silence. If this approach is not working, try a completely different strategy. Next response must be a tool call, code, or an explicit blocker statement. Session closes after this."
+        ]
+      },
+      "verification_deferral": {
+        "reasons": [
+          "verification_deferral: code written but not verified",
+          "verification_deferral: second inject — still not verified",
+          "verification_deferral: final inject before session close"
+        ],
+        "messages": [
+          "You wrote code but did not run tests/build/lint. Run verification now before stopping. {stepClause}",
+          "Second time. You wrote code but STILL did not verify. Run the test/build command NOW. {stepClause}",
+          "Third inject. Code unverified. Run tests/build immediately or state what blocks you. {stepClause}"
+        ]
+      }
+    }
+  }
+}

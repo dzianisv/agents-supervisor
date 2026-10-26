@@ -1,0 +1,30 @@
+[2026-08-07T01:08:41.148Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.150Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:41.149Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:41.151Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:41.158Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.162Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:41.166Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:41.170Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.245Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:41.246Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:41.246Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:41.255Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:41.257Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:41.257Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:41.258Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:41.267Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:41.268Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.269Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.270Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:41.271Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:41.275Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:41.273Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:41.271Z] [Supervisor] session.idle received
+[2026-08-07T01:08:41.273Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:41.271Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:42.173Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:42.184Z] [Supervisor] subagent-gate: supervising root session ses_0263c3eb2ffeOVXHAvpqqpBwTN
+[2026-08-07T01:08:42.203Z] [Supervisor] Skipping reflection — non-actionable:summary for ses_0263
+[2026-08-07T01:08:42.792Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:42.797Z] [Supervisor] subagent-gate: supervising root session ses_0263c3eb2ffeOVXHAvpqqpBwTN

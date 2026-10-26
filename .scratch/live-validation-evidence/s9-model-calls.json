@@ -1,0 +1,30 @@
+[
+  {
+    "i": 0,
+    "roles": "system,system,user,user",
+    "lastUser": "Add a --verbose flag to the CLI and test it. LIVEVAL_S9_WORK",
+    "hasStatusMarker": true,
+    "nTools": 0
+  },
+  {
+    "i": 1,
+    "roles": "system,system,user",
+    "lastUser": "Add a --verbose flag to the CLI and test it. LIVEVAL_S9_WORK",
+    "hasStatusMarker": true,
+    "nTools": 19
+  },
+  {
+    "i": 2,
+    "roles": "system,user,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 0
+  },
+  {
+    "i": 3,
+    "roles": "system,user",
+    "lastUser": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single frames extracted from delivered videos appear as image content blocks — LOOK at them and judge the v",
+    "hasStatusMarker": false,
+    "nTools": 19
+  }
+]

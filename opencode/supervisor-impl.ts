@@ -1,0 +1,3498 @@
+/**
+ * Supervisor Plugin for OpenCode
+ *
+ * Consolidated supervisor layer that combines self-assessment with workflow checks.
+ * Uses a dynamic prompt (task + workflow requirements) unless supervisor.md overrides it.
+ * Ensures tests/build/PR/CI checks are verified before completion.
+ */
+
+import type { Plugin } from "@opencode-ai/plugin"
+import { readFile, writeFile, mkdir, stat, appendFile, chmod } from "fs/promises"
+import { join, dirname } from "path"
+import { homedir } from "os"
+import { fileURLToPath } from "url"
+import { execFile } from "child_process"
+// Shared goal-loop DECISION logic — single source of truth across runtimes.
+// State lives in core/session-store.mjs; supervisorStore is an async adapter.
+import {
+  resolveRunawayLimit, describeRunawayLimit, formatRunawayLimit, parseAttemptsValue,
+  readConfiguredMaxAttempts, parseSupervisorCommand, buildGoalRequirementSection,
+  appendGoalOwnershipDirectiveToSystem, buildGoalAssessmentContext,
+  decideGoalTransition, sameGoalContract, DEFAULT_MAX_GOAL_DURATION_MS,
+  writeProjectGoal, GOAL_CONDITION_MAX_LEN,
+  readProjectGoalCondition, readProjectGoalContract, retireProjectGoal,
+  buildGoalDerivationPrompt, parseDerivedGoalResponse,
+  isStatusDiagramEnabled, isPlainspeakEnabled, goalStore,
+  withResumeHint, goalResumeHintSuffix, GOAL_RESUME_HINT,
+} from "../core/goal.mjs"
+// Plainspeak style detector. DELIBERATELY deterministic-only on this runtime:
+// only `scoreVerbosity(...).verdict === "verbose"` fires, `"suspect"` is
+// treated as terse, and `buildStylePrompt` is INTENTIONALLY UNUSED here. The
+// Claude Code hook (bin/plainspeak-on-stop.mjs) may escalate an ambiguous
+// reply to an LLM tiebreak; the plugin must not, because that would add a
+// model call, a network dependency, and a source of flake to the idle path
+// for what is only a style nudge.
+import { scoreVerbosity, buildRewriteDirective } from "../core/verbosity.mjs"
+import {
+  sessionStore, listSessions, maybeGcSessions,
+} from "../core/session-store.mjs"
+import {
+  isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting,
+  getCrossReviewModelSpec, getLastSessionModelSpec,
+} from "../core/model-selection.mjs"
+// The plugin's `directory` is the SERVER cwd, not the session's — see
+// core/session-context.mjs for the incident that makes this distinction load-bearing.
+import { getLastSessionCwd, resolveSessionDirectory } from "../core/session-context.mjs"
+import {
+  SELF_ASSESSMENT_MARKER, FEEDBACK_MARKER, inferTaskType, extractToolCommands,
+  detectSignals, normalizeCommand, getRecentCommands, hasLocalTestCommand,
+  pushedToDefaultBranch, hasCodeChangeEvidence,
+  evaluateSelfAssessment, isPlanMode, isHumanOnlyAction,
+  splitActionItems, HUMAN_ONLY_ACTION_PATTERNS, AGENT_ACTION_PATTERNS,
+  evaluateNoProgress,
+} from "../core/evaluation.mjs"
+import {
+  DEFAULT_RUBRIC, parseRubric, buildSelfAssessmentPrompt, buildJudgePrompt,
+  parseSelfAssessmentJson,
+} from "../core/assessment.mjs"
+import { buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody } from "../core/feedback.mjs"
+import {
+  appendStatusDirectiveToSystem,
+  checkStatusCompliance,
+  buildStatusCorrectionMessage,
+} from "../core/status-directive.mjs"
+import { buildReflectionPrompt } from "../core/reflection-prompt.mjs"
+import {
+  extractLastAssistantText, findLastRelevantUserIndex, currentUserTask,
+  buildConversationChain, userMessageText, truncateForPrompt, PROMPT_TEXT_LIMIT,
+} from "../core/task-context.mjs"
+import { classifyTurn, shouldSkipReflection } from "../core/turn-classifier.mjs"
+// THE shared parser for the agent-declared loop exit (a real tool here, a
+// text sentinel on Claude Code — see core/loop-exit.mjs's header) and its
+// ONE forensic-log writer, reused by both the runaway-ceiling circuit
+// breaker and executeSupervisorLoopExit below so .supervisor/loop-exit.log
+// never grows a second record format.
+import { appendLoopExitLog } from "../core/loop-exit.mjs"
+
+// Plugin's own shipped .agents/supervisor dir — fallback defaults when a
+// project hasn't customized SystemPrompt.md/Patterns.md/User.md/Goal.md.
+// supervisor-impl.ts lives in opencode/, so ".." reaches the repo root.
+const defaultsDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".agents", "supervisor")
+export { resolveRunawayLimit, parseSupervisorCommand, buildGoalRequirementSection, decideGoalTransition }
+export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, getCrossReviewModelSpec, getRoutingModel, classifyTaskForRoutingWithLLM }
+export {
+  buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody, retireProjectGoal,
+  getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
+  DEFAULT_RUBRIC, parseRubric, buildTaskContext,
+}
+export { getLastSessionCwd, resolveSessionDirectory }
+export { extractLastAssistantText, currentUserTask, buildConversationChain, findLastRelevantUserIndex }
+export { classifyTurn, shouldSkipReflection }
+
+export function detectSupervisorActionInText(text: string): "off" | "on" | null {
+  if (!text || typeof text !== "string") return null
+  // Every form must be the ENTIRE trimmed line. A substring match would let any
+  // pasted log, config snippet, or discussion of the supervisor silently disable it.
+  const OFF_LINES = new Set(['command: "off"', "command: 'off'", "/supervisor off", "/supervisor:off", "supervisor off", "supervisor:off"])
+  const ON_LINES = new Set(['command: "on"', "command: 'on'", "/supervisor on", "/supervisor:on", "supervisor on", "supervisor:on"])
+  for (const raw of text.toLowerCase().split("\n")) {
+    const line = raw.trim()
+    if (OFF_LINES.has(line)) return "off"
+    if (ON_LINES.has(line)) return "on"
+  }
+  return null
+}
+
+/**
+ * True when a session was spawned by another session — i.e. a delegated
+ * subagent created through the `task` tool, not a session a human is watching.
+ *
+ * FIELD NAME IS VERIFIED, NOT GUESSED (2026-08-06):
+ *   - SDK type:  `Session.parentID?: string`
+ *     (node_modules/@opencode-ai/sdk/dist/gen/types.gen.d.ts:397)
+ *   - Live REST: `GET /session/{id}` on a real subagent session returns
+ *     `"parentID": "ses_…"`; the same call on a root session omits the key
+ *     entirely (it is absent, not null).
+ *   - SQLite:    the `session` table stores it as `parent_id`
+ *     (~/.local/share/opencode/opencode.db) — snake_case is the storage form
+ *     only; the API/SDK surface is camelCase `parentID`.
+ *
+ * TRAP: `message.info.parentID` also exists but holds a *message* id
+ * (`msg_…`), not a session id. Never derive subagent-ness from the transcript.
+ * The snake_case / lowercase-d variants below are accepted purely as
+ * defence-in-depth against a future SDK rename; `parentID` is the real one.
+ */
+export function isSubagentSession(session: any): boolean {
+  if (!session || typeof session !== "object") return false
+  const parent = session.parentID ?? session.parent_id ?? session.parentId
+  return typeof parent === "string" && parent.trim().length > 0
+}
+
+/**
+ * Values the model emits for a parameter it does not actually want to set.
+ *
+ * Why this exists: the supervisor tools declare every parameter `.optional()`,
+ * but the schema that reaches the model serialises with
+ * `"required": ["mode","action","condition","clear","n"]` — verified live in
+ * the running tool manifest. The plugin registers its tools through a raw-zod
+ * `args` record, and this runtime passes those zod objects through verbatim
+ * (the manifest shows `{"_def":{...,"typeName":"ZodOptional"}}` instead of a
+ * JSON Schema), so optionality is lost before the model ever sees it. The
+ * model is therefore *forced* to emit a value and invents filler.
+ *
+ * Consequence (30-day forensics): 3 of 5 real `/supervisor off` calls arrived
+ * as `{action:"off", mode:"reflection"}` and one as
+ * `{action:"off", mode:"autopilot"}` — the user asked OFF and got a mode
+ * change. Until the runtime can emit real optional params, the executor must
+ * treat filler as absent.
+ */
+const ABSENT_ARG_SENTINELS = new Set(["", "null", "undefined"])
+
+/**
+ * Normalise a tool argument that is semantically optional but may arrive as a
+ * runtime-forced filler value. Returns undefined for absent/filler input.
+ */
+export function normalizeOptionalArg(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  if (ABSENT_ARG_SENTINELS.has(trimmed.toLowerCase())) return undefined
+  return trimmed
+}
+
+export function getLastUserMessageText(messages: any[]): string {
+  if (!Array.isArray(messages)) return ""
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    const role = msg.info?.role || msg.role
+    if (role === "user") {
+      const textParts: string[] = []
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && typeof part.text === "string") {
+          if (!part.text.includes(SELF_ASSESSMENT_MARKER) && !part.text.includes(FEEDBACK_MARKER)) {
+            textParts.push(part.text)
+          }
+        }
+      }
+      if (textParts.length > 0) return textParts.join("\n")
+    }
+  }
+  return ""
+}
+
+/**
+ * Read the project-level goal condition for a SESSION, from the session's own
+ * project — not from whatever cwd `opencode serve` happens to have been
+ * started in.
+ *
+ * This is the single entry point the idle/reflection path uses so the
+ * session-scoping rule is expressed in exactly one place (and is directly
+ * testable — see test/goal-scope.test.mjs). Returns '' when the session's
+ * project has no goal; it must NEVER substitute another project's goal.
+ *
+ * INCIDENT 2026-07-27: readProjectGoalCondition(directory) here read the
+ * server cwd (this plugin's own repo), injecting an OpenClawBot checklist as a
+ * MANDATORY GOAL into a session working in KineticAiCoach.
+ */
+export function resolveProjectGoalForSession(messages: any[], pluginDirectory: string): string {
+  try {
+    return readProjectGoalCondition(resolveSessionDirectory(messages, pluginDirectory)) || ""
+  } catch {
+    return ""
+  }
+}
+
+// Lazy Sentry helper — reports errors without crashing if @sentry/node is unavailable
+async function reportError(err: unknown, context?: Record<string, string>): Promise<void> {
+  try {
+    const Sentry = await import("@sentry/node")
+    if (!Sentry.isInitialized()) return
+    Sentry.captureException(err, context ? { tags: context } : undefined)
+  } catch {}
+}
+
+/**
+ * Read the top-level `maxAttempts:` value from ~/.config/opencode/supervisor.yaml.
+ * Accepts a positive integer OR an `unlimited`/`off`/`none`/`0` opt-out (→
+ * Infinity); returns undefined if the file is missing, the key is absent, or the
+ * value is invalid (an invalid value is warned to the debug log and the resolver
+ * falls through to the next tier — the file-surface form of "reject, don't
+ * silently rewrite"). Delegates to core's shared reader so the yaml surface is
+ * parsed identically on Claude Code and OpenCode (ONE parser, one spelling).
+ */
+async function loadConfiguredMaxAttempts(): Promise<number | undefined> {
+  return readConfiguredMaxAttempts((msg) => debug(msg), SUPERVISOR_CONFIG_PATH)
+}
+
+/**
+ * Read the top-level `superviseSubagents:` boolean from
+ * ~/.config/opencode/supervisor.yaml. Mirrors loadConfiguredMaxAttempts.
+ *
+ * Default FALSE: the supervisor does not run inside delegated subagent
+ * sessions. 633 of 962 injections in a 30-day sample (66%) landed in sessions
+ * whose "user" is a scoped delegation prompt rather than a human — the
+ * supervisor pushed read-only audit subagents to open PRs and pull
+ * credentials, and every observed injection loop lived in one. Set
+ * `superviseSubagents: true` to restore the old behaviour.
+ */
+export async function loadConfiguredSuperviseSubagents(
+  configPath: string = SUPERVISOR_CONFIG_PATH
+): Promise<boolean> {
+  try {
+    const content = await readFile(configPath, "utf-8")
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith("#")) continue
+      const match = line.match(/^superviseSubagents\s*:\s*(\S+)/)
+      if (match) return /^(true|yes|1|on)$/i.test(match[1].trim())
+    }
+  } catch {}
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor per-session persistence (supervisorStore)
+//
+// Stores goal + retry state at
+// <directory>/.supervisor/sessions/<sessionId>/state.json — see
+// core/session-store.mjs, the SINGLE accessor shared with the Claude Code
+// runtime. Legacy <directory>/.supervisor/goals/<sessionId>.json is read and
+// migrated forward transparently on first load.
+// so supervisor decisions survive across tool invocations within a session.
+// ---------------------------------------------------------------------------
+
+export interface SupervisorGoal {
+  id?: string
+  condition: string
+  acceptanceCriteria?: string
+  verification?: string
+  source?: "user" | "agent"
+  status: "active" | "paused" | "achieved" | "cleared" | "exhausted"
+  attempts: number
+  tokenBaseline: number
+  startedAt: number
+  deadline: number
+  lastReason: string
+  /**
+   * Fingerprint of the human turn `attempts` belongs to (the last relevant
+   * user message id here; a transcript-derived turn key on the Claude Code
+   * side). The attempt budget is per-turn, not cumulative for the session —
+   * see the reset in the session.idle handler. null until the first idle pass
+   * observes one.
+   */
+  lastTurnKey?: string | null
+}
+
+export interface SupervisorState {
+  maxAttempts?: number | "unlimited"  // /supervisor:retry override; "unlimited" = no runaway cap
+  goal?: SupervisorGoal
+  goalCleared?: boolean
+  autoreview?: boolean       // cross-model review: gate behind explicit opt-in
+  /**
+   * Opt-in status.md / roadmap directive. ABSENT MEANS OFF.
+   * Read through isStatusDiagramEnabled(), never bare truthiness.
+   */
+  statusDiagram?: boolean
+  /**
+   * Plainspeak style-rewrite nudge. ABSENT MEANS ON — identical contract to
+   * `statusDiagram` above. Read it through isPlainspeakEnabled(), never as a
+   * bare truthiness test.
+   */
+  plainspeak?: boolean
+  /**
+   * The project directory this session works in, as resolved from its own
+   * transcript (`info.path.cwd` — see core/session-context.mjs).
+   *
+   * Persisted so the chat-system hook can scope its .supervisor/disabled
+   * lookup correctly WITHOUT depending on a warm in-memory cache. The cache
+   * empties on every server restart, and a restarted server would then read
+   * the wrong project's disabled file for every pre-existing session.
+   */
+  projectDir?: string
+  /**
+   * The turn key (last HUMAN user-message id — see
+   * getLastRelevantUserMessageId) of the turn a plainspeak rewrite directive
+   * was last injected on.
+   *
+   * This is the TERMINATION PROOF for plainspeak: one rewrite per turn, ever.
+   * The agent's reply to the directive raises a fresh session.idle with the
+   * SAME turn key, so the guard matches and the second pass returns silently.
+   * Persisted (not in-memory) so a server restart mid-turn cannot re-fire it.
+   */
+  lastPlainTurnKey?: string
+  /**
+   * The agent's explicit "end the supervision loop" declaration, written by
+   * the `supervisor_loop_exit` tool. `turnKey` is the human turn it was
+   * declared on (same key the attempt counter uses), so a record from an
+   * EARLIER turn can never suppress supervision of a NEW human message.
+   */
+  loopExit?: {
+    turnKey: string
+    reason: "completed" | "stuck"
+    detail: string
+    at: number
+  }
+  /**
+   * No-progress gate state (core/evaluation.mjs's evaluateNoProgress) —
+   * fingerprint + consecutive-repeat count of the agent's last final reply.
+   * Same on-disk keys as the Claude Code runtime (bin/supervisor-on-stop.mjs)
+   * so the two gates cannot drift onto different persistence shapes.
+   */
+  lastReplyHash?: string | null
+  replyRepeatCount?: number
+}
+
+/** Provenance/idempotency marker on every injected plainspeak directive. */
+export const PLAINSPEAK_MARKER = "<!-- supervisor:plainspeak -->"
+const GOAL_CONTRACT_MARKER = "<!-- supervisor:active-goal-contract -->"
+
+/**
+ * Default-off gate for the status directive. Only explicit `true` enables it.
+ *
+ * Re-exported from core/goal.mjs rather than reimplemented: the Claude Code
+ * hook reads the same on-disk key through the core copy, and two independent
+ * implementations of a default-ON flag drift into a default-OFF one silently.
+ */
+export { isStatusDiagramEnabled, isPlainspeakEnabled }
+
+/**
+ * `supervisorStore` is an ASYNC ADAPTER, not a second implementation.
+ *
+ * It used to be a full parallel copy of core/goal.mjs's `goalStore`: same
+ * on-disk contract, two code paths, no shared tests. This repo has repeatedly
+ * shipped bugs from exactly that shape (two extractors, two truncation
+ * constants, two isStatusDiagramEnabled). Every method below now delegates to
+ * `sessionStore` in core/session-store.mjs — the ONE accessor both runtimes
+ * use — and only keeps the `Promise`-returning signatures the plugin's call
+ * sites expect.
+ *
+ * The core is deliberately synchronous (see its header): the Claude Code hook
+ * and both CLIs are sync, and this file already calls sync core helpers
+ * (writeProjectGoal, retireProjectGoal, readProjectGoalCondition). The
+ * payload is one small JSON object per session.
+ */
+export const supervisorStore = {
+  async load(directory: string, sessionId: string): Promise<SupervisorState> {
+    return sessionStore.load(directory, sessionId) as SupervisorState
+  },
+
+  async save(directory: string, sessionId: string, state: SupervisorState): Promise<void> {
+    sessionStore.save(directory, sessionId, state)
+  },
+
+  async setGoal(
+    directory: string,
+    sessionId: string,
+    condition: string,
+    opts?: { tokenBaseline?: number; now?: number; maxDurationMs?: number; acceptanceCriteria?: string; verification?: string; source?: "user" | "agent"; replace?: boolean; projectDir?: string }
+  ): Promise<SupervisorState> {
+    return goalStore.setGoal(directory, sessionId, condition, opts ?? {}) as SupervisorState
+  },
+
+  async clearGoal(directory: string, sessionId: string): Promise<SupervisorState> {
+    return goalStore.clearGoal(directory, sessionId) as SupervisorState
+  },
+
+  async setRetry(directory: string, sessionId: string, n: number | "unlimited"): Promise<SupervisorState> {
+    return goalStore.setRetry(directory, sessionId, n) as SupervisorState
+  },
+
+  async setAutoreview(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    return goalStore.setAutoreview(directory, sessionId, enabled) as SupervisorState
+  },
+
+  async setStatusDiagram(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    return goalStore.setStatusDiagram(directory, sessionId, enabled) as SupervisorState
+  },
+
+  async setPlainspeak(directory: string, sessionId: string, enabled: boolean): Promise<SupervisorState> {
+    return goalStore.setPlainspeak(directory, sessionId, enabled) as SupervisorState
+  },
+
+  /**
+   * Flip a paused/exhausted goal back to active — see resumeGoal() in
+   * core/goal.mjs for the full contract (condition preserved verbatim,
+   * lastReason cleared, attempt counter reset, past deadline extended). Never a
+   * silent no-op: the returned outcome's `resumed` field tells the caller
+   * whether anything actually changed.
+   */
+  async resumeGoal(directory: string, sessionId: string, opts?: { now?: number; maxDurationMs?: number }) {
+    return goalStore.resumeGoal(directory, sessionId, opts ?? {})
+  },
+
+  /**
+   * Persist an arbitrary field without clobbering a concurrent writer's field.
+   * Read-modify-write is serialised behind the session lock in the core.
+   */
+  async mutate(
+    directory: string,
+    sessionId: string,
+    fn: (state: SupervisorState) => SupervisorState | void
+  ): Promise<SupervisorState> {
+    return sessionStore.mutate(directory, sessionId, fn as any) as SupervisorState
+  },
+
+  /** Every session id known in this project (new layout + un-migrated legacy). */
+  async list(directory: string): Promise<string[]> {
+    try {
+      return listSessions(directory).map((s) => s.id)
+    } catch {
+      return []
+    }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// parseSupervisorCommand — pure parser for /supervisor:* command names
+//
+// Maps a command name + its argument string to a discriminated action.
+// No I/O. Safe to call from any context.
+// ---------------------------------------------------------------------------
+
+// parseSupervisorCommand now imported from ../core/goal.mjs (shared).
+
+// ---------------------------------------------------------------------------
+// buildGoalRequirementSection — prompt fragment for active session goals
+//
+// Appended to the judge/self-assessment rubric when a goal is active. Pure,
+// no I/O. Returns an empty string for blank conditions (caller should skip
+// appending in that case).
+// ---------------------------------------------------------------------------
+
+// buildGoalRequirementSection now imported from ../core/goal.mjs (shared).
+
+// extractGoalCondition now imported from ../core/goal.mjs (shared — was
+// duplicated here and in buildReflectionPrompt + bin/supervisor-on-stop.mjs).
+
+// ---------------------------------------------------------------------------
+// decideGoalTransition — pure decision for an active session goal
+//
+// Given the current goal, the judge's verdict, and the budget, decide the next
+// goal state. No I/O; returns a NEW goal object (never mutates the input).
+// Applied in strict order: budget exhaustion FIRST (attempts cap or deadline),
+// then achievement, then continuation (which increments attempts).
+// ---------------------------------------------------------------------------
+
+// decideGoalTransition now imported from ../core/goal.mjs (shared decision logic).
+
+// ---------------------------------------------------------------------------
+// Supervisor rubric (configurable patterns/antipatterns)
+//
+// The judge's positive completion rules ("Patterns") and the mined
+// premature-stop rules ("Antipatterns") were historically hardcoded inline in
+// two prompt builders. They now live in this single embedded default, which
+// users can override with a rubric.md file (see loadRubric). The embedded
+// default keeps the single-file `cp supervisor-3.ts` install working.
+// ---------------------------------------------------------------------------
+
+export interface Rubric {
+  patterns: string
+  antipatterns: string
+}
+
+/**
+ * Load the active rubric for a project. Precedence (first complete one wins):
+ *   1. project: <directory>/.supervisor/rubric.md      → source "project"
+ *   2. global:  ~/.config/opencode/supervisor/rubric.md → source "global"
+ *   3. embedded DEFAULT_RUBRIC                           → source "default"
+ * An override missing either section falls through to the next source, so the
+ * judge never runs with an empty rubric.
+ */
+export async function loadRubric(
+  directory: string
+): Promise<Rubric & { source: "project" | "global" | "default" }> {
+  const candidates: Array<{ path: string; source: "project" | "global" }> = [
+    { path: join(directory, ".supervisor", "rubric.md"), source: "project" },
+    { path: join(homedir(), ".config", "opencode", "supervisor", "rubric.md"), source: "global" },
+  ]
+  for (const { path, source } of candidates) {
+    try {
+      const md = await readFile(path, "utf-8")
+      const r = parseRubric(md)
+      if (r.patterns && r.antipatterns) return { ...r, source }
+    } catch {
+      /* not present / unreadable — try next */
+    }
+  }
+  return { ...parseRubric(DEFAULT_RUBRIC), source: "default" }
+}
+
+type TaskType = "coding" | "docs" | "research" | "ops" | "other"
+type AgentMode = "plan" | "build" | "unknown"
+type RoutingCategory = "backend" | "architecture" | "frontend" | "default"
+
+interface WorkflowRequirements {
+  requiresTests: boolean
+  requiresBuild: boolean
+  requiresPR: boolean
+  requiresCI: boolean
+  requiresLocalTests: boolean
+  requiresLocalTestsEvidence: boolean
+}
+
+interface TaskContext extends WorkflowRequirements {
+  /**
+   * Backward-compatible alias of `currentTask`. It used to be every user
+   * message in the session joined as "[1]..[n]" — unbounded and unweighted,
+   * which let the judge demand turn 1's deliverables on turn 20.
+   */
+  taskSummary: string
+  /** The user's LATEST request. Feeds the non-actionable turn gate — NOT the judge. */
+  currentTask: string
+  /**
+   * THE judge's context, and the only one: the plain alternating conversation
+   * (`user:` / `assistant:` blocks, oldest first, newest pair always in full).
+   * Tool calls, tool inputs and tool results are deliberately absent — the
+   * judge reads the conversation the way a human would. See
+   * core/task-context.mjs.
+   */
+  conversationChain?: string
+  taskType: TaskType
+  agentMode: AgentMode
+  humanMessages: string[]
+  toolsSummary: string
+  detectedSignals: string[]
+  recentCommands: string[]
+  pushedToDefaultBranch: boolean
+}
+
+interface SelfAssessment {
+  task_summary?: string
+  task_type?: string
+  status?: "complete" | "in_progress" | "blocked" | "stuck" | "waiting_for_user"
+  confidence?: number
+  evidence?: {
+    tests?: {
+      ran?: boolean
+      results?: "pass" | "fail" | "unknown"
+      ran_after_changes?: boolean
+      commands?: string[]
+      skipped?: boolean
+      skip_reason?: string
+    }
+    build?: {
+      ran?: boolean
+      results?: "pass" | "fail" | "unknown"
+    }
+    pr?: {
+      created?: boolean
+      url?: string
+      ci_status?: "pass" | "fail" | "unknown"
+      checked?: boolean
+    }
+  }
+  remaining_work?: string[]
+  next_steps?: string[]
+  needs_user_action?: string[]
+  stuck?: boolean
+  alternate_approach?: string
+}
+
+interface SupervisorAnalysis {
+  complete: boolean
+  shouldContinue: boolean
+  reason: string
+  missing: string[]
+  nextActions: string[]
+  requiresHumanAction: boolean
+  severity: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "BLOCKER"
+  /**
+   * The judge's feedback EXACTLY as it came back, before `reason` substitutes
+   * a placeholder for a blank one.
+   *
+   * isActionlessVerdict's whole job is to notice a verdict with nothing in it
+   * — empty missing, empty next_actions, blank feedback. Feeding it `reason`
+   * fed it "Judge analysis completed" instead of "", so the blank-feedback
+   * arm could never be true and the guard reported the wrong stand-down
+   * reason for the exact verdict shape it was written for (observed live:
+   * an empty verdict stood down as "judge did not ask to continue" rather
+   * than "verdict had no actionable content").
+   */
+  rawFeedback?: string
+}
+
+interface RoutingConfig {
+  enabled: boolean
+  models: Record<RoutingCategory, string>
+}
+
+const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
+  enabled: false,
+  models: {
+    backend: "",
+    architecture: "",
+    frontend: "",
+    default: ""
+  }
+}
+
+const JUDGE_RESPONSE_TIMEOUT = 120_000
+const POLL_INTERVAL = 2_000
+const ABORT_COOLDOWN = 10_000
+const ABORT_RACE_DELAY = 1_500 // ms to wait for session.error to arrive before running supervisor
+const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "supervisor.yaml")
+// Last-resort fallback when no model is configured. Uses a free opencode model
+// to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
+const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
+const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_loop_exit", "set_supervisor"])
+
+export function trackSessionScopedToolSession(
+  currentSessionId: string | null,
+  input: { tool?: string; sessionID?: string }
+): string | null {
+  if (input.sessionID && input.tool && SESSION_SCOPED_TOOLS.has(input.tool)) {
+    return input.sessionID
+  }
+  return currentSessionId
+}
+
+// Debug logging — writes to .supervisor/debug.log when SUPERVISOR_DEBUG=1.
+// Never write to stdout/stderr — it corrupts the OpenCode TUI.
+const SUPERVISOR_DEBUG = process.env.SUPERVISOR_DEBUG === "1"
+
+// Module-level debug function, initially a no-op.
+// Replaced with a file-backed logger once the plugin initializes with a directory.
+let debug: (...args: any[]) => void = () => {}
+
+function initDebugLogger(directory: string) {
+  if (!SUPERVISOR_DEBUG) return
+  const logPath = join(directory, ".supervisor", "debug.log")
+  let dirEnsured = false
+  debug = (...args: any[]) => {
+    const msg = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")
+    const ts = new Date().toISOString()
+    const line = `[${ts}] [Supervisor] ${msg}\n`
+    // Fire-and-forget: do not await to avoid slowing down the plugin
+    ;(async () => {
+      if (!dirEnsured) {
+        try { await mkdir(join(directory, ".supervisor"), { recursive: true }) } catch {}
+        dirEnsured = true
+      }
+      try { await appendFile(logPath, line) } catch {}
+    })()
+  }
+}
+
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/\/\*[^]*?\*\//g, "")
+    .replace(/(^|\s)\/\/.*$/gm, "$1")
+}
+
+async function loadPreferredModelSpec(directory: string): Promise<string | null> {
+  const candidates = [
+    join(directory, "opencode.json"),
+    join(directory, ".opencode", "opencode.json"),
+    join(homedir(), ".config", "opencode", "opencode.json"),
+    join(directory, "opencode.jsonc"),
+    join(directory, ".opencode", "opencode.jsonc"),
+    join(homedir(), ".config", "opencode", "opencode.jsonc"),
+  ]
+
+  for (const path of candidates) {
+    try {
+      const content = await readFile(path, "utf-8")
+      const parsed = JSON.parse(stripJsonComments(content))
+      const model = parsed?.model
+      if (typeof model === "string" && model.trim()) {
+        return model.trim()
+      }
+    } catch {}
+  }
+  return null
+}
+
+async function loadSupervisorPrompt(directory: string): Promise<string | null> {
+  const candidates = [".supervisor.md", ".supervisor.MD", "supervisor.md", "supervisor.MD"]
+  for (const name of candidates) {
+    try {
+      const supervisorPath = join(directory, name)
+      const customPrompt = await readFile(supervisorPath, "utf-8")
+      debug("Loaded custom prompt from", name)
+      return customPrompt.trim()
+    } catch {}
+  }
+  return null
+}
+
+function buildToolSupervisorGuidanceSection(toolSupervisorPrompt: string | null): string {
+  if (!toolSupervisorPrompt) return ""
+  return `\n## Tool Supervisor Guidance\n${truncateForPrompt(toolSupervisorPrompt, PROMPT_TEXT_LIMIT, { keep: "head", label: "tool guidance" })}\n`
+}
+
+function resolveSupervisorPromptPrecedence(
+  filePrompt: string | null,
+  toolSupervisorPrompt: string | null,
+  defaultPrompt: string
+): { prompt: string; source: "file" | "tool" | "default"; effectiveToolSupervisorPrompt: string | null } {
+  if (filePrompt) {
+    return {
+      prompt: filePrompt,
+      source: "file",
+      effectiveToolSupervisorPrompt: null
+    }
+  }
+  if (toolSupervisorPrompt) {
+    return {
+      prompt: `${defaultPrompt}${buildToolSupervisorGuidanceSection(toolSupervisorPrompt)}`,
+      source: "tool",
+      effectiveToolSupervisorPrompt: toolSupervisorPrompt
+    }
+  }
+  return {
+    prompt: defaultPrompt,
+    source: "default",
+    effectiveToolSupervisorPrompt: null
+  }
+}
+
+async function getAgentsFile(directory: string): Promise<string> {
+  for (const name of ["AGENTS.md", ".opencode/AGENTS.md", "agents.md"]) {
+    try {
+      const content = await readFile(join(directory, name), "utf-8")
+      return content
+    } catch {}
+  }
+  return ""
+}
+
+/**
+ * Stable identity for one message — THE per-turn key (see
+ * getLastRelevantUserMessageId, which the attempt budget is scoped by).
+ *
+ * `msg.info.id` is checked, not just `msg.id`. opencode's REST transcript
+ * shape is `{ info: { id, role, time }, parts: [...] }` — there is NO
+ * top-level `id`, so the old `if (msg.id)` NEVER matched and every key fell
+ * through to the composite. Verified against a live server: `msg.id` is
+ * `undefined` and `msg.info.id` is `msg_fda79148d001bdPZnwwZoyiPGx`.
+ *
+ * That mattered because the composite is lossy: `info.time.start` is unset on
+ * user messages (only `created` exists), so every key degraded to
+ * `user:0:<first 20 characters>`. Two consecutive human turns sharing a
+ * 20-character prefix — "can you please check the alpha module" and "…the
+ * beta module" both key as `user:0:can you please check` — collided, and the
+ * second turn silently inherited the first turn's spent attempt budget, i.e.
+ * was never supervised at all.
+ */
+function getMessageSignature(msg: any): string {
+  const id = msg?.id || msg?.info?.id
+  if (id) return id
+  const role = msg?.info?.role || "unknown"
+  const time = msg?.info?.time?.created ?? msg?.info?.time?.start ?? 0
+  const textPart = msg?.parts?.find((p: any) => p.type === "text")?.text?.slice(0, 20) || ""
+  return `${role}:${time}:${textPart}`
+}
+
+export function getLastRelevantUserMessageId(messages: any[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.info?.role === "user") {
+      let isSupervisor = false
+      for (const part of msg.parts || []) {
+        if (part.type === "text" && part.text) {
+          if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) {
+            isSupervisor = true
+            break
+          }
+        }
+      }
+      if (!isSupervisor) return getMessageSignature(msg)
+    }
+  }
+  return null
+}
+
+/**
+ * Epoch-ms start of the current HUMAN turn: the `time.created` of the last
+ * user message that is not a supervisor injection (same "relevant user
+ * message" rule as getLastRelevantUserMessageId, so the two always agree on
+ * which turn they mean).
+ *
+ * Returns 0 when it cannot be determined. Callers must treat 0 as "unknown"
+ * and degrade permissively — see checkStatusCompliance in
+ * core/status-directive.mjs, which lets any existing status.md count as fresh
+ * in that case rather than nagging on a guess.
+ */
+export function getLastRelevantUserMessageTime(messages: any[]): number {
+  if (!Array.isArray(messages)) return 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg?.info?.role !== "user") continue
+    let isSupervisor = false
+    for (const part of msg.parts || []) {
+      if (part.type === "text" && part.text) {
+        if (part.text.includes(SELF_ASSESSMENT_MARKER) || part.text.includes(FEEDBACK_MARKER)) {
+          isSupervisor = true
+          break
+        }
+      }
+    }
+    if (isSupervisor) continue
+    const created = msg?.info?.time?.created
+    return typeof created === "number" && Number.isFinite(created) ? created : 0
+  }
+  return 0
+}
+
+function isJudgeSession(sessionId: string, messages: any[], judgeSessionIds: Set<string>): boolean {
+  if (judgeSessionIds.has(sessionId)) return true
+  for (const msg of messages) {
+    for (const part of msg.parts || []) {
+      if (part.type === "text" && (part.text?.includes("ANALYZE SUPERVISOR") || part.text?.includes("SELF-ASSESS SUPERVISOR") || part.text?.includes("REVIEW SUPERVISOR COMPLETION"))) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+async function showToast(client: any, directory: string, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  try {
+    await client.tui.publish({
+      query: { directory },
+      body: {
+        type: "tui.toast.show",
+        properties: { title: "Supervisor", message, variant, duration: 5000 }
+      }
+    })
+  } catch {}
+}
+
+function parseModelListFromYaml(content: string): string[] {
+  const models: string[] = []
+  const lines = content.split(/\r?\n/)
+  let inModels = false
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+
+    if (/^models\s*:/i.test(line)) {
+      inModels = true
+      const inline = line.replace(/^models\s*:/i, "").trim()
+      if (inline.startsWith("[") && inline.endsWith("]")) {
+        const items = inline.slice(1, -1).split(",")
+        for (const item of items) {
+          const value = item.trim().replace(/^['"]|['"]$/g, "")
+          if (value) models.push(value)
+        }
+        inModels = false
+      }
+      continue
+    }
+
+    if (inModels) {
+      if (/^[\w-]+\s*:/.test(line)) {
+        inModels = false
+        continue
+      }
+      if (line.startsWith("-")) {
+        const value = line.replace(/^-\s*/, "").trim().replace(/^['"]|['"]$/g, "")
+        if (value) models.push(value)
+      }
+    }
+  }
+
+  return models
+}
+
+function parseRoutingFromYaml(content: string): RoutingConfig {
+  const config: RoutingConfig = { ...DEFAULT_ROUTING_CONFIG, models: { ...DEFAULT_ROUTING_CONFIG.models } }
+  const lines = content.split(/\r?\n/)
+  let inRouting = false
+  let inRoutingModels = false
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+
+    if (/^routing\s*:/i.test(line)) {
+      inRouting = true
+      continue
+    }
+
+    if (inRouting) {
+      // Exit routing section when we hit a top-level key
+      if (/^[a-zA-Z][\w-]*\s*:/.test(rawLine) && !rawLine.startsWith(" ") && !rawLine.startsWith("\t")) {
+        inRouting = false
+        inRoutingModels = false
+        continue
+      }
+
+      if (/^\s*enabled\s*:\s*(true|false)/i.test(rawLine)) {
+        config.enabled = /true/i.test(rawLine)
+        continue
+      }
+
+      if (/^\s*models\s*:/i.test(rawLine)) {
+        inRoutingModels = true
+        continue
+      }
+
+      if (inRoutingModels) {
+        // Exit models sub-section on a non-indented or non-model key
+        if (/^\s{2,}[\w-]+\s*:/.test(rawLine) || /^\s+[\w-]+\s*:/.test(rawLine)) {
+          const match = rawLine.match(/^\s+([\w-]+)\s*:\s*(.*)/)
+          if (match) {
+            const key = match[1].toLowerCase() as RoutingCategory
+            const value = match[2].trim().replace(/^['"]|['"]$/g, "")
+            if (key === "backend" || key === "architecture" || key === "frontend" || key === "default") {
+              config.models[key] = value
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return config
+}
+
+
+function parseRoutingCategory(text: string | null | undefined): RoutingCategory | null {
+  if (typeof text !== "string") return null
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as { category?: string }
+      const value = (parsed.category || "").toLowerCase()
+      if (value === "backend" || value === "architecture" || value === "frontend" || value === "default") {
+        return value
+      }
+    } catch {}
+  }
+  const word = trimmed.split(/\s+/)[0]?.toLowerCase()
+  if (word === "backend" || word === "architecture" || word === "frontend" || word === "default") {
+    return word
+  }
+  return null
+}
+
+async function classifyTaskForRoutingWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  judgeSessionIds: Set<string>,
+  sessionMessages?: any[],
+  opts?: { routingEnabled?: boolean }
+): Promise<RoutingCategory | null> {
+  // Gate: skip entire classification when routing is disabled — saves tokens
+  if (opts?.routingEnabled === false) return null
+
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
+
+  let attempts: string[] = []
+  if (modelList.length) {
+    attempts = modelList
+  } else if (preferredModel) {
+    const routingModel = getGitHubCopilotModelForRouting(preferredModel)
+    if (routingModel && !isBlockedJudgeModel(routingModel)) {
+      attempts = [routingModel]
+    } else if (!isBlockedJudgeModel(preferredModel)) {
+      attempts = [preferredModel]
+    }
+  }
+  if (attempts.length === 0) {
+    attempts = sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec) ? [sessionModelSpec] : [JUDGE_FREE_FALLBACK]
+  }
+
+  const prompt = `CLASSIFY TASK ROUTING\n\nYou are classifying a task into one routing category.\n\nTask summary:\n${context.taskSummary}\n\nTask type: ${context.taskType}\n\nRecent user messages:\n${context.humanMessages.slice(0, 4).join("\n\n")}\n\nChoose exactly one category from: backend, architecture, frontend, default.\nReturn JSON only:\n{\n  "category": "backend|architecture|frontend|default"\n}`
+
+  for (const modelSpec of attempts) {
+    let classifierSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      classifierSession = data
+    } catch {
+      return null
+    }
+    if (!classifierSession?.id) return null
+    judgeSessionIds.add(classifierSession.id)
+
+    let response: string | null = null
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: classifierSession.id },
+        body
+      })
+
+      response = await waitForResponse(client, classifierSession.id)
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "routing-classifier" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: classifierSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(classifierSession.id)
+    }
+
+    const category = parseRoutingCategory(response)
+    if (category) return category
+  }
+
+  return null
+}
+
+async function loadRoutingConfig(): Promise<RoutingConfig> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    return parseRoutingFromYaml(content)
+  } catch {
+    return { ...DEFAULT_ROUTING_CONFIG, models: { ...DEFAULT_ROUTING_CONFIG.models } }
+  }
+}
+
+function getRoutingModel(config: RoutingConfig, category: RoutingCategory | null): { providerID: string; modelID: string } | null {
+  if (!category) return null
+  if (!config.enabled) return null
+  const modelSpec = config.models[category] || config.models["default"] || ""
+  if (!modelSpec) return null
+  const parts = modelSpec.split("/")
+  const providerID = parts[0] || ""
+  const modelID = parts.slice(1).join("/") || ""
+  if (!providerID || !modelID) return null
+  return { providerID, modelID }
+}
+
+async function loadSupervisorModelList(): Promise<string[]> {
+  try {
+    const content = await readFile(SUPERVISOR_CONFIG_PATH, "utf-8")
+    const models = parseModelListFromYaml(content)
+    const filtered = models.filter((model) => {
+      if (isBlockedJudgeModel(model)) {
+        debug("Blocked weak supervisor model:", model)
+        return false
+      }
+      return true
+    })
+    if (filtered.length) debug("Loaded supervisor model list:", JSON.stringify(filtered))
+    return filtered
+  } catch {
+    return []
+  }
+}
+
+async function writeVerdictSignal(directory: string, sessionId: string, complete: boolean, severity: string): Promise<void> {
+  // Appends to .supervisor/sessions/<full session id>/verdicts.jsonl.
+  //
+  // Replaces `.supervisor/verdict_<sid8>.json`. That file keyed on the session
+  // id TRUNCATED to 8 chars, so two sessions sharing a prefix overwrote each
+  // other's verdict; and it kept only the newest, so the history a reviewer
+  // needs was gone. The log is append-only and keyed on the FULL id.
+  const ok = sessionStore.appendVerdict(directory, sessionId, {
+    sessionId,
+    complete,
+    severity,
+    timestamp: Date.now(),
+    kind: "verdict-signal",
+  })
+  if (ok) debug("Wrote verdict signal for session:", sessionId)
+  else debug("Failed to write verdict signal for session:", sessionId)
+}
+
+async function saveSupervisorData(directory: string, sessionId: string, data: any): Promise<void> {
+  // Replaces the one-file-per-assessment `.supervisor/<sid8>_<ts>.json` spray
+  // (truncated id, unbounded file count, no GC). Same append-only log.
+  sessionStore.appendVerdict(directory, sessionId, { kind: "assessment", data })
+}
+
+async function waitForResponse(client: any, sessionId: string): Promise<string | null> {
+  const start = Date.now()
+  while (Date.now() - start < JUDGE_RESPONSE_TIMEOUT) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL))
+    try {
+      const { data } = await client.session.messages({ path: { id: sessionId } })
+      const messages = Array.isArray(data) ? data : []
+      const assistantMsg = [...messages].reverse().find((m: any) => m.info?.role === "assistant")
+      if (!(assistantMsg?.info?.time as any)?.completed) continue
+      for (const part of assistantMsg?.parts || []) {
+        if (part.type === "text" && part.text) return part.text
+      }
+    } catch {}
+  }
+  return null
+}
+
+async function hasPath(target: string): Promise<boolean> {
+  try {
+    await stat(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function getRepoSignals(directory: string): Promise<{ hasTestScript: boolean; hasBuildScript: boolean; hasTestsDir: boolean }>{
+  let hasTestScript = false
+  let hasBuildScript = false
+  const packagePath = join(directory, "package.json")
+  try {
+    const content = await readFile(packagePath, "utf-8")
+    const pkg = JSON.parse(content)
+    const scripts = pkg?.scripts || {}
+    hasTestScript = Boolean(scripts.test || scripts["test:ci"] || scripts["test:e2e"])
+    hasBuildScript = Boolean(scripts.build || scripts["build:prod"])
+  } catch {}
+
+  const hasTestsDir = (await hasPath(join(directory, "test"))) || (await hasPath(join(directory, "tests")))
+  return { hasTestScript, hasBuildScript, hasTestsDir }
+}
+
+async function buildTaskContext(messages: any[], directory: string): Promise<TaskContext | null> {
+  if (!Array.isArray(messages)) return null
+  const humanMessages: string[] = []
+
+  for (const msg of messages) {
+    if (msg.info?.role === "user") {
+      const text = userMessageText(msg)
+      if (text != null) humanMessages.push(text)
+    }
+  }
+
+  // ONE extractor, shared with the reflection call site (core/task-context.mjs).
+  // Previously this kept the LAST text part while extractLastAssistantText took
+  // the FIRST, so the judge's "agent's last response" depended on the call site.
+  const lastAssistantText = extractLastAssistantText(messages)
+
+  if (humanMessages.length === 0) return null
+
+  // `currentTask` is NOT judge context any more — it feeds the non-actionable
+  // turn gate and `taskSummary`. The judge reads `conversationChain` only.
+  const currentTask = currentUserTask(humanMessages)
+  const taskSummary = currentTask
+
+  // THE judge's context: the plain alternating user/assistant conversation.
+  // Tool calls, tool inputs and tool results are deliberately NOT here.
+  const conversationChain = buildConversationChain(messages)
+
+  const combinedText = `${humanMessages.join(" ")} ${lastAssistantText}`
+  const taskType = inferTaskType(combinedText)
+  const agentMode: AgentMode = isPlanMode(messages) ? "plan" : "build"
+
+  const repoSignals = await getRepoSignals(directory)
+  const commands = extractToolCommands(messages)
+  const detectedSignals = detectSignals(combinedText, commands)
+  const recentCommands = getRecentCommands(commands)
+  const hasLocalTests = hasLocalTestCommand(commands)
+  const pushedDefault = pushedToDefaultBranch(commands)
+
+  const requiresTests = taskType === "coding" && (repoSignals.hasTestScript || repoSignals.hasTestsDir || detectedSignals.includes("test-mention"))
+  const requiresBuild = taskType === "coding" && (repoSignals.hasBuildScript || detectedSignals.includes("build-mention"))
+  // PR and CI are only required for coding tasks that actually changed code — not
+  // merely classified "coding" from a verb like "create" (e.g. "create GitHub epic
+  // issues" has no diff to PR, just gh/API calls). ops/personal-assistant tasks
+  // don't need them either.
+  const requiresPR = taskType === "coding" && hasCodeChangeEvidence(commands)
+  const requiresCI = taskType === "coding" && hasCodeChangeEvidence(commands)
+  const requiresLocalTests = requiresTests
+  const requiresLocalTestsEvidence = requiresTests && !hasLocalTests
+
+  const toolsSummary = commands.slice(-6).join("\n") || "(none)"
+
+    return {
+    taskSummary,
+    currentTask,
+    conversationChain: conversationChain || undefined,
+    taskType,
+    agentMode,
+    humanMessages,
+    toolsSummary,
+    detectedSignals,
+    recentCommands,
+    pushedToDefaultBranch: pushedDefault,
+    requiresTests,
+    requiresBuild,
+    requiresPR,
+    requiresCI,
+    requiresLocalTests,
+    requiresLocalTestsEvidence
+  }
+}
+
+// extractLastAssistantText now lives in core/task-context.mjs (imported above)
+// and is the SINGLE extractor used by both this file and buildTaskContext.
+
+async function analyzeSelfAssessmentWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  selfAssessment: string,
+  judgeSessionIds: Set<string>,
+  toolSupervisorPrompt?: string | null,
+  rubric?: Rubric,
+  sessionMessages?: any[]
+): Promise<SupervisorAnalysis | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
+  const attempts = modelList.length
+    ? modelList
+    : preferredModel && !isBlockedJudgeModel(preferredModel)
+      ? [preferredModel]
+      : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+        ? [sessionModelSpec]
+        : [JUDGE_FREE_FALLBACK]
+
+  const prompt = buildJudgePrompt(context, selfAssessment, toolSupervisorPrompt, rubric)
+
+  for (const modelSpec of attempts) {
+    let judgeSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      judgeSession = data
+    } catch {
+      return null
+    }
+    if (!judgeSession?.id) return null
+    judgeSessionIds.add(judgeSession.id)
+
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: judgeSession.id },
+        body
+      })
+
+      const response = await waitForResponse(client, judgeSession.id)
+      if (!response) continue
+
+      const verdict = parseSelfAssessmentJson(response) as any
+      if (!verdict) continue
+      const missing = Array.isArray(verdict.missing) ? verdict.missing : []
+      const humanOnlyMissing = missing.filter((item: string) => isHumanOnlyAction(item))
+      const actionableMissing = missing.filter((item: string) => !isHumanOnlyAction(item))
+      const actionableNextActions = Array.isArray(verdict.next_actions)
+        ? verdict.next_actions.filter((item: string) => typeof item === "string" && !isHumanOnlyAction(item))
+        : []
+      const shouldContinue = !verdict.complete && (actionableMissing.length > 0 || actionableNextActions.length > 0)
+      const requiresHumanAction = !!verdict.requires_human_action || humanOnlyMissing.length > 0
+      return {
+        complete: !!verdict.complete,
+        shouldContinue,
+        reason: verdict.feedback || "Judge analysis completed",
+        rawFeedback: typeof verdict.feedback === "string" ? verdict.feedback : "",
+        missing,
+        nextActions: Array.isArray(verdict.next_actions) ? verdict.next_actions : [],
+        requiresHumanAction,
+        severity: verdict.severity || "MEDIUM"
+      }
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "judge-session" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: judgeSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(judgeSession.id)
+    }
+  }
+
+  return null
+}
+
+/**
+ * LLM goal-derivation for a `set-goal` request invoked with no explicit
+ * condition and no existing session/project goal. Binding contract
+ * (align-supervisor-modes): goal derivation is not allowed to fabricate a
+ * static default — on ANY failure
+ * (no model available, session/network error, unparseable response, or a
+ * response that fails strict falsifiability/injection validation via
+ * core/goal.mjs's parseDerivedGoalResponse) this returns null and the caller
+ * MUST surface an explicit "please set a goal manually" message rather than
+ * inventing one. This function owns only the runtime plumbing — spawning an
+ * ephemeral judge-style session per candidate model, mirroring the same
+ * model cascade used by analyzeSelfAssessmentWithLLM above — the actual
+ * prompt construction and response validation live in core/goal.mjs so both
+ * are independently unit-testable without a network call.
+ */
+async function deriveGoalWithLLM(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  agents: string,
+  sessionMessages: any[],
+  judgeSessionIds: Set<string>
+): Promise<{ condition: string; acceptanceCriteria: string; verification: string; rationale: string } | null> {
+  const modelList = await loadSupervisorModelList()
+  const preferredModel = await loadPreferredModelSpec(directory)
+  const sessionModelSpec = getLastSessionModelSpec(sessionMessages || [])
+  // Named modelAttempts (NOT `attempts`) — the SupervisorPlugin closure
+  // already declares `attempts` as the per-message attempt-count Map; this
+  // function is standalone (not nested in that closure) so there is no
+  // actual shadowing bug, but the distinct name avoids any confusion when
+  // reading this alongside that closure.
+  const modelAttempts = modelList.length
+    ? modelList
+    : preferredModel && !isBlockedJudgeModel(preferredModel)
+      ? [preferredModel]
+      : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+        ? [sessionModelSpec]
+        : [JUDGE_FREE_FALLBACK]
+
+  // Transcript excerpt is untrusted data — see buildGoalDerivationPrompt's
+  // fencing/security framing in core/goal.mjs. Bounded to the last few
+  // messages so a long session can't blow the prompt budget.
+  const transcriptExcerpt = (sessionMessages || [])
+    .slice(-10)
+    .map((m: any) => {
+      const role = m.info?.role || "unknown"
+      const text = (m.parts || [])
+        .filter((p: any) => p.type === "text" && p.text)
+        .map((p: any) => p.text)
+        .join(" ")
+      return text ? `${role}: ${text.slice(0, 500)}` : ""
+    })
+    .filter(Boolean)
+    .join("\n")
+
+  const prompt = buildGoalDerivationPrompt({
+    taskSummary: context.taskSummary,
+    transcriptExcerpt,
+    agentsExcerpt: agents,
+  })
+
+  for (const modelSpec of modelAttempts) {
+    let derivationSession: any
+    try {
+      const { data } = await client.session.create({ query: { directory } })
+      derivationSession = data
+    } catch {
+      return null
+    }
+    if (!derivationSession?.id) return null
+    judgeSessionIds.add(derivationSession.id)
+
+    try {
+      const modelParts = modelSpec ? modelSpec.split("/") : []
+      const providerID = modelParts[0] || ""
+      const modelID = modelParts.slice(1).join("/") || ""
+
+      const body: any = { parts: [{ type: "text", text: prompt }] }
+      if (providerID && modelID) body.model = { providerID, modelID }
+
+      await client.session.promptAsync({
+        path: { id: derivationSession.id },
+        body
+      })
+
+      const response = await waitForResponse(client, derivationSession.id)
+      if (!response) continue
+
+      const derived = parseDerivedGoalResponse(response)
+      if (!derived) continue
+      return derived
+    } catch (e) {
+      reportError(e, { plugin: "supervisor-3", op: "goal-derivation-session" })
+      continue
+    } finally {
+      try {
+        await client.session.delete({ path: { id: derivationSession.id }, query: { directory } })
+      } catch {}
+      judgeSessionIds.delete(derivationSession.id)
+    }
+  }
+
+  return null
+}
+
+async function runCrossModelReview(
+  client: any,
+  directory: string,
+  context: TaskContext,
+  selfAssessment: string,
+  analysis: SupervisorAnalysis,
+  lastAssistantText: string,
+  assessmentModelSpec: string | null,
+  judgeSessionIds: Set<string>,
+  toolSupervisorPrompt?: string | null
+): Promise<{ modelSpec: string; response: string } | null> {
+  const crossModelSpec = getCrossReviewModelSpec(assessmentModelSpec)
+  if (!crossModelSpec) return null
+
+  debug("Starting cross-model review session with model:", crossModelSpec)
+
+  let reviewSession: any
+  try {
+    const { data } = await client.session.create({ query: { directory } })
+    reviewSession = data
+  } catch {
+    debug("Failed to create cross-review session")
+    return null
+  }
+  if (!reviewSession?.id) return null
+  judgeSessionIds.add(reviewSession.id)
+
+  const prompt = `REVIEW SUPERVISOR COMPLETION
+
+You are reviewing another model's completion verdict for an agent task.
+Provide a concise critique and supervisor:
+- Does the self-assessment evidence justify completion?
+- Any missing workflow gates (tests/build/PR/CI)?
+- Any inconsistencies between tool signals and the agent's claim?
+- Provide a short supervisor: what could have been stronger?
+
+## Task Summary
+${context.taskSummary}
+
+## Task Type
+${context.taskType}
+
+## Tool Signals
+${context.toolsSummary}
+
+## Agent Last Response
+${truncateForPrompt(lastAssistantText, 2000, { keep: "tail", label: "agent response" })}
+
+## Self-Assessment
+${truncateForPrompt(selfAssessment, 3000, { keep: "tail", label: "self-assessment" })}
+${buildToolSupervisorGuidanceSection(toolSupervisorPrompt || null)}
+
+## Supervisor Analysis Verdict
+${JSON.stringify(analysis, null, 2)}
+
+Return a short paragraph plus bullet list of any gaps.`
+
+  try {
+    const modelParts = parseModelSpec(crossModelSpec)
+    const body: any = { parts: [{ type: "text", text: prompt }] }
+    if (modelParts) body.model = modelParts
+
+    await client.session.promptAsync({
+      path: { id: reviewSession.id },
+      body
+    })
+
+    const response = await waitForResponse(client, reviewSession.id)
+    if (!response) return null
+    return { modelSpec: crossModelSpec, response }
+  } catch (e) {
+    reportError(e, { plugin: "supervisor-3", op: "cross-review" })
+    return null
+  } finally {
+    try {
+      await client.session.delete({ path: { id: reviewSession.id }, query: { directory } })
+    } catch {}
+    judgeSessionIds.delete(reviewSession.id)
+  }
+}
+
+export const SupervisorPlugin: Plugin = async ({ client, directory }) => {
+  initDebugLogger(directory)
+  const judgeSessionIds = new Set<string>()
+  const activeSupervisors = new Set<string>()
+  const pendingSupervisorIdles = new Set<string>()
+  const recentlyAbortedSessions = new Map<string, number>()
+  /**
+   * In-memory tier of THE per-turn attempt counter. One entry per session,
+   * replaced when the turn moves, so it is bounded by live-session count.
+   *
+   * This is NOT a second stop mechanism. It is a monotonic floor under the
+   * persisted counter in `.supervisor/sessions/<id>/state.json`: reads take
+   * max(memory, disk) and writes go to both. Rationale — the persisted write
+   * is best-effort (an fs failure must never crash a turn), and without an
+   * in-memory floor a failed saturation write would let the same turn be
+   * supervised again. Disk gives cross-restart and cross-process safety;
+   * memory gives in-process safety when disk is unavailable. Same number,
+   * two tiers.
+   */
+  const memAttempts = new Map<string, { turnKey: string; count: number }>()
+  /**
+   * One-shot registry for the "completed but skipped the status checkpoint"
+   * correction: sessionId -> the lastUserMsgId it was already sent for.
+   * At most ONE correction per human turn, ever, so this can never become a
+   * loop. Kept alongside the attempt counter (which that path also saturates)
+   * because it is a different concern: "this chore was already asked for",
+   * not "this turn's budget is spent".
+   */
+  const statusCorrectionSent = new Map<string, string>()
+  /**
+   * sessionId -> the turnKey we already emitted the "runaway limit is
+   * UNLIMITED" debug line for. opencode raises several session.idle events per
+   * human turn, so this dedupes the visibility notice to once per turn — an
+   * unbounded session must be visible in the log without spamming it.
+   */
+  const unlimitedNoticeTurn = new Map<string, string>()
+  /**
+   * sessionId -> the project directory that session is working in.
+   *
+   * A pure read-through cache in front of the DURABLE copy persisted in
+   * SupervisorState.projectDir. It is an optimisation only: every reader must
+   * fall back to the persisted value, because this map is empty after every
+   * server restart and a cache-only lookup would then silently scope the
+   * .supervisor/disabled check to the wrong project.
+   */
+  const sessionDirCache = new Map<string, string>()
+
+  /**
+   * THE per-turn attempt counter — read.
+   *
+   * Turn-scoped by construction: `sessionStore.readAttempts` returns 0 the
+   * moment the stored turnKey differs from `turnKey`, and the memory tier is
+   * compared on turnKey too. So a new human message resets the budget without
+   * anyone having to remember to clear anything (the class of bug the old
+   * `attempts.delete(attemptKey)` calls existed to paper over).
+   *
+   * Never throws: an unreadable state file must not stop supervision, and the
+   * memory tier still bounds the loop inside this process.
+   */
+  function readTurnAttempts(sessionId: string, turnKey: string): number {
+    const cached = memAttempts.get(sessionId)
+    const mem = cached && cached.turnKey === turnKey ? cached.count : 0
+    let disk = 0
+    try {
+      disk = sessionStore.readAttempts(directory, sessionId, turnKey) || 0
+    } catch (e: any) {
+      debug("attempts read failed (using in-memory tier):", e?.message || e)
+    }
+    return Math.max(mem, disk)
+  }
+
+  /**
+   * THE per-turn attempt counter — write. Memory first (cannot fail), then
+   * disk (best-effort). Monotonic within a turn on both tiers.
+   */
+  function writeTurnAttempts(sessionId: string, n: number, turnKey: string): void {
+    const cached = memAttempts.get(sessionId)
+    const base = cached && cached.turnKey === turnKey ? cached.count : 0
+    if (n > base || !cached || cached.turnKey !== turnKey) {
+      memAttempts.set(sessionId, { turnKey, count: Math.max(n, base) })
+    }
+    try {
+      sessionStore.writeAttempts(directory, sessionId, n, turnKey)
+    } catch (e: any) {
+      debug("attempts write failed (in-memory tier still holds):", e?.message || e)
+    }
+  }
+
+  /**
+   * Stand down for the REST of this human turn.
+   *
+   * There is exactly ONE way the per-turn loop stops: the counter reaching the
+   * budget. Every path whose intent is "do not supervise this turn again"
+   * therefore saturates the counter rather than setting a second boolean flag.
+   * The previous design had two mechanisms (a `lastReflectedMsgId` boolean AND
+   * this counter) and the boolean always won, which made the counter — and
+   * therefore `/supervisor retry N` — dead on this runtime.
+   *
+   * ONLY for paths that have already committed to supervising this turn
+   * (judge ran, or a judge/transport error ended the pass). Cheap, idempotent
+   * ELIGIBILITY gates — the subagent gate, `.supervisor/disabled`, the
+   * non-actionable/control-command turn gate — must plain-return instead:
+   * they re-derive the same answer for free on every idle, and saturating
+   * makes them indistinguishable from a genuinely spent budget, which then
+   * triggers the cap branch's side effects (see the turn-gate comment).
+   */
+  function standDownForTurn(sessionId: string, turnKey: string, budget: number): void {
+    writeTurnAttempts(sessionId, budget, turnKey)
+  }
+
+  /**
+   * ── Plainspeak: one deterministic style-rewrite nudge per turn ──────────
+   *
+   * Asks the agent to rewrite its own last reply when that reply reads
+   * verbose. This is a CHORE, in the same family as the status-checkpoint
+   * correction — never a continuation attempt — so it deliberately does not
+   * read or write the attempt budget.
+   *
+   * DETERMINISTIC ONLY, ON PURPOSE. It fires exclusively on
+   * `scoreVerbosity(text).verdict === "verbose"`; `"suspect"` is treated as
+   * terse and dropped. `buildStylePrompt` (core/verbosity.mjs) is
+   * INTENTIONALLY UNUSED by this runtime — escalating an ambiguous reply to
+   * an LLM tiebreak, as bin/plainspeak-on-stop.mjs may, would put a model
+   * call, a network dependency, and a source of flake on the idle path for a
+   * style nudge. If you are here to "improve" this by adding the tiebreak:
+   * don't.
+   *
+   * IT NEVER FIGHTS THE SUPERVISOR. Call this ONLY from a path where the
+   * supervisor itself already decided to stand down (task complete with no
+   * status correction, human action required, actionless verdict, empty
+   * rendered feedback). If the supervisor injected continuation feedback
+   * or a status correction on this turn, plainspeak stays silent —
+   * at most ONE chore injection per turn.
+   *
+   * TERMINATION: `lastPlainTurnKey` is persisted and compared against the same
+   * turn key the attempt budget uses. The agent's reply to the directive
+   * raises a fresh session.idle for the SAME key, the guard matches, and this
+   * returns silently. There is no path to a second injection on one turn.
+   *
+   * The subagent gate, `.supervisor/disabled`, the judge/ephemeral-session
+   * gate and the supervisor-control-turn gate are all satisfied structurally:
+   * every one of them plain-returns from runSupervisor long before any call
+   * site below is reached.
+   *
+   * @returns true if a directive was injected.
+   */
+  async function maybeInjectPlainspeak(args: {
+    sessionId: string
+    turnKey: string
+    sup: SupervisorState
+    goal: SupervisorGoal | null
+    lastAssistantText: string
+    projectGoalCondition?: string
+  }): Promise<boolean> {
+    const { sessionId, turnKey, sup, goal, lastAssistantText } = args
+    try {
+      if (!isPlainspeakEnabled(sup)) return false
+      // An active goal (session-scoped or project-scoped) means the turn is
+      // still under a standing objective. Style is not the priority.
+      if (goal) return false
+      if (args.projectGoalCondition) return false
+      // One rewrite per turn, ever.
+      if (sup.lastPlainTurnKey === turnKey) return false
+      if (!lastAssistantText || typeof lastAssistantText !== "string") return false
+
+      const scored = scoreVerbosity(lastAssistantText)
+      // 'suspect' is treated as terse — see the deterministic-only note above.
+      if (scored?.verdict !== "verbose") return false
+
+      const directive = buildRewriteDirective(scored)
+      // Nothing concrete to name = nothing to inject. Never send an empty body.
+      if (!directive || !directive.trim()) return false
+
+      // Marker FIRST, on its own line — provenance + a stable grep for tests,
+      // mirroring STATUS_DIRECTIVE_MARKER. The status directive is
+      // deliberately NOT appended: this is a rewrite of the reply just given,
+      // not a new work instruction.
+      const text = `${PLAINSPEAK_MARKER}\n${directive}`
+
+      // Claim the turn BEFORE prompting. A failed promptAsync still burns the
+      // turn's single rewrite — failing toward silence, never toward a loop.
+      try {
+        await supervisorStore.mutate(directory, sessionId, (s) => { s.lastPlainTurnKey = turnKey })
+      } catch (e: any) {
+        debug("plainspeak: could not persist lastPlainTurnKey, skipping:", e?.message || e)
+        return false
+      }
+
+      await client.session.promptAsync({
+        path: { id: sessionId },
+        body: { parts: [{ type: "text", text }] },
+      })
+      debug("plainspeak: injected rewrite directive for", sessionId.slice(0, 8), "turn", turnKey)
+      await showToast(client, directory, "Reply read verbose — asked for a rewrite", "info")
+      return true
+    } catch (e: any) {
+      // Never let a style nudge change whether the supervisor stops.
+      debug("plainspeak check failed (non-fatal):", e?.message || e)
+      return false
+    }
+  }
+
+  /**
+   * Persist the session -> project-directory mapping so it survives a server
+   * restart. Best-effort and write-avoiding: only touches disk when the value
+   * actually changed, so this costs nothing on the steady-state path.
+   */
+  async function rememberSessionDirectory(sessionId: string, dir: string): Promise<void> {
+    sessionDirCache.set(sessionId, dir)
+    try {
+      const state = await supervisorStore.load(directory, sessionId)
+      if (state.projectDir === dir) return
+      // mutate(), not save(): a blind whole-state overwrite would clobber any
+      // field another writer changed since `load` — attempts and the goal now
+      // live in the SAME state.json.
+      await supervisorStore.mutate(directory, sessionId, (s) => { s.projectDir = dir })
+    } catch (e: any) {
+      debug("failed to persist session projectDir (non-fatal):", e?.message || e)
+    }
+  }
+  let toolSupervisorPrompt: string | null = null
+  let currentSessionId: string | null = null  // tracks most recent active session for the toggle tool
+
+  // Exact match only. Session IDs are time-ordered, so prefix matching would let one
+  // truncated line disable every session created in the same window. Every writer
+  // (this file and bin/supervisor.mjs) persists full IDs, so prefixes are never needed.
+  function sessionMatchesDisabledLine(sessionId: string, line: string): boolean {
+    return line.trim() === sessionId
+  }
+
+  async function readDisabledLines(filePath: string): Promise<string[] | null> {
+    try {
+      const content = await readFile(filePath, "utf8")
+      return content.split("\n").map(l => l.trim()).filter(Boolean)
+    } catch { return null }
+  }
+
+  async function checkDisabledFile(filePath: string, sessionId: string): Promise<boolean> {
+    const lines = await readDisabledLines(filePath)
+    return !!lines?.some(line => sessionMatchesDisabledLine(sessionId, line))
+  }
+
+  async function writeDisabledLines(dir: string, lines: string[]): Promise<void> {
+    const flagPath = join(dir, ".supervisor", "disabled")
+    await mkdir(join(dir, ".supervisor"), { recursive: true, mode: 0o700 })
+    await writeFile(flagPath, lines.join("\n") + (lines.length ? "\n" : ""), { mode: 0o600 })
+    // writeFile's mode only applies on create; chmod covers pre-existing files.
+    await chmod(flagPath, 0o600).catch(() => {})
+  }
+
+  async function isSessionDisabled(sessionId: string, sessionDir?: string): Promise<boolean> {
+    if (sessionDir && await checkDisabledFile(join(sessionDir, ".supervisor", "disabled"), sessionId)) {
+      return true
+    }
+    // The plugin `directory` is the server cwd, not the session's project. It is read
+    // for backward compatibility with entries written before disable became
+    // session-scoped, and by the bin/ CLI when it runs from the server cwd.
+    if (!sessionDir || sessionDir !== directory) {
+      if (await checkDisabledFile(join(directory, ".supervisor", "disabled"), sessionId)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  async function setSessionDisabled(sessionId: string, disabled: boolean, sessionDir?: string): Promise<void> {
+    if (disabled) {
+      // Write ONLY to the session's own project so disabling a session in project A
+      // does not leave an entry in whatever project `opencode serve` started in.
+      const dir = sessionDir || directory
+      const lines = (await readDisabledLines(join(dir, ".supervisor", "disabled"))) ?? []
+      if (!lines.some(l => sessionMatchesDisabledLine(sessionId, l))) lines.push(sessionId)
+      await writeDisabledLines(dir, lines)
+      return
+    }
+
+    // Re-enable must clear EVERY location that isSessionDisabled reads, otherwise a
+    // legacy entry in the server cwd would keep the session disabled forever.
+    for (const dir of new Set<string>([directory, ...(sessionDir ? [sessionDir] : [])])) {
+      const lines = await readDisabledLines(join(dir, ".supervisor", "disabled"))
+      if (lines === null) continue  // no file here; don't create an empty one
+      const next = lines.filter(l => !sessionMatchesDisabledLine(sessionId, l))
+      if (next.length !== lines.length) await writeDisabledLines(dir, next)
+    }
+  }
+
+  /**
+   * Gate for the always-on system-prompt injection of the status directive.
+   *
+   * Runs on the hot path of EVERY LLM request, so it must be cheap and must
+   * never call back into the server (it would be re-entering a server that is
+   * mid-request). Order is cheapest-first: in-memory checks before any
+   * filesystem read.
+   *
+   * The session's project directory comes from the DURABLE
+   * SupervisorState.projectDir, read out of the same `supervisorStore.load`
+   * this function already performs — not from the in-memory sessionDirCache,
+   * which is empty after every server restart. A cache-only lookup made this
+   * gate read the SERVER cwd's .supervisor/disabled for every pre-existing
+   * session after a restart, so a session disabled in project A silently
+   * kept getting the directive (and one disabled in the server cwd silently
+   * suppressed it for unrelated projects).
+   *
+   * Returns false — i.e. stays silent — for:
+   *  - requests with no sessionID (opencode also fires this hook for internal
+   *    agent-config generation, which has no session and no user turn),
+   *  - judge/ephemeral sessions the supervisor itself created,
+   *  - sessions listed in .supervisor/disabled,
+   *  - sessions with statusDiagram explicitly turned off.
+   */
+  async function shouldInjectStatusDirective(sessionID: string | undefined): Promise<boolean> {
+    if (!sessionID || typeof sessionID !== "string") return false
+    // Judge/cross-review sessions are registered here for their whole
+    // lifetime (see runSelfAssessment / runCrossModelReview); the
+    // transcript-scanning half of isJudgeSession needs messages we
+    // deliberately do not fetch on this path.
+    if (judgeSessionIds.has(sessionID)) return false
+    const state = await supervisorStore.load(directory, sessionID)
+    if (!isStatusDiagramEnabled(state)) return false
+    const sessionDir = state.projectDir || sessionDirCache.get(sessionID)
+    if (await isSessionDisabled(sessionID, sessionDir)) return false
+    return true
+  }
+
+  const setSupervisorDescription = "Use this for difficult or complex tasks to set supervisor guidance with a plan/checklist. Provide concrete steps and verification checks so supervisor can validate completion quality and catch missed work."
+  const executeSetSupervisor = async (args: { guidance?: string; clear?: boolean }) => {
+    if (args.clear) {
+      toolSupervisorPrompt = null
+      return "Cleared tool-provided supervisor guidance. Supervisor now uses file override (.supervisor.md/supervisor.md) or default prompt."
+    }
+    const guidance = (args.guidance || "").trim()
+    if (!guidance) {
+      if (!toolSupervisorPrompt) {
+        return "No tool-provided supervisor guidance is set."
+      }
+      return `Current tool-provided supervisor guidance:\n${toolSupervisorPrompt}`
+    }
+    toolSupervisorPrompt = guidance
+    const msg = "Set tool-provided supervisor guidance for this runtime. It will be used when no .supervisor.md/supervisor.md file override exists."
+    if (guidance.length > 4000) return `${msg}\n\nNote: guidance exceeds 4000 chars and will be truncated when applied to supervisor prompts.`
+    return msg
+  }
+
+  // Primary supervisor tool: status and session controls.
+  const supervisorToggleDescription = "Inspect or change supervisor state. action=off/on disables/enables this session. Use status on/off for the status directive and plain on/off for plainspeak. Omit args for status. Use supervisor_goal to declare a goal contract and supervisor_retry for the runaway valve. There are no selectable modes."
+  const executeSupervisorToggle = async (
+    args: { action?: string; mode?: string; condition?: string; clear?: boolean; resume?: boolean; n?: number } = {},
+    context?: any
+  ) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) return "No active session tracked yet — wait for the first session.idle event, then try again."
+    currentSessionId = sid
+    const sessionDir = await resolveSessionDirectoryFor(sid)
+
+    // Filler-tolerant argument reading. The runtime forces the model to emit a
+    // value for every "optional" param (see ABSENT_ARG_SENTINELS), so `mode`
+    // and `action` may both be populated when the user asked for only one.
+    const requestedMode = normalizeOptionalArg(args.mode)?.toLowerCase()
+    const requestedAction = normalizeOptionalArg(args.action)?.toLowerCase()
+
+    // ENABLE AXIS FIRST. off/on are orthogonal to mode, so they must be handled
+    // BEFORE any mode branch. The old order checked `mode` first and
+    // early-returned, which silently converted `/supervisor off` into a mode
+    // change: 3 of 5 real off-attempts in a 30-day sample never persisted, and
+    // one of them ("mode":"autopilot") turned the supervisor UP instead of off.
+    // The tool then returned a success-shaped string, so the agent told the
+    // user "Supervisor is off" while it kept injecting.
+    if (requestedAction === "off" || requestedAction === "on") {
+      const shouldDisable = requestedAction === "off"
+      const modeNote = requestedMode ? " Selectable modes have been removed; goal unchanged." : ""
+      try {
+        await setSessionDisabled(sid, shouldDisable, sessionDir)
+      } catch (e: any) {
+        return `FAILED to ${shouldDisable ? "disable" : "enable"} supervisor for session ${sid.slice(0, 8)}… — could not write .supervisor/disabled: ${e?.message || e}. The supervisor is still ${shouldDisable ? "ON" : "OFF"}.${modeNote}`
+      }
+      // Never report success for an operation that did not persist. Read the
+      // state back through the same path runSupervisor uses.
+      let persisted: boolean
+      try {
+        persisted = await isSessionDisabled(sid, sessionDir)
+      } catch (e: any) {
+        return `FAILED to verify supervisor state for session ${sid.slice(0, 8)}… after ${requestedAction}: ${e?.message || e}. Do not assume the supervisor is ${shouldDisable ? "off" : "on"}.${modeNote}`
+      }
+      if (persisted !== shouldDisable) {
+        return `FAILED to ${shouldDisable ? "disable" : "enable"} supervisor for session ${sid.slice(0, 8)}… — the change did not persist (still ${persisted ? "disabled" : "enabled"}). Checked ${join(sessionDir, ".supervisor", "disabled")}.${modeNote}`
+      }
+      return shouldDisable
+        ? `Supervisor disabled for session ${sid.slice(0, 8)}… (added to .supervisor/disabled, verified).${modeNote}`
+        : `Supervisor enabled for session ${sid.slice(0, 8)}… (removed from .supervisor/disabled, verified).${modeNote}`
+    }
+
+    if (requestedMode) return "Selectable supervisor modes have been removed. Goal unchanged; use supervisor_goal to declare a verified goal contract."
+    // Filler-tolerant, same as the enable-axis above: the runtime may send
+    // `action: ""`/"null" for a request that only carried a mode.
+    const action = requestedAction || "status"
+    // Status-directive toggle. Accepted as "status on"/"status off" (what the
+    // /supervisor and /supervisor:status templates route to) plus the
+    // hyphenated spellings, since models normalise inconsistently. Bare
+    // "status" is NOT handled here — it stays the read-only report below.
+    // The plain "off"/"on" actions are NOT handled here: they are the enable
+    // axis and were already dispatched above, before any mode branch.
+    if (action === "status on" || action === "status-on" || action === "statusdiagram on") {
+      await supervisorStore.setStatusDiagram(directory, sid, true)
+      return `Status checkpoint directive ENABLED for session ${sid.slice(0, 8)}…. Every turn will carry the status.md/roadmap instruction, and a completed task that skipped it gets one reminder.`
+    }
+    if (action === "status off" || action === "status-off" || action === "statusdiagram off") {
+      await supervisorStore.setStatusDiagram(directory, sid, false)
+      return `Status checkpoint directive DISABLED for session ${sid.slice(0, 8)}…. No status.md/roadmap instruction will be injected, and completion will not be gated on it.`
+    }
+    if (action === "plain on" || action === "plain-on" || action === "plainspeak on" || action === "plainspeak-on") {
+      await supervisorStore.setPlainspeak(directory, sid, true)
+      return `Plainspeak ENABLED for session ${sid.slice(0, 8)}…. When a turn ends with nothing left to do and the reply reads verbose, the supervisor asks for one rewrite (deterministic detector, at most once per turn).`
+    }
+    if (action === "plain off" || action === "plain-off" || action === "plainspeak off" || action === "plainspeak-off") {
+      await supervisorStore.setPlainspeak(directory, sid, false)
+      return `Plainspeak DISABLED for session ${sid.slice(0, 8)}…. No style rewrite directives will be injected.`
+    }
+    if (action === "autopilot" || action === "reflection") {
+      return "Selectable supervisor modes have been removed. Goal unchanged; use supervisor_goal."
+    }
+    if (action === "goal") {
+      return "Goal mutations through supervisor(action=goal) are retired. Use supervisor_goal with explicit contract fields and provenance; no goal was changed."
+    }
+    if (action === "retry") {
+      return executeSupervisorRetry({ n: args.n }, context)
+    }
+    if (action === "autoreview" || action === "autoreview-on" || action === "autoreview-off" || action === "autoreview-status") {
+      if (action === "autoreview-off") return executeSupervisorAutoreview({ enabled: false }, context)
+      if (action === "autoreview-status") {
+        const st = await supervisorStore.load(directory, sid)
+        return `Autoreview: ${st.autoreview ? "on" : "off"}`
+      }
+      return executeSupervisorAutoreview({ enabled: true }, context)
+    }
+    const disabled = await isSessionDisabled(sid, sessionDir)
+    const st = await supervisorStore.load(directory, sid)
+    const goalText = st.goal ? `\ngoal: ${st.goal.status} — ${st.goal.condition}\nsource: ${st.goal.source}\nacceptance criteria: ${st.goal.acceptanceCriteria}\nverification: ${st.goal.verification || "(stated in condition)"}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}` : "\ngoal: (none)"
+    // Resolve the ACTUAL runaway limit in effect (retry > config > env >
+    // default), so status shows the real bound — including `unlimited` — not
+    // just whether a session override happens to be set. OpenCode has no
+    // platform cap, so `cappedByPlatform` never fires here.
+    const runaway = describeRunawayLimit({ sessionOverride: st.maxAttempts, config: await loadConfiguredMaxAttempts() })
+    const runawayText = runaway.unlimited
+      ? `\nrunaway limit: unlimited — no attempt cap (tier: ${runaway.tier}). The loop is bounded only by supervisor_loop_exit, the no-progress gate, a goal deadline, and /supervisor off.`
+      : `\nrunaway limit: ${runaway.limit} injections/turn (tier: ${runaway.tier}) — a safety valve, not a budget; the real stop is supervisor_loop_exit.`
+    return `Supervisor status for session ${sid.slice(0, 8)}…\nenabled: ${disabled ? "no" : "yes"}\nretry: ${st.maxAttempts ?? "(default)"}${runawayText}\nautoreview: ${st.autoreview ? "on" : "off"}\nstatus directive: ${isStatusDiagramEnabled(st) ? "on" : "off"}\nplainspeak: ${isPlainspeakEnabled(st) ? "on" : "off"}${goalText}`
+  }
+
+  // supervisor_train tool — runs the learning loop (mine sessions -> classify ->
+  // update USER-LOCAL patterns). Web-app portable (works in TUI, web, and serve).
+  const supervisorTrainDescription = "Train the supervisor on recent sessions: mine how the agent stopped and how the user followed up, then update the user-local patterns/anti-patterns. Never commits to git; dataset stays private. Args: since (e.g. '14d'), dryRun (preview only), pushHf (push private dataset to HuggingFace)."
+  const executeSupervisorTrain = async (args: { since?: string; dryRun?: boolean; pushHf?: boolean }) => {
+    const trainScript = join(dirname(fileURLToPath(import.meta.url)), "..", "train", "run-train.mjs")
+    const argv = [trainScript, `--since=${args.since || "14d"}`]
+    if (args.dryRun) argv.push("--dry-run")
+    if (args.pushHf) argv.push("--push-hf")
+    return await new Promise<string>((resolve) => {
+      execFile("node", argv, { cwd: directory, timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const out = `${stdout || ""}${stderr ? `\n[stderr]\n${stderr}` : ""}`.trim()
+        if (err) resolve(`supervisor:train failed (${err.message}).\n${out.slice(-4000)}`)
+        else resolve(out.slice(-8000) || "supervisor:train completed (no output).")
+      })
+    })
+  }
+
+  /**
+   * The project directory a given session is actually working in.
+   * Fetches the transcript so `info.path.cwd` can be read; falls back to the
+   * plugin/server `directory` only when that is unavailable. See
+   * core/session-context.mjs for why the plugin `directory` is not usable
+   * as a per-session value.
+   */
+  const resolveSessionDirectoryFor = async (sid: string): Promise<string> => {
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      const resolved = resolveSessionDirectory(Array.isArray(data) ? data : [], directory)
+      await rememberSessionDirectory(sid, resolved)
+      return resolved
+    } catch {
+      return sessionDirCache.get(sid) ?? directory
+    }
+  }
+
+  /**
+   * True when this session is a delegated subagent (spawned via the `task`
+   * tool) and the user has not opted into supervising those.
+   *
+   * The parent id is NOT available on the transcript — `message.info.parentID`
+   * is a message id — so this needs the session object itself
+   * (`GET /session/{id}` → `parentID`). Result is cached: a session's parent
+   * never changes, so this costs at most one local API call per session.
+   *
+   * Fails OPEN (returns false) when the SDK has no `session.get` or the call
+   * throws. A hard fail-closed here would silently disable the supervisor
+   * everywhere on an SDK mismatch, which is worse than the bug it fixes.
+   */
+  const subagentCache = new Map<string, boolean>()
+  const isDelegatedSubagentSession = async (sid: string): Promise<boolean> => {
+    if (await loadConfiguredSuperviseSubagents()) return false
+    const cached = subagentCache.get(sid)
+    if (cached !== undefined) return cached
+    if (typeof (client as any)?.session?.get !== "function") {
+      debug("client.session.get unavailable — cannot detect subagent sessions")
+      return false
+    }
+    try {
+      const { data } = await (client as any).session.get({ path: { id: sid } })
+      const result = isSubagentSession(data)
+      subagentCache.set(sid, result)
+      return result
+    } catch (e: any) {
+      debug("session.get failed while checking subagent status:", e?.message || e)
+      return false
+    }
+  }
+
+  /** Project-level goal for a session, read from that session's own project. */
+  const readProjectGoalForSessionId = async (sid: string): Promise<string> => {
+    try {
+      return readProjectGoalCondition(await resolveSessionDirectoryFor(sid)) || ""
+    } catch {
+      return ""
+    }
+  }
+
+  // supervisor_goal / supervisor_retry tools — wire the verified goal loop
+  // to a callable surface (works in TUI, web, serve). The runSupervisor loop reads
+  // this per-session state on the next session.idle.
+  const supervisorGoalDescription = "Declare a goal contract BEFORE requested multi-step work: condition, acceptanceCriteria (observable/falsifiable), verification (evidence/checks), source=agent. Use source=user only for an explicit user-set goal. Agent goals are session-only, cannot overwrite user goals, and need replace=true to replace an active agent goal. No args: report existing goal or derive and create a session-only contract from requested work. Plain questions need no goal. Also supports clear and resume. Completion is audited by the judge, not supervisor_loop_exit."
+  const executeSupervisorGoal = async (args: { condition?: string; acceptanceCriteria?: string; verification?: string; source?: string; replace?: boolean; clear?: boolean; resume?: boolean } = {}, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) return "No active session yet — wait for the first session.idle, then set a goal."
+    currentSessionId = sid
+    if (args.resume) {
+      const outcome = await supervisorStore.resumeGoal(directory, sid)
+      if (!outcome.resumed) {
+        // Never a silent no-op — name the goal's ACTUAL current status so the
+        // caller can't mistake this for a successful resume.
+        if (outcome.reason === "no-goal") {
+          return `No goal is set for session ${sid.slice(0, 8)}… — nothing to resume. Set one with supervisor_goal { condition }.`
+        }
+        if (outcome.reason === "already-active") {
+          return `Goal for session ${sid.slice(0, 8)}… is already active (not paused): "${outcome.condition}". Nothing to resume.`
+        }
+        return `Goal for session ${sid.slice(0, 8)}… is ${outcome.status}, not paused — it cannot be resumed. Set a new one with supervisor_goal { condition }.`
+      }
+      // Never report success for a write that did not persist — read the
+      // state back through the same load() path a fresh reader would use,
+      // matching the off/on FAILED-verification pattern above.
+      const after = await supervisorStore.load(directory, sid)
+      if (after.goal?.status !== "active" || after.goal?.condition !== outcome.condition) {
+        return `FAILED to resume goal for session ${sid.slice(0, 8)}… — the change did not persist (status now: ${after.goal?.status ?? "(no goal)"}). Do not assume the goal is active.`
+      }
+      return `Goal resumed for session ${sid.slice(0, 8)}… (was ${outcome.previousStatus}): "${outcome.condition}". Attempt budget reset for this turn; the supervisor will keep pushing until it's met (or the retry budget runs out).`
+    }
+    if (args.clear) {
+      if (normalizeOptionalArg(args.source) !== "user") {
+        return "FAILED to clear goal: clearing requires an explicit user cancellation (source=user). Report completed for an evidence audit, or replace your own goal after a user redirect. Goal unchanged."
+      }
+      await supervisorStore.clearGoal(directory, sid)
+      return `Goal cleared for session ${sid.slice(0, 8)}….`
+    }
+    // Truncate to the same GOAL_CONDITION_MAX_LEN the CC CLI path already
+    // enforces (parseSupervisorCommand). Must happen once, here, before the
+    // condition fans out to session state, Goal.md/history, and the reply
+    // string below — otherwise a >4000-char condition would silently diverge
+    // between what setGoal remembers and what writeProjectGoal persists.
+    const condition = (normalizeOptionalArg(args.condition) || "").slice(0, GOAL_CONDITION_MAX_LEN)
+    if (!condition) {
+      const st = await supervisorStore.load(directory, sid)
+      if (st.goal) {
+        return `Goal (${st.goal.status}, source: ${st.goal.source || "user"}): ${st.goal.condition}\n${buildGoalRequirementSection(st.goal.condition, st.goal)}\nattempts: ${st.goal.attempts}${st.goal.lastReason ? `\nlast: ${st.goal.lastReason}` : ""}${goalResumeHintSuffix(st.goal)}`
+      }
+      const projectCondition = await readProjectGoalForSessionId(sid)
+      if (projectCondition && !st.goalCleared) {
+        return `No session goal set, but a project-level goal exists (.agents/supervisor/Goal.md or goal.md): "${projectCondition}". The supervisor will already enforce it; call supervisor_goal with an explicit condition to set a session-level goal instead.`
+      }
+      // Binding contract (align-supervisor-modes): a set-goal request with no
+      // condition AND no existing session/project goal MUST attempt an LLM
+      // derivation rather than silently no-op-ing. On any failure/invalid
+      // result, do NOT fabricate a default — ask the user to set one.
+      return await deriveAndSetGoal(sid)
+    }
+    const source = normalizeOptionalArg(args.source) || "agent"
+    if (source !== "user" && source !== "agent") return "FAILED to set goal: source must be user or agent. Goal unchanged."
+    let persisted: SupervisorState
+    try {
+      persisted = await supervisorStore.setGoal(directory, sid, condition, {
+        acceptanceCriteria: normalizeOptionalArg(args.acceptanceCriteria),
+        verification: normalizeOptionalArg(args.verification),
+        source, replace: args.replace === true, projectDir: await resolveSessionDirectoryFor(sid),
+      })
+    } catch (e: any) {
+      return `FAILED to set goal: ${e?.message || e}. Do not assume the goal changed.`
+    }
+    if (source === "user") {
+      try {
+        const projectDir = await resolveSessionDirectoryFor(sid)
+        writeProjectGoal(projectDir, persisted.goal!.condition, persisted.goal)
+        const written = readProjectGoalContract(projectDir)
+        if (!written || written.condition !== persisted.goal!.condition ||
+            written.acceptanceCriteria !== persisted.goal!.acceptanceCriteria ||
+            written.verification !== persisted.goal!.verification) {
+          throw new Error("project goal contract did not persist or was changed concurrently")
+        }
+      } catch (e: any) {
+        return `Session goal set, but FAILED to save project Goal.md: ${e?.message || e}. The session goal remains active; project persistence is not confirmed.`
+      }
+    }
+    return `Goal set for session ${sid.slice(0, 8)}…: "${persisted.goal!.condition}".\n${buildGoalRequirementSection(persisted.goal!.condition, persisted.goal)}\n${source === "user" ? "Also saved to .agents/supervisor/Goal.md." : "Session-only agent contract; no project goal file written."}`
+  }
+
+  /**
+   * Derive a concise, falsifiable goal via LLM when a set-goal request is made
+   * with no condition and nothing is set yet (see deriveGoalWithLLM above
+   * for the model cascade / ephemeral-session plumbing, and
+   * core/goal.mjs's buildGoalDerivationPrompt / parseDerivedGoalResponse for
+   * the prompt-injection-resistant prompt + strict validation).
+   *
+   * SESSION-SCOPED ONLY (deliberate). An auto-derived goal is inferred from
+   * whatever the session happened to be doing at derivation time. It used to
+   * ALSO be persisted to .agents/supervisor/goal.md, which turned a guess made
+   * on turn 1 into a MANDATORY completion requirement for turn 50 — and for
+   * every future session in that project, forever, with no expiry. That was
+   * the single largest source of stale-goal injections. Only an explicit
+   * `/supervisor:set-goal <condition>` (executeSupervisorGoal above, via
+   * writeProjectGoal) may create the durable project file now.
+   *
+   * On failure/invalid derivation, sets nothing and says so explicitly —
+   * never a fabricated default.
+   */
+  const deriveAndSetGoal = async (sid: string): Promise<string> => {
+    let messages: any[] = []
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      messages = Array.isArray(data) ? data : []
+    } catch {
+      return "Could not derive a goal: failed to read the session transcript. Set one manually: /supervisor:set-goal <condition>"
+    }
+    const sessionDirectory = resolveSessionDirectory(messages, directory)
+    const context = buildGoalAssessmentContext(await buildTaskContext(messages, sessionDirectory))
+    if (!context) {
+      return "Could not derive a goal: no task context yet (session has no user message). Set one manually: /supervisor:set-goal <condition>"
+    }
+    const agents = await getAgentsFile(sessionDirectory)
+    const derived = await deriveGoalWithLLM(client, directory, context, agents, messages, judgeSessionIds)
+    if (!derived) {
+      return "Could not derive a falsifiable goal automatically (no model available, or the derivation was not concrete/falsifiable enough). Please set one explicitly: /supervisor:set-goal <condition>"
+    }
+    try {
+      await supervisorStore.setGoal(directory, sid, derived.condition, { ...derived, source: "agent", projectDir: sessionDirectory })
+    } catch (e: any) {
+      return `FAILED to set derived goal: ${e?.message || e}. Do not assume the goal changed.`
+    }
+    return `Derived and set goal for session ${sid.slice(0, 8)}…: "${derived.condition}"${derived.rationale ? ` (${derived.rationale})` : ""}.\n${buildGoalRequirementSection(derived.condition, derived)}\nSupervisor will keep pushing until it's met (or the retry budget runs out). Scoped to THIS session only — it is deliberately NOT written to .agents/supervisor/goal.md; use /supervisor:set-goal <condition> if you want a goal that persists across sessions.`
+  }
+  const supervisorRetryDescription = "Set or check the supervisor per-turn runaway safety valve for this session. Args: n — a positive integer (honoured verbatim, no upper clamp), or 0 for UNLIMITED (no cap; the loop then stops only on supervisor_loop_exit, the no-progress gate, a goal deadline, or /supervisor off). Omit to check current. It is a runaway valve, not a budget the agent should pace against."
+  const executeSupervisorRetry = async (args: { n?: number }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) return "No active session yet — wait for the first session.idle, then set retry."
+    currentSessionId = sid
+    if (typeof args.n === "number") {
+      // Honour or reject — never silently rewrite the number the operator typed
+      // (2a). parseAttemptsValue → positive int (verbatim), Infinity (0/unlimited
+      // opt-out), or null (negative / fractional / NaN → reject with the range).
+      const parsed = parseAttemptsValue(args.n)
+      if (parsed === null) {
+        return `Rejected retry value ${args.n}: use a positive integer, or 0 for unlimited (no cap). The value was NOT changed for session ${sid.slice(0, 8)}….`
+      }
+      const stored = parsed === Infinity ? "unlimited" : parsed
+      await supervisorStore.setRetry(directory, sid, stored)
+      const eff = describeRunawayLimit({ sessionOverride: stored })
+      return eff.unlimited
+        ? `Runaway safety valve set to UNLIMITED for session ${sid.slice(0, 8)}… — no attempt cap. The loop now stops only on supervisor_loop_exit, the no-progress gate, a goal deadline, or /supervisor off.`
+        : `Runaway safety valve set to ${eff.limit} injections/turn for session ${sid.slice(0, 8)}…. It is a safety valve, not a budget — the real stop is supervisor_loop_exit.`
+    }
+    const st = await supervisorStore.load(directory, sid)
+    const eff = describeRunawayLimit({ sessionOverride: st.maxAttempts, config: await loadConfiguredMaxAttempts() })
+    return `Runaway safety valve (session override): ${st.maxAttempts ?? "(default)"}; in effect: ${formatRunawayLimit(eff.limit)} (tier: ${eff.tier}).`
+  }
+
+  // supervisor_autoreview tool — toggle cross-model review on completion
+  const supervisorAutoreviewDescription = "Toggle cross-model autoreview. When enabled, a second AI model reviews task completion verdicts for blind-spot coverage. Usage: call with enabled=true to enable, enabled=false to disable."
+  const executeSupervisorAutoreview = async (args: { enabled: boolean }, context?: any) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) return "No active session yet — wait for the first session.idle, then toggle autoreview."
+    currentSessionId = sid
+    await supervisorStore.setAutoreview(directory, sid, args.enabled)
+    if (args.enabled) {
+      return `Autoreview enabled for session ${sid.slice(0, 8)}…. Cross-model review will run when the judge marks a task complete.`
+    }
+    return `Autoreview disabled for session ${sid.slice(0, 8)}….`
+  }
+
+  // supervisor_loop_exit tool — THE stop condition for the supervision loop.
+  //
+  // The per-turn attempt counter is now only a runaway circuit breaker
+  // (core/goal.mjs RUNAWAY_CEILING): a counter cannot observe whether the
+  // human's task is finished, and a low default made the supervisor stand
+  // down mid-task. The agent declares the loop over instead, here.
+  const supervisorLoopExitDescription = `Report completion or inability to progress for this turn. With an active goal, completed does NOT end supervision: the next idle judge must audit all criteria and evidence. Without an active goal, completed ends the loop.
+Call with reason="completed" when the requested work is genuinely finished.
+Call with reason="stuck" when the supervisor is repeating the same feedback, demanding something impossible or already done, or you cannot make further progress.
+Pass a short "detail" saying why. Both args are optional; reason defaults to "completed".`
+
+  /**
+   * Resolve THE turn key from the tool's own session, the same way the idle
+   * handler does (getLastRelevantUserMessageId over the transcript, which
+   * skips supervisor-injected messages). Doing it here — rather than storing a
+   * bare timestamp and having the idle handler guess which turn it belongs to
+   * — keeps a single, exact definition of "this turn" shared by the counter
+   * and the loop-exit gate. If the transcript is unreadable we return null and
+   * the caller records nothing: silently attributing the exit to an unknown
+   * turn could suppress supervision of a FUTURE human message.
+   */
+  const resolveCurrentTurnKey = async (sid: string): Promise<string | null> => {
+    try {
+      const { data } = await client.session.messages({ path: { id: sid } })
+      const messages = Array.isArray(data) ? data : []
+      return getLastRelevantUserMessageId(messages) || null
+    } catch (e: any) {
+      debug("loop-exit: could not resolve turn key:", e?.message || e)
+      return null
+    }
+  }
+
+  const executeSupervisorLoopExit = async (
+    args?: { reason?: string; detail?: string },
+    context?: any
+  ) => {
+    const sid = (context?.sessionID || context?.sessionId || currentSessionId)?.trim()
+    if (!sid) {
+      return { title: "No session", output: "No active session yet — nothing to exit." }
+    }
+    currentSessionId = sid
+    const reason: "completed" | "stuck" = args?.reason === "stuck" ? "stuck" : "completed"
+    const detail = typeof args?.detail === "string" ? args.detail.trim().slice(0, 2000) : ""
+    const at = Date.now()
+    const turnKey = await resolveCurrentTurnKey(sid)
+
+    if (!turnKey) {
+      debug("loop-exit: no turn key resolved — not recording for", sid)
+      return {
+        title: "Loop exit not recorded",
+        output: "Could not identify the current turn, so no loop-exit was recorded. Supervisor state left unchanged.",
+      }
+    }
+
+    const state = await supervisorStore.load(directory, sid)
+    const projectDir = await resolveSessionDirectoryFor(sid)
+    const activeProjectGoal = !state.goal && !state.goalCleared ? readProjectGoalContract(projectDir) : null
+    if (reason === "completed" && (state.goal?.status === "active" || activeProjectGoal)) {
+      return {
+        title: "Completion pending judge audit",
+        output: "Completion must be judged on the next idle against every acceptance criterion and verification evidence. Goal remains active; no loop-exit recorded.",
+      }
+    }
+
+    let pausedGoal: SupervisorGoal | null = null
+    if (reason === "stuck" && (state.goal?.status === "active" || activeProjectGoal)) {
+      const result = goalStore.pauseGoal(directory, sid, {
+        expectedGoal: state.goal, projectGoal: activeProjectGoal, projectDir, reason: detail,
+      })
+      if (!result.paused) return { title: "Goal changed", output: "Goal changed while reporting stuck; no stale exit recorded. Read the current goal again." }
+      pausedGoal = result.state.goal
+    }
+    let recorded = false
+    await supervisorStore.mutate(directory, sid, (s) => {
+      const expected = pausedGoal || state.goal
+      if (expected ? !sameGoalContract(expected, s.goal) : !!s.goal) return
+      if (!expected && !s.goalCleared && readProjectGoalContract(projectDir)) return
+      s.loopExit = { turnKey, reason, detail, at }
+      recorded = true
+    })
+    if (!recorded) return { title: "Goal changed", output: "Goal changed while reporting exit; no stale exit recorded. Read the current goal again." }
+    if (reason === "stuck") {
+      const ok = appendLoopExitLog(directory, { session: sid, turnKey, reason, detail, at })
+      if (!ok) debug("loop-exit: log append failed (non-fatal) for", sid)
+    }
+    const goalWasPaused = !!pausedGoal
+    debug("loop-exit recorded:", sid, "turn:", turnKey, "reason:", reason, "detail:", detail)
+    return reason === "stuck"
+      ? {
+          title: "Supervision loop ended (stuck)",
+          output: `Supervision loop ended for this turn: stuck.${detail ? ` ${detail}` : ""} Recorded in .supervisor/loop-exit.log. The supervisor will not push again until the human sends a new message.${goalWasPaused ? ` The associated goal is now paused. ${GOAL_RESUME_HINT}` : ""}`,
+        }
+      : {
+          title: "Supervision loop ended",
+          output: "Supervision loop ended for this turn: task reported complete. The supervisor will not push again until the human sends a new message.",
+        }
+  }
+
+  let setSupervisorTool: any = null
+  let supervisorToggleTool: any = null
+  let supervisorTrainTool: any = null
+  let supervisorGoalTool: any = null
+  let supervisorRetryTool: any = null
+  let supervisorAutoreviewTool: any = null
+  let supervisorLoopExitTool: any = null
+  try {
+    const { tool } = await import("@opencode-ai/plugin/tool")
+    supervisorGoalTool = tool({
+      description: supervisorGoalDescription,
+      args: {
+        condition: tool.schema.string().optional().describe("Requested goal. Omit for status or LLM contract derivation if none exists."),
+        acceptanceCriteria: tool.schema.string().optional().describe("Observable, falsifiable acceptance criteria; all must pass."),
+        verification: tool.schema.string().optional().describe("Checks/evidence used to verify every criterion."),
+        source: tool.schema.string().optional().describe("agent for normal task declaration; user only for an explicit user-set goal."),
+        replace: tool.schema.boolean().optional().describe("Explicitly replace an active agent goal; never overrides a user goal."),
+        clear: tool.schema.boolean().optional().describe("Explicit user cancellation only: set true with source=user. Completion must use the evidence audit, not clear."),
+        resume: tool.schema.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
+      },
+      execute: executeSupervisorGoal as any
+    })
+    supervisorRetryTool = tool({
+      description: supervisorRetryDescription,
+      args: {
+        n: tool.schema.number().optional().describe("Runaway safety valve: a positive integer (honoured verbatim, no upper clamp), or 0 for UNLIMITED (no cap). Omit to check current.")
+      },
+      execute: executeSupervisorRetry as any
+    })
+    supervisorTrainTool = tool({
+      description: supervisorTrainDescription,
+      args: {
+        since: tool.schema.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
+        dryRun: tool.schema.boolean().optional().describe("Preview the proposed pattern changes without writing."),
+        pushHf: tool.schema.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
+      },
+      execute: executeSupervisorTrain as any
+    })
+    setSupervisorTool = tool({
+      description: setSupervisorDescription,
+      args: {
+        guidance: tool.schema.string().optional().describe("Supervisor guidance. Include a concise plan/checklist for complex work and evidence expectations."),
+        clear: tool.schema.boolean().optional().describe("Set true to clear the current tool-provided supervisor guidance.")
+      },
+      execute: executeSetSupervisor
+    })
+    supervisorToggleTool = tool({
+      description: supervisorToggleDescription,
+      args: {
+        action: tool.schema.string().optional().describe("status, off, on, status on/off, plain on/off, retry. Use supervisor_goal for goal contracts."),
+        n: tool.schema.number().optional().describe("Runaway valve when action is 'retry': a positive integer, or 0 for unlimited (no cap).")
+      },
+      execute: executeSupervisorToggle as any
+    })
+    supervisorAutoreviewTool = tool({
+      description: supervisorAutoreviewDescription,
+      args: {
+        enabled: tool.schema.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
+      },
+      execute: executeSupervisorAutoreview as any
+    })
+    supervisorLoopExitTool = tool({
+      description: supervisorLoopExitDescription,
+      args: {
+        reason: tool.schema.string().optional().describe("\"completed\" (task genuinely finished) or \"stuck\" (supervisor looping / no further progress possible). Default \"completed\"."),
+        detail: tool.schema.string().optional().describe("Short free-text reason. Default empty.")
+      },
+      execute: executeSupervisorLoopExit as any
+    })
+  } catch {
+    try {
+      const { z } = await import("zod")
+      setSupervisorTool = {
+        description: setSupervisorDescription,
+        args: {
+          guidance: z.string().optional().describe("Supervisor guidance. Include a concise plan/checklist for complex work and evidence expectations."),
+          clear: z.boolean().optional().describe("Set true to clear the current tool-provided supervisor guidance.")
+        },
+        execute: executeSetSupervisor
+      }
+      supervisorToggleTool = {
+        description: supervisorToggleDescription,
+        args: {
+          action: z.string().optional().describe("status, off, on, status on/off, plain on/off, retry. Use supervisor_goal for goal contracts."),
+          n: z.number().optional().describe("Retry budget when action is 'retry'.")
+        },
+        execute: executeSupervisorToggle
+      }
+      supervisorTrainTool = {
+        description: supervisorTrainDescription,
+        args: {
+          since: z.string().optional().describe("Mine sessions from the last N days, e.g. '14d'. Default 14d."),
+          dryRun: z.boolean().optional().describe("Preview the proposed pattern changes without writing."),
+          pushHf: z.boolean().optional().describe("Also push the private mined dataset to HuggingFace (requires `hf auth login`).")
+        },
+        execute: executeSupervisorTrain
+      }
+      supervisorGoalTool = {
+        description: supervisorGoalDescription,
+        args: {
+          condition: z.string().optional().describe("Requested goal. Omit for status or LLM derivation."),
+          acceptanceCriteria: z.string().optional().describe("Observable, falsifiable acceptance criteria; all must pass."),
+          verification: z.string().optional().describe("Checks/evidence used to verify every criterion."),
+          source: z.string().optional().describe("agent for normal declaration; user only for explicit user-set goals."),
+          replace: z.boolean().optional().describe("Replace active agent goal only; never overrides user goals."),
+          clear: z.boolean().optional().describe("Explicit user cancellation only: set true with source=user. Completion must use the evidence audit, not clear."),
+          resume: z.boolean().optional().describe("Set true to resume a paused or exhausted goal — keeps the condition, clears the stale pause reason, resets the turn's attempt budget.")
+        },
+        execute: executeSupervisorGoal
+      }
+      supervisorRetryTool = {
+        description: supervisorRetryDescription,
+        args: {
+          n: z.number().optional().describe("Retry budget (1–100). Omit to check current.")
+        },
+        execute: executeSupervisorRetry
+      }
+      supervisorAutoreviewTool = {
+        description: supervisorAutoreviewDescription,
+        args: {
+          enabled: z.boolean().describe("Set true to enable cross-model autoreview, false to disable it.")
+        },
+        execute: executeSupervisorAutoreview
+      }
+      supervisorLoopExitTool = {
+        description: supervisorLoopExitDescription,
+        args: {
+          // Plain z.string(), not z.enum(): this runtime marks every param
+          // required in the manifest, so filler must be able to reach the
+          // executor (which normalises it) instead of failing validation.
+          reason: z.string().optional().describe("\"completed\" or \"stuck\". Default \"completed\"."),
+          detail: z.string().optional().describe("Short free-text reason. Default empty.")
+        },
+        execute: executeSupervisorLoopExit
+      }
+    } catch {
+      // Neither @opencode-ai/plugin/tool nor zod are available (e.g. CI without
+      // npm install, or a bare Node.js environment). Create minimal plain objects
+      // with just execute + description so plugin.tool is always defined and the
+      // execute functions remain callable without schema validation.
+      setSupervisorTool = { description: setSupervisorDescription, args: {}, execute: executeSetSupervisor }
+      supervisorToggleTool = { description: supervisorToggleDescription, args: {}, execute: executeSupervisorToggle }
+      supervisorTrainTool = { description: supervisorTrainDescription, args: {}, execute: executeSupervisorTrain }
+      supervisorGoalTool = { description: supervisorGoalDescription, args: {}, execute: executeSupervisorGoal }
+      supervisorRetryTool = { description: supervisorRetryDescription, args: {}, execute: executeSupervisorRetry }
+      supervisorAutoreviewTool = { description: supervisorAutoreviewDescription, args: {}, execute: executeSupervisorAutoreview }
+      supervisorLoopExitTool = { description: supervisorLoopExitDescription, args: {}, execute: executeSupervisorLoopExit }
+    }
+  }
+
+  async function runSupervisor(sessionId: string): Promise<void> {
+      debug("runSupervisor called for session:", sessionId.slice(0, 8))
+      if (activeSupervisors.has(sessionId)) {
+        pendingSupervisorIdles.add(sessionId)
+        debug("Coalescing idle while audit in flight:", sessionId)
+        return
+      }
+
+      currentSessionId = sessionId
+
+      activeSupervisors.add(sessionId)
+
+      try {
+        let messages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          messages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session not found (likely deleted), skipping supervisor:", sessionId.slice(0, 8))
+          return
+        }
+        if (!messages || messages.length < 2) return
+
+        if (isJudgeSession(sessionId, messages, judgeSessionIds)) return
+        if (isPlanMode(messages)) return
+        if (await isDelegatedSubagentSession(sessionId)) {
+          // Full session id (not sliced): ids created seconds apart share an
+          // 8-char prefix, so a truncated id cannot identify a session here.
+          debug("subagent-gate: skipping delegated subagent session", sessionId, "(set superviseSubagents: true in ~/.config/opencode/supervisor.yaml to override)")
+          return
+        }
+        debug("subagent-gate: supervising root session", sessionId)
+
+        const sessionDirectory = resolveSessionDirectory(messages || [], directory)
+        await rememberSessionDirectory(sessionId, sessionDirectory)
+        // Retention sweep for per-session state dirs, throttled to once a day
+        // per project. Best-effort by contract: it never throws, never blocks
+        // supervision, and never touches the live session.
+        try { maybeGcSessions(sessionDirectory, { protect: sessionId }) } catch { /* best effort */ }
+        if (sessionDirectory !== directory) {
+          debug("session cwd differs from plugin directory:", sessionDirectory, "(plugin:", directory + ")")
+        }
+
+        // The disabled check runs AFTER the transcript fetch (it used to short-circuit
+        // before it). That costs one local API call per idle on a disabled session, which
+        // is the price of honouring a transcript-level `/supervisor on` — the model does
+        // not reliably call the tool, so the command must be readable from the messages.
+        const lastUserText = getLastUserMessageText(messages)
+        const explicitAction = detectSupervisorActionInText(lastUserText)
+        if (explicitAction === "off") {
+          await setSessionDisabled(sessionId, true, sessionDirectory)
+          // Full id: sessions minted seconds apart share an 8-char prefix, so a
+          // truncated id cannot say WHICH session was disabled — the exact
+          // ambiguity the per-session state work exists to remove.
+          debug("Supervisor disabled by explicit user command in transcript:", sessionId)
+          return
+        } else if (explicitAction === "on") {
+          await setSessionDisabled(sessionId, false, sessionDirectory)
+        }
+
+        if (await isSessionDisabled(sessionId, sessionDirectory)) {
+          debug("Supervisor disabled for session:", sessionId)
+          return
+        }
+
+        // Issue #82 / Issue #109: ESC-abort detection.
+        // Previously we checked time.completed on the last assistant message, but
+        // that caused false negatives — sessions where the model stopped producing
+        // output (context exhaustion, rate limit, etc.) also lack time.completed,
+        // and supervisor would silently skip them.
+        // We now rely solely on the recentlyAbortedSessions map (populated by
+        // session.error with MessageAbortedError) plus a brief delay in the event
+        // handler to handle the race where session.idle fires before session.error.
+
+        const lastUserMsgId = getLastRelevantUserMessageId(messages)
+        if (!lastUserMsgId) return
+
+        // THE turn key. getLastRelevantUserMessageId deliberately SKIPS
+        // supervisor-injected user messages, so this stays pinned to the last
+        // HUMAN message across every injection in the turn — which is exactly
+        // what makes a per-turn counter possible. It is no longer the stop
+        // condition itself; the counter below is.
+        const initialUserMsgId = lastUserMsgId
+        const turnKey = lastUserMsgId
+
+        // Supervisor goal/retry state, loaded BEFORE the budget gate: the gate
+        // needs the goal and the `/supervisor retry N` override. Cheap — one
+        // small local JSON read — and it lets an already-spent turn bail before
+        // paying for buildTaskContext and the judge round-trip.
+        const sup = await supervisorStore.load(directory, sessionId)
+        let goal = sup.goal && sup.goal.status === "active" ? sup.goal : null
+        // Inactive session goals suppress stale project fallback.
+        const projectContract = !sup.goal && !sup.goalCleared ? readProjectGoalContract(sessionDirectory) : null
+        const projectCondition = projectContract?.condition || ""
+        // A stuck exit always stands down; completed never bypasses an active contract.
+        if (sup.loopExit) {
+          if (sup.loopExit.turnKey === turnKey && (sup.loopExit.reason === "stuck" || (!goal && !projectCondition))) {
+            debug("loop-exit gate: standing down for", sessionId, "turn:", turnKey, "reason:", sup.loopExit.reason)
+            return
+          }
+          delete sup.loopExit
+          try { await supervisorStore.mutate(directory, sessionId, (s) => { delete s.loopExit }) } catch { /* best effort */ }
+        }
+        const eligibility = shouldSkipReflection({ text: userMessageText(messages[findLastRelevantUserIndex(messages)]) || "", hasActiveGoal: !!goal || !!projectCondition })
+        if (eligibility.skip) {
+          debug("Skipping reflection —", eligibility.reason, "for", sessionId.slice(0, 8))
+          return
+        }
+        if (!goal && !projectCondition) {
+          const lastAssistantText = extractLastAssistantText(messages)
+          if (isStatusDiagramEnabled(sup) && statusCorrectionSent.get(sessionId) !== turnKey) {
+            const compliance = checkStatusCompliance({
+              lastAssistantText, statusFilePath: join(sessionDirectory, "status.md"),
+              turnStartedAtMs: getLastRelevantUserMessageTime(messages),
+            })
+            if (!compliance.compliant) {
+              statusCorrectionSent.set(sessionId, turnKey)
+              await client.session.promptAsync({ path: { id: sessionId }, body: {
+                parts: [{ type: "text", text: `${FEEDBACK_MARKER} Status checkpoint\n\n${buildStatusCorrectionMessage()}` }],
+              } })
+              return
+            }
+          }
+          if (statusCorrectionSent.get(sessionId) !== turnKey) {
+            await maybeInjectPlainspeak({ sessionId, turnKey, sup, goal: null, lastAssistantText })
+          }
+          return
+        }
+        // ONE resolver (core/goal.mjs), as a DESCRIPTOR so the ceiling gate, the
+        // once-per-turn visibility line, and the loop-exit.log record all read
+        // the same resolution. OpenCode has no platform ceiling on continuations
+        // (unlike Claude Code's Stop-hook block cap — see resolveClaudeCodeHardCap),
+        // so `unlimited` here is truly unbounded by the counter: the loop then
+        // stops ONLY on supervisor_loop_exit, the no-progress gate, a goal
+        // deadline, or `/supervisor off`.
+        const runaway = describeRunawayLimit({
+          sessionOverride: sup.maxAttempts,
+          config: await loadConfiguredMaxAttempts(),
+        })
+        const runawayLimit = runaway.limit
+        // An unbounded session must never be a surprise: log it once per human
+        // turn (keyed to the turn so a multi-idle turn does not spam the log).
+        if (runaway.unlimited && unlimitedNoticeTurn.get(sessionId) !== turnKey) {
+          unlimitedNoticeTurn.set(sessionId, turnKey)
+          debug(
+            "runaway limit: UNLIMITED (tier:", runaway.tier + ") for", sessionId.slice(0, 8),
+            "— bounded ONLY by supervisor_loop_exit, the no-progress gate, a goal deadline, and /supervisor off"
+          )
+        }
+
+        // ── THE per-turn runaway circuit breaker ─────────────────────────
+        //
+        // NOT the intended stop condition — supervisor_loop_exit above is.
+        // This counter exists only to bound a pathological loop (a judge
+        // repeating identical feedback, a model that never calls the tool).
+        // Its default is therefore RUNAWAY_CEILING (core/goal.mjs), high
+        // enough that hitting it means something is wrong, not that the task
+        // is done. An explicit `/supervisor retry N` or a config value still
+        // wins, because those are deliberate user choices.
+        //
+        // Pre-increment check, mirroring bin/supervisor-on-stop.mjs — so
+        // `/supervisor retry N` yields exactly N injections (the old
+        // post-increment check yielded N-1, and `retry 1` yielded ZERO).
+        //
+        // TERMINATION: every injection path below writes count+1 before it
+        // prompts, and the agent's reply to that injection raises a fresh
+        // session.idle for the SAME turnKey. So each idle either injects and
+        // strictly increases the counter, or stands down (which saturates it).
+        // The counter is monotonic within a turn and bounded above by
+        // runawayLimit, therefore the turn ends after at most
+        // runawayLimit injections.
+        //
+        // UNLIMITED: `runawayLimit` is Infinity, so this branch must never
+        // fire. The `Number.isFinite` guard is not redundant with `count >=
+        // Infinity` (which is already false for any finite count): a
+        // stand-down path saturates the counter to `runawayLimit` via
+        // standDownForTurn, so under unlimited the counter itself can become
+        // Infinity, and `Infinity >= Infinity` is TRUE. Without the guard a
+        // stray later idle in the same turn would then fire the runaway branch
+        // — logging a bogus `runaway_ceiling` and running goal side-effects —
+        // for a session the operator explicitly asked NOT to cap. The runaway
+        // CEILING firing under `unlimited` is a contradiction in terms.
+        const currentAttemptCount = readTurnAttempts(sessionId, turnKey)
+        if (Number.isFinite(runawayLimit) && currentAttemptCount >= runawayLimit) {
+          // An active goal must not die silently at the cap. Mirrors
+          // bin/supervisor-on-stop.mjs: goal.attempts is the SAME number as
+          // the counter, so decideGoalTransition is guaranteed to report
+          // "exhausted" here, with reason "deadline" if the goal also outlived
+          // its window — and only a deadline is a real end-of-goal. The
+          // attempts cap is per-human-turn, so persisting "exhausted" for it
+          // would kill a goal the human is still driving.
+          if (goal) {
+            try {
+              const t = decideGoalTransition({ goal, complete: false, now: Date.now(), maxAttempts: runawayLimit })
+              if (t.action === "exhausted" && t.reason === "deadline") {
+                await supervisorStore.mutate(directory, sessionId, (s) => {
+                  if (sameGoalContract(goal, s.goal)) s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
+                })
+                await showToast(client, directory, `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`, "warning")
+              } else {
+                await showToast(client, directory, `Goal push limit reached this turn (${currentAttemptCount} attempts) — resumes on your next message`, "warning")
+              }
+            } catch (e: any) {
+              debug("goal transition at attempt cap failed (non-fatal):", e?.message || e)
+            }
+          }
+          debug("attempt-cap reached for", sessionId.slice(0, 8), "attempts:", currentAttemptCount, "max:", runawayLimit, "goal:", !!goal)
+          // Hitting the ceiling is strictly WORSE than an agent-declared
+          // `stuck` exit (executeSupervisorLoopExit, above): it means the
+          // loop never terminated on its own — only the circuit breaker did.
+          // A declared `stuck` already leaves forensic evidence in
+          // .supervisor/loop-exit.log; a ceiling hit previously left only the
+          // debug() line just above, invisible without SUPERVISOR_DEBUG=1.
+          // Same shared writer (core/loop-exit.mjs) as the CC hook and the
+          // supervisor_loop_exit tool, tagged distinctly so this can never be
+          // confused with a declared exit.
+          appendLoopExitLog(directory, {
+            session: sessionId, turnKey, reason: "runaway_ceiling", detail: "",
+            at: Date.now(), attempts: currentAttemptCount, maxAttempts: runawayLimit,
+            // Name the resolved limit AND the tier that set it, so a forensic
+            // reader can tell whether the operator chose this (retry/config/env)
+            // or it is the shipped default.
+            limit: formatRunawayLimit(runawayLimit), limitTier: runaway.tier,
+          })
+          return
+        }
+
+        const context = buildGoalAssessmentContext(await buildTaskContext(messages, sessionDirectory))
+        if (!context) return
+
+        const lastAssistantText = extractLastAssistantText(messages)
+        const customPrompt = await loadSupervisorPrompt(sessionDirectory)
+        const agents = await getAgentsFile(sessionDirectory)
+        const rubric = await loadRubric(sessionDirectory)
+
+        // ── No-progress gate (deterministic, no LLM) ─────────────────────
+        //
+        // Parity fix: this gate existed ONLY on the Claude Code runtime
+        // (bin/supervisor-on-stop.mjs's "NO-PROGRESS GATE") — opencode had no
+        // detection at all for "the agent's reply is unchanged from last
+        // time, so pushing again is pointless". Same shared helper
+        // (core/evaluation.mjs's evaluateNoProgress), same threshold
+        // (NO_PROGRESS_REPEAT_THRESHOLD), same on-disk keys
+        // (lastReplyHash/replyRepeatCount), same locked mutate() — one
+        // implementation, two runtimes.
+        //
+        // ORDERING: eligibility/loop-exit and runaway gates run first.
+        // Repeated replies stand down before spending another judge call.
+        // Completed signals cannot bypass an active contract's audit.
+        //
+        // BUDGET: this is an ELIGIBILITY gate, not a spent attempt — it does
+        // NOT call writeTurnAttempts. Saturating the counter here would make
+        // "the agent repeated itself" indistinguishable from "the budget is
+        // spent", and opencode raises several session.idle events per human
+        // turn, so a LATER idle in the same turn would then read the
+        // saturated counter and take the budget-exhausted branch above,
+        // firing its goal-transition side effects
+        // for the wrong reason. The gate re-derives the same answer for free
+        // on every idle, so it needs no counter of its own to terminate.
+        const noProgress = evaluateNoProgress(lastAssistantText, sup.lastReplyHash, sup.replyRepeatCount)
+        if (noProgress.standDown) {
+          debug("no-progress gate: standing down for", sessionId.slice(0, 8), "goal:", !!goal, "repeats:", noProgress.repeatCount)
+          return
+        }
+        // Locked read-modify-write: never save() a whole state object read
+        // earlier in this turn, or the goal/attempts/loopExit keys already
+        // resolved above would be lost (the exact lost-update shape
+        // test/goal-per-turn.test.mjs guards).
+        try {
+          await supervisorStore.mutate(directory, sessionId, (s) => {
+            s.lastReplyHash = noProgress.hash
+            s.replyRepeatCount = noProgress.repeatCount
+          })
+        } catch (e: any) {
+          debug("no-progress gate: persist failed (non-fatal):", e?.message || e)
+        }
+
+        // Non-actionable turn gate ran before the no-goal return above.
+        // Control commands never consume attempts or trigger a judge.
+        // A goal's attempt budget is per-human-turn, not cumulative for the
+        // whole session: once the human speaks again the previous turn's
+        // escalation no longer applies. goal.attempts is MIRRORED from the one
+        // turn-scoped counter above (which already resets itself when turnKey
+        // moves) rather than being a second, independently-incremented count —
+        // that duplicate was bug #57 on the Claude Code hook and this line is
+        // the same fix. lastTurnKey is still stamped so the persisted record
+        // says which human turn the count belongs to.
+        // The `lastUserMsgId != null` guard mirrors bin/supervisor-on-stop.mjs:
+        // without it a null id makes the condition true on every idle.
+        if (goal && lastUserMsgId != null && (goal.lastTurnKey !== lastUserMsgId || goal.attempts !== currentAttemptCount)) {
+          const expected = goal
+          let synchronized = false
+          await supervisorStore.mutate(directory, sessionId, (s) => {
+            if (!sameGoalContract(expected, s.goal)) return
+            const latestCount = s.attempts?.turnKey === turnKey ? s.attempts.count : 0
+            s.goal = { ...s.goal!, lastTurnKey: lastUserMsgId, attempts: Math.max(currentAttemptCount, latestCount || 0) }
+            goal = s.goal
+            sup.goal = s.goal
+            synchronized = true
+          })
+          if (!synchronized) return
+        }
+
+        // When a goal is active, its condition is the strongest stated intent and
+        // MUST compose with the existing gates.
+        const goalSection = goal ? buildGoalRequirementSection(goal.condition, goal) : ""
+
+        // Also read a project-level goal from the SESSION's
+        // .agents/supervisor/Goal.md (or the lower-case goal.md — see
+        // core/goal.mjs's readProjectGoalCondition / writeDerivedProjectGoal,
+        // which shares this same lookup order with the LLM-derivation path).
+        let projectGoalSection = ""
+        // The exact condition injected into THIS judgement. Load-bearing for
+        // goal retirement: we only ever delete a goal file that still holds
+        // the condition we actually judged (see retireProjectGoal's safety
+        // rule in core/goal.mjs).
+        let injectedProjectGoalCondition = ""
+        // Session goals take precedence; inactive/cleared session goals
+        // must not silently reactivate through project fallback.
+        if (!sup.goal && !sup.goalCleared) {
+          const cond = projectCondition
+          if (cond) {
+            injectedProjectGoalCondition = cond
+            projectGoalSection = buildGoalRequirementSection(cond, projectContract || {})
+          }
+        }
+        const effectiveGoalSection = goalSection || projectGoalSection
+
+        const effRubric: Rubric = effectiveGoalSection
+          ? { ...rubric, antipatterns: `${rubric.antipatterns}\n\n${effectiveGoalSection}` }
+          : rubric
+
+        // Use 3-file reflection system (falls back to buildSelfAssessmentPrompt internally)
+        const defaultSupervisorPrompt = await buildReflectionPrompt({
+          // Session-scoped: Goal.md and the .supervisor/rubric.md override are
+          // both per-project and must come from the session's own project.
+          directory: sessionDirectory,
+          defaultsDir,
+          context,
+          agents,
+          lastAssistantText,
+          attemptCount: currentAttemptCount,
+          maxAttempts: runawayLimit,
+          goalSection: effectiveGoalSection || undefined,
+        })
+        let supervisorPrompt: string
+        let effectiveToolSupervisorPrompt: string | null
+        let promptSource: "file" | "tool" | "default" | "goal" | "reflection+goal"
+        if (goal) {
+          // Goal active: use the default (goal-augmented) prompt directly.
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "goal"
+        } else if (projectGoalSection) {
+          supervisorPrompt = defaultSupervisorPrompt
+          effectiveToolSupervisorPrompt = null
+          promptSource = "reflection+goal"
+        } else {
+          const resolvedPrompt = resolveSupervisorPromptPrecedence(customPrompt, toolSupervisorPrompt, defaultSupervisorPrompt)
+          supervisorPrompt = resolvedPrompt.prompt
+          effectiveToolSupervisorPrompt = resolvedPrompt.effectiveToolSupervisorPrompt
+          promptSource = resolvedPrompt.source
+        }
+
+        await showToast(client, directory, "Requesting supervisor self-assessment...", "info")
+        debug("Requesting supervisor self-assessment (source:", promptSource, ")")
+
+        // Issue #98: Run self-assessment in a separate ephemeral session instead
+        // of prompting the active agent session. Asking the active session to
+        // respond in JSON poisons its context, causing subsequent replies to be
+        // JSON-only.
+        const modelList = await loadSupervisorModelList()
+        const preferredModel = await loadPreferredModelSpec(directory)
+        const sessionModelSpec = getLastSessionModelSpec(messages || [])
+        const assessmentAttempts = modelList.length
+          ? modelList
+          : preferredModel && !isBlockedJudgeModel(preferredModel)
+            ? [preferredModel]
+            : sessionModelSpec && !isBlockedJudgeModel(sessionModelSpec)
+              ? [sessionModelSpec]
+              : [JUDGE_FREE_FALLBACK]
+
+      let selfAssessment: string | null = null
+      let assessmentModelSpec: string | null = null
+      for (const modelSpec of assessmentAttempts) {
+        let assessmentSession: any
+        try {
+          const { data } = await client.session.create({ query: { directory } })
+            assessmentSession = data
+          } catch {
+            debug("Failed to create self-assessment session")
+            standDownForTurn(sessionId, turnKey, runawayLimit)
+            return
+          }
+          if (!assessmentSession?.id) {
+            standDownForTurn(sessionId, turnKey, runawayLimit)
+            return
+          }
+          judgeSessionIds.add(assessmentSession.id)
+
+          try {
+            const modelParts = modelSpec ? modelSpec.split("/") : []
+            const providerID = modelParts[0] || ""
+            const modelID = modelParts.slice(1).join("/") || ""
+            const body: any = { parts: [{ type: "text", text: supervisorPrompt }] }
+            if (providerID && modelID) body.model = { providerID, modelID }
+
+            await client.session.promptAsync({
+              path: { id: assessmentSession.id },
+              body
+            })
+
+            selfAssessment = await waitForResponse(client, assessmentSession.id)
+            if (selfAssessment) {
+              assessmentModelSpec = modelSpec || null
+              break
+            }
+          } catch (e: any) {
+            debug("promptAsync failed (self-assessment):", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "prompt-self-assessment" })
+            continue
+          } finally {
+            try {
+              await client.session.delete({ path: { id: assessmentSession.id }, query: { directory } })
+            } catch {}
+            judgeSessionIds.delete(assessmentSession.id)
+          }
+        }
+
+        if (!selfAssessment) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          return
+        }
+
+        debug("Self-assessment received")
+
+        // Check if user sent a new message or aborted during assessment
+        const abortTime = recentlyAbortedSessions.get(sessionId)
+        if (abortTime) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          return
+        }
+
+        let currentMessages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          currentMessages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session deleted during supervisor, aborting:", sessionId.slice(0, 8))
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          return
+        }
+        const currentUserMsgId = getLastRelevantUserMessageId(currentMessages || [])
+        if (currentUserMsgId && currentUserMsgId !== initialUserMsgId) {
+          standDownForTurn(sessionId, initialUserMsgId, runawayLimit)
+          return
+        }
+
+        let analysis: SupervisorAnalysis | null = null
+        const parsedAssessment = parseSelfAssessmentJson(selfAssessment, { requireStatus: true })
+        if (parsedAssessment) {
+          analysis = evaluateSelfAssessment(parsedAssessment, context)
+        } else {
+          analysis = await analyzeSelfAssessmentWithLLM(
+            client,
+            directory,
+            context,
+            selfAssessment,
+            judgeSessionIds,
+            effectiveToolSupervisorPrompt,
+            effRubric,
+            currentMessages
+          )
+        }
+
+        if (!analysis) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          await showToast(client, directory, "Supervisor analysis failed", "warning")
+          return
+        }
+
+        debug("Supervisor analysis completed")
+        // Recheck both turn and declaration after the second-stage judge.
+        const contractIsCurrent = async () => {
+          const latest = await supervisorStore.load(directory, sessionId)
+          return goal ? sameGoalContract(goal, latest.goal)
+            : !latest.goal && !latest.goalCleared && sameGoalContract(projectContract, readProjectGoalContract(sessionDirectory))
+        }
+        if (await resolveCurrentTurnKey(sessionId) !== turnKey || recentlyAbortedSessions.has(sessionId) || !(await contractIsCurrent())) {
+          debug("Discarding stale goal audit for", sessionId)
+          return
+        }
+
+        // Supervisor goal loop: when an active goal exists, decide its next state
+        // (budget exhaustion FIRST, then achievement, then continuation). An
+        // exhausted goal pauses the loop WITHOUT injecting a continuation; an
+        // achieved goal is persisted and falls through to the normal complete
+        // bookkeeping; a continuing goal must ONLY burn budget (attempts+1) when a
+        // continuation is actually injected — so we defer that persist until after
+        // the feedback prompt succeeds (see pendingGoalContinue below). This avoids
+        // silently losing budget on interrupted passes (human-action, new-message,
+        // abort, or per-message max-attempts rechecks that early-return).
+        let pendingGoalContinue: SupervisorState | null = null
+        if (goal) {
+          const t = decideGoalTransition({
+            goal,
+            complete: analysis.complete,
+            now: Date.now(),
+            maxAttempts: runawayLimit,
+            reason: analysis.reason,
+          })
+          if (t.action === "exhausted") {
+            // Two different things reach this branch, and only the deadline is
+            // a real end-of-goal — it means the goal outlived the window it was
+            // set for. The attempts cap is per-human-turn (see the reset above),
+            // so persisting "exhausted" there would kill a
+            // goal the human is still driving. Stand down for the rest of THIS
+            // turn instead and leave it active. Mirrors bin/supervisor-on-stop.mjs.
+            // decideGoalTransition reports WHICH condition fired; never
+            // re-derive it from the clock (a third exhaust reason would then
+            // be silently misclassified as the recoverable per-turn case).
+            const deadlineHit = t.reason === "deadline"
+            if (deadlineHit) {
+              await supervisorStore.mutate(directory, sessionId, (s) => {
+                if (sameGoalContract(goal, s.goal)) s.goal = { ...t.goal, lastReason: withResumeHint(t.goal.lastReason || "goal deadline reached") }
+              })
+            }
+            standDownForTurn(sessionId, turnKey, runawayLimit)
+            await showToast(
+              client,
+              directory,
+              deadlineHit
+                ? `Goal deadline reached — paused. ${GOAL_RESUME_HINT}`
+                : `Goal budget spent for this turn (${t.goal.attempts} attempts) — resumes on your next message`,
+              "warning"
+            )
+            debug(deadlineHit ? "Goal deadline reached, pausing" : "Goal turn budget spent, pausing until next human turn")
+            return
+          }
+          if (t.action === "achieved") {
+            // An achieved goal must DIE. Persisting status:'achieved' alone
+            // left .agents/supervisor/Goal.md (or goal.md) on disk, so the
+            // NEXT session re-read it and the goal resurrected forever.
+            // Retire the project file (both casings) AND drop the session
+            // goal, after recording the achievement durably in
+            // .supervisor/goal-achieved.log. See retireProjectGoal for the
+            // deletion safety rule (only a file still holding the exact
+            // judged condition is removed).
+            const completion = goalStore.completeGoal(directory, sessionId, {
+              expectedGoal: goal, projectDir: sessionDirectory,
+              source: "opencode:session-goal-achieved", reason: analysis.reason || "",
+            })
+            if (!completion.achieved) {
+              debug("Discarding stale or unlogged goal completion for", sessionId)
+              return
+            }
+            debug("Goal achieved and audit logged for", sessionId)
+          } else {
+            // "continue": DO NOT persist the attempts++ here. Stash it and only
+            // write it after a continuation is actually injected (post-promptAsync
+            // success). Any early-return below leaves goal.attempts unchanged.
+            // Only `.goal` is later persisted (see pendingGoalContinue use).
+            pendingGoalContinue = { ...sup, goal: t.goal }
+          }
+        }
+
+        let crossReview: { modelSpec: string; response: string } | null = null
+        if (analysis.complete && sup.autoreview === true) {
+          debug("Task complete, attempting cross-model review (assessmentModel:", assessmentModelSpec || "unknown", ")")
+          crossReview = await runCrossModelReview(
+            client,
+            directory,
+            context,
+            selfAssessment,
+            analysis,
+            lastAssistantText,
+            assessmentModelSpec,
+            judgeSessionIds,
+            effectiveToolSupervisorPrompt
+          )
+          if (crossReview) {
+            debug("Cross-model review completed by", crossReview.modelSpec)
+          } else {
+            debug("Cross-model review skipped (no cross-model mapping or error)")
+          }
+        }
+
+        // Compute routing early so it can be included in saved data
+        const routingConfig = await loadRoutingConfig()
+        const routingCategory = await classifyTaskForRoutingWithLLM(
+          client, directory, context, judgeSessionIds, currentMessages,
+          { routingEnabled: routingConfig.enabled }
+        )
+        const routingModel = getRoutingModel(routingConfig, routingCategory)
+
+        await saveSupervisorData(directory, sessionId, {
+          task: context.taskSummary,
+          assessment: selfAssessment.slice(0, 4000),
+          analysis,
+          crossReview,
+          routing: routingModel ? { category: routingCategory, model: routingModel } : null,
+          timestamp: new Date().toISOString()
+        })
+
+        await writeVerdictSignal(directory, sessionId, analysis.complete, analysis.severity)
+
+        if (analysis.complete) {
+          // Goal retirement runs FIRST and unconditionally. The status
+          // correction below can early-return, and a goal that survived that
+          // return would re-fire on every future turn and every future
+          // session — the two must not be able to step on each other.
+          //
+          // Project goal (no session goal object, so the goal
+          // loop above never ran): the condition WAS injected as a MANDATORY
+          // completion requirement for this judgement, so complete === the
+          // goal was judged met. Retire it, or it fires forever on every
+          // future turn and every future session in this project — which is
+          // exactly how a "$1,000 MRR" condition ended up being injected into
+          // 95 unrelated turns.
+          if (injectedProjectGoalCondition) {
+            try {
+              let completed = false
+              await supervisorStore.mutate(directory, sessionId, (s) => {
+                if (s.goal || s.goalCleared || !sameGoalContract(projectContract, readProjectGoalContract(sessionDirectory))) return
+                const retired = retireProjectGoal(sessionDirectory, {
+                  condition: injectedProjectGoalCondition, contract: projectContract,
+                  sessionId, source: "opencode:project-goal-achieved", reason: analysis.reason || "",
+                })
+                if (retired.logged) { s.goalCleared = true; completed = true }
+                debug("Project goal judged met, retired:", JSON.stringify(retired))
+              })
+              if (!completed) return
+            } catch (e: any) {
+              debug("retireProjectGoal failed (non-fatal):", e?.message || e)
+            }
+          }
+
+          // "Completed but skipped the status checkpoint" correction.
+          //
+          // Runs BEFORE the hard stop below, and is deliberately NOT part of
+          // the attempt budget: it is a one-line chore, not another
+          // continuation attempt, so it must not shorten the retries a real
+          // follow-up turn would get. Bounded by statusCorrectionSent to
+          // exactly ONE injection per human turn — the agent's reply to it
+          // triggers a fresh session.idle, and on that pass the key already
+          // matches, so we fall through to the normal stop whether or not the
+          // agent actually complied. No loop is possible.
+          const statusCorrectionKey = `${sessionId}:${lastUserMsgId}`
+          let correctionInjected = false
+          try {
+            if (
+              statusCorrectionSent.get(sessionId) !== lastUserMsgId &&
+              isStatusDiagramEnabled(sup)
+            ) {
+              // status.md belongs to the SESSION's own project, never the
+              // server cwd this plugin happens to run in (INCIDENT
+              // 2026-07-27 — see resolveProjectGoalForSession above).
+              const compliance = checkStatusCompliance({
+                lastAssistantText,
+                statusFilePath: join(sessionDirectory, "status.md"),
+                turnStartedAtMs: getLastRelevantUserMessageTime(messages || []),
+              })
+              if (!compliance.compliant) {
+                debug("Task complete but status checkpoint missing:", compliance.reason)
+                try {
+                  await client.session.promptAsync({
+                    path: { id: sessionId },
+                    body: { parts: [{ type: "text", text: `${FEEDBACK_MARKER} Status checkpoint\n\n${buildStatusCorrectionMessage()}` }] },
+                  })
+                  correctionInjected = true
+                  await showToast(client, directory, "Task complete — asking for the status checkpoint", "info")
+                } catch (e: any) {
+                  debug("promptAsync failed (status correction):", e?.message || e)
+                  reportError(e, { plugin: "supervisor-3", op: "prompt-status-correction" })
+                }
+              }
+            }
+          } catch (e: any) {
+            // Never let this gate change whether a completed task stops.
+            debug("status correction check failed:", e?.message || e)
+            reportError(e, { plugin: "supervisor-3", op: "status-correction-check" })
+          }
+
+          if (correctionInjected) {
+            statusCorrectionSent.set(sessionId, lastUserMsgId)
+            // Stand down for the rest of the turn. The task is already
+            // COMPLETE — the correction is a one-line chore, not another
+            // continuation attempt — so there is no remaining budget worth
+            // preserving, and re-running the judge after it would cost a
+            // second full judge round-trip to reach the same verdict.
+            standDownForTurn(sessionId, turnKey, runawayLimit)
+            debug("Supervisor injected status checkpoint correction for", statusCorrectionKey)
+            return
+          }
+
+
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          await showToast(client, directory, goal ? `Goal achieved ✓ (${analysis.severity})` : `Task complete ✓ (${analysis.severity})`, "success")
+          debug("Supervisor complete")
+          // The supervisor is standing down and the status correction did NOT
+          // fire, so this turn's single chore slot is free.
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
+          return
+        }
+
+        if (analysis.requiresHumanAction && !analysis.shouldContinue) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          const hint = (Array.isArray(analysis.missing) && analysis.missing[0]) || "User action required"
+          await showToast(client, directory, `Action needed: ${hint}`, "warning")
+          debug("Supervisor requires human action (no agent-actionable work remaining)")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
+          return
+        }
+
+        // A verdict with NOTHING actionable must not continue. This runtime
+        // previously injected on any `!analysis.complete`, ignoring
+        // shouldContinue entirely — so a judge verdict with an empty
+        // missing/next_actions and blank feedback rendered a "Task Incomplete"
+        // headline with an empty body, the agent had nothing to act on, went
+        // idle, and got the byte-identical message again ~20s later until the
+        // retry cap (observed: 15 consecutive identical injections). Stand
+        // down instead, and record why. Mirrors the `no_inject` handling in
+        // bin/supervisor-on-stop.mjs.
+        const actionlessVerdict = isActionlessVerdict({
+          missing: analysis.missing,
+          next_actions: analysis.nextActions,
+          // rawFeedback, not reason: `reason` has already had a placeholder
+          // substituted for a blank verdict (see SupervisorAnalysis).
+          feedback: analysis.rawFeedback ?? analysis.reason,
+        })
+        if (!analysis.shouldContinue || actionlessVerdict) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          const standDownReason = actionlessVerdict
+            ? "verdict had no actionable content (empty missing, empty next_actions, blank feedback)"
+            : "judge did not ask to continue (shouldContinue=false)"
+          debug("Supervisor standing down, no injection:", standDownReason)
+          await showToast(client, directory, `Supervisor stood down — ${standDownReason}`, "info")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
+          return
+        }
+
+        // Re-check for new user messages or abort before feedback injection
+        // (analysis/judge phase can take significant time)
+        let preFeedbackMessages: any[] | undefined
+        try {
+          const { data } = await client.session.messages({ path: { id: sessionId } })
+          preFeedbackMessages = Array.isArray(data) ? data : undefined
+        } catch {
+          debug("Session deleted before feedback injection, aborting:", sessionId.slice(0, 8))
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          return
+        }
+        const preFeedbackUserMsgId = getLastRelevantUserMessageId(preFeedbackMessages || [])
+        if (preFeedbackUserMsgId && preFeedbackUserMsgId !== initialUserMsgId) {
+          standDownForTurn(sessionId, initialUserMsgId, runawayLimit)
+          debug("User sent new message during analysis, skipping feedback")
+          return
+        }
+        const preFeedbackAbort = recentlyAbortedSessions.get(sessionId)
+        if (preFeedbackAbort) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          debug("Session aborted during analysis, skipping feedback")
+          return
+        }
+
+        // Burn one attempt. The budget CHECK lives in the single gate at the
+        // top of this handler (pre-increment, mirroring
+        // bin/supervisor-on-stop.mjs); this is only the write. There used to
+        // be a second `>= runawayLimit` check right here, which made
+        // the effective budget N-1 and `/supervisor retry 1` a no-op.
+        //
+        // Ordering invariant (see issue #57): the goal loop above runs BEFORE
+        // this, so an active goal's own transition gets first refusal and
+        // decideGoalTransition's reason:"attempts" branch stays reachable.
+        // Written BEFORE promptAsync so a failed injection still costs an
+        // attempt — failing toward termination, never toward a loop.
+        if (!(await contractIsCurrent())) {
+          debug("Skipping stale goal continuation for", sessionId)
+          return
+        }
+        const nextAttemptCount = currentAttemptCount + 1
+        writeTurnAttempts(sessionId, nextAttemptCount, turnKey)
+
+        // Reflection is the SOLE completion/progress judgement authority.
+        // buildEscalatingFeedback is driven purely by the judge's own verdict
+        // fields (analysis.severity/reason/missing/nextActions). There is no
+        // deterministic loop-detection mechanism in this repository anymore.
+        const renderedFeedback = buildEscalatingFeedback(
+          analysis.severity || "MEDIUM",
+          {
+            feedback: analysis.reason || "Task incomplete",
+            missing: analysis.missing,
+            next_actions: analysis.nextActions,
+            confidence: parsedAssessment?.confidence,
+            // A standing goal is context carried across turns, NOT a gap this
+            // turn produced. Rendered in its own labelled section so the user
+            // never sees "Missing: reach $1,000 MRR" next to
+            // "Missing: fix build errors" as if both were this turn's fault.
+            goal_condition: goal?.condition || injectedProjectGoalCondition || "",
+          },
+          // `/supervisor:status off` must silence the reflection path too.
+          { statusDirective: isStatusDiagramEnabled(sup) }
+        )
+
+        // Last-resort guard: never inject a message whose body is empty after
+        // rendering. isActionlessVerdict above should already have stood us
+        // down; this catches any future verdict shape that slips past it.
+        if (!hasFeedbackBody(renderedFeedback)) {
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          debug("Supervisor standing down, no injection: rendered feedback had an empty body")
+          await maybeInjectPlainspeak({ sessionId, turnKey, sup, goal, lastAssistantText, projectGoalCondition: injectedProjectGoalCondition })
+          return
+        }
+
+        // NEVER apply routing model to the active session feedback. The active
+        // session must keep its original model. Routing was removed because it
+        // silently switched the user's session model (e.g. to gpt-5.2-codex),
+        // breaking the session when the target model/provider wasn't available.
+        // If task-based routing is needed in the future, it must spawn a separate
+        // subagent session — never mutate the active session's model.
+        const feedbackText = `${renderedFeedback}\n\n${effectiveGoalSection}`
+        const feedbackBody: any = { parts: [{ type: "text", text: feedbackText }] }
+        if (routingModel) {
+          // Log for diagnostics but do NOT apply to active session
+          debug("Routing would suggest", routingCategory, "model:", JSON.stringify(routingModel), "(NOT applied to active session)")
+        }
+
+        try {
+          await client.session.promptAsync({
+            path: { id: sessionId },
+            body: feedbackBody
+          })
+        } catch (e: any) {
+          debug("promptAsync failed (feedback):", e?.message || e)
+          reportError(e, { plugin: "supervisor-3", op: "prompt-feedback" })
+          standDownForTurn(sessionId, turnKey, runawayLimit)
+          return
+        }
+
+        // NO stand-down here. This is the bug this branch exists to fix: the
+        // old code set the "already reflected this turn" boolean immediately
+        // after a SUCCESSFUL injection, so the session.idle raised by the
+        // agent's reply bailed at the top and the supervisor could never push
+        // twice in one human turn. The attempt counter was incremented above
+        // and then never read again. Termination is now the counter's job:
+        // the next idle re-enters with count+1 and stops at the budget.
+
+        // Goal budget is burned ONLY here, after a continuation was actually
+        // injected. If any earlier recheck early-returned (or promptAsync above
+        // threw and returned), pendingGoalContinue was never set / never reached,
+        // so goal.attempts stays unchanged — no silent budget loss.
+        if (pendingGoalContinue) {
+          const pending = pendingGoalContinue
+          await supervisorStore.mutate(directory, sessionId, (s) => {
+            if (sameGoalContract(goal, s.goal)) s.goal = { ...s.goal!, attempts: Math.max(s.goal!.attempts, pending.goal!.attempts), lastReason: pending.goal!.lastReason }
+          })
+        }
+
+        debug("Supervisor pushed continuation")
+
+        const routingInfo = routingModel ? ` [routing: ${routingCategory}]` : ""
+        await showToast(client, directory, `Pushed agent to continue${routingInfo}`, "info")
+      } finally {
+        activeSupervisors.delete(sessionId)
+        // An idle for a NEW human turn/reply can arrive while an old audit is
+        // awaiting its model. Coalesce it, then read fresh state after the old
+        // audit exits; otherwise its stale-result guard silently loses that turn.
+        if (pendingSupervisorIdles.delete(sessionId)) {
+          const replay = setTimeout(async () => {
+            if (recentlyAbortedSessions.has(sessionId)) return
+            try {
+              // An older duplicate idle is not permission to interrupt a turn
+              // that started since then. Its actual next idle will run normally.
+              if (typeof client.session.status === "function") {
+                const { data } = await client.session.status()
+                if (["busy", "retry"].includes(data?.[sessionId]?.type)) return
+              }
+              await runSupervisor(sessionId)
+            } catch (e: any) {
+              debug("Queued supervisor replay failed:", e?.message || e)
+              reportError(e, { plugin: "supervisor-3", op: "replay-idle" })
+            }
+          }, ABORT_RACE_DELAY)
+          replay.unref?.()
+        }
+      }
+    }
+
+  return {
+    config: async (cfg: any) => {
+      // Upgrades must suppress our retired names even when old manually copied
+      // command files remain. Do not delete files or unrelated user commands.
+      for (const name of ["supervisor:autopilot", "supervisor:reflection"]) {
+        if (cfg.command) delete cfg.command[name]
+      }
+      // Register the /supervisor slash command so users can type
+      // /supervisor [args] directly in the TUI instead of calling the tool.
+      // The template instructs the LLM to route to the appropriate tool call.
+      cfg.command = {
+        ...(cfg.command || {}),
+        supervisor: {
+          description: "Control the supervisor: status | status on|off | plain on|off | on | off | set-goal <condition> | set-goal clear | retry <N> | autoreview on|off",
+          template: `Execute this supervisor command by calling the supervisor tool with the appropriate arguments.
+
+Command: "{{input}}"
+
+Routing rules:
+- empty or "status" → supervisor({ action: "status" })
+- "status on" → supervisor({ action: "status on" })
+- "status off" → supervisor({ action: "status off" })
+- "plain on" (or "plainspeak on") → supervisor({ action: "plain on" })
+- "plain off" (or "plainspeak off") → supervisor({ action: "plain off" })
+- "on" → supervisor({ action: "on" })
+- "off" → supervisor({ action: "off" })
+- "set-goal <condition text>" (or legacy "goal <condition text>") → supervisor_goal({ condition: "<condition text>", source: "user", acceptanceCriteria: "<observable criteria within requested scope>", verification: "<checks/evidence>" })
+- "set-goal" → supervisor_goal({})
+- "set-goal clear" (or legacy "goal clear") → supervisor_goal({ clear: true, source: "user" })
+- "retry <N>" → supervisor({ action: "retry", n: N })
+- "autoreview on" → supervisor_autoreview({ enabled: true })
+- "autoreview off" → supervisor_autoreview({ enabled: false })
+
+There are no selectable supervisor modes. Obsolete mode requests must not change or drop a goal.
+
+Call the tool now. Do not explain, just execute the tool call.`
+        }
+      }
+    },
+    "tool.execute.before": async (input: { tool?: string; sessionID?: string }) => {
+      currentSessionId = trackSessionScopedToolSession(currentSessionId, input)
+    },
+    /**
+     * Always-on status-directive injection.
+     *
+     * Registered under the FLAT dotted key, not a nested
+     * `experimental.chat.system.transform` object: opencode 1.17.9 resolves
+     * plugin hooks with a literal `hooks[name]` lookup
+     * (`Plugin.triggerFor` in the bundled runtime), so a nested object is
+     * never found. Verified empirically against a real `opencode serve` —
+     * the flat key fires with `(input, output)` where
+     * `input = {sessionID, model}` and `output = {system: string[]}`.
+     *
+     * Why this exists at all: the supervisor's other injection points
+     * (continuation feedback) only ride along on turns the
+     * supervisor itself pushes, which by definition excludes the FIRST turn
+     * of a session — the turn that establishes the roadmap. This closes that
+     * gap.
+     *
+     * Contract: never throw. This runs inside the user's own request; a
+     * failure here must degrade to "no directive", never to a broken turn.
+     */
+    "experimental.chat.system.transform": async (
+      input: { sessionID?: string; model?: unknown },
+      output: { system?: string[] }
+    ) => {
+      try {
+        if (!Array.isArray(output?.system)) return
+        // Unconditional entry trace (SUPERVISOR_DEBUG only). The "injected"
+        // line below fires ONLY when the directive was actually appended, so
+        // without an entry line there is no way to tell "the hook ran N times
+        // and suppressed N-1 duplicates" from "the hook ran once". Counted by
+        // test/live-validation.mjs scenario 7.
+        debug("status-directive hook fired for", input?.sessionID?.slice(0, 8))
+        const sid = input?.sessionID
+        if (!sid || judgeSessionIds.has(sid)) return
+        const abortedAt = recentlyAbortedSessions.get(sid)
+        if (abortedAt && Date.now() - abortedAt < ABORT_COOLDOWN) return
+        const state = await supervisorStore.load(directory, sid)
+        if (await isSessionDisabled(sid, state.projectDir || sessionDirCache.get(sid))) return
+        if (await isDelegatedSubagentSession(sid)) return
+        const { data } = await client.session.messages({ path: { id: sid } })
+        const messages = Array.isArray(data) ? data : []
+        if (await isSessionDisabled(sid, resolveSessionDirectory(messages, state.projectDir || directory))) return
+        if (isPlanMode(messages) || isJudgeSession(sid, messages, judgeSessionIds)) return
+        const userText = getLastUserMessageText(messages)
+        if (detectSupervisorActionInText(userText) === "off") return
+        const latestUser = messages.findLast((m: any) => (m.info?.role || m.role) === "user")
+        const humanText = userMessageText(latestUser)
+        // Synthetic continuations/status chores cannot seed a fresh contract.
+        if (humanText && !shouldSkipReflection({ text: humanText, hasActiveGoal: false }).skip) {
+          appendGoalOwnershipDirectiveToSystem(output.system)
+        }
+        const activeContract = state.goal?.status === "active" ? state.goal
+          : !state.goal && !state.goalCleared ? readProjectGoalContract(resolveSessionDirectory(messages, state.projectDir || directory)) : null
+        // Reused arrays must carry only the CURRENT contract, not a replaced goal.
+        for (let i = output.system.length - 1; i >= 0; i--) {
+          if (output.system[i].startsWith(GOAL_CONTRACT_MARKER)) output.system.splice(i, 1)
+        }
+        if (activeContract) {
+          output.system.push(`${GOAL_CONTRACT_MARKER}\n${buildGoalRequirementSection(activeContract.condition, activeContract)}`)
+        }
+        if (!(await shouldInjectStatusDirective(sid))) return
+        // Idempotent by marker — this hook fires more than once per user turn
+        // (measured: 3 fires for one turn on opencode 1.18.14), and system
+        // arrays may be reused. NOTE: the reuse half was measured on 1.17.9;
+        // on 1.18.14 every fire got a FRESH array, so the guard currently
+        // suppresses nothing at runtime there. Keep it — it is cheap, and the
+        // cost of being wrong is a duplicated directive in every prompt.
+        if (appendStatusDirectiveToSystem(output.system)) {
+          debug("status directive injected into system prompt for", input?.sessionID?.slice(0, 8))
+        }
+      } catch (e: any) {
+        debug("status directive injection failed:", e?.message || e)
+        reportError(e, { plugin: "supervisor-3", op: "status-directive-system" })
+      }
+    },
+    tool: (setSupervisorTool || supervisorToggleTool || supervisorTrainTool || supervisorGoalTool || supervisorRetryTool || supervisorLoopExitTool) ? {
+      ...(setSupervisorTool ? { set_supervisor: setSupervisorTool } : {}),
+      ...(supervisorToggleTool ? { supervisor: supervisorToggleTool } : {}),
+      ...(supervisorTrainTool ? { supervisor_train: supervisorTrainTool } : {}),
+      ...(supervisorGoalTool ? { supervisor_goal: supervisorGoalTool } : {}),
+      ...(supervisorRetryTool ? { supervisor_retry: supervisorRetryTool } : {}),
+      ...(supervisorAutoreviewTool ? { supervisor_autoreview: supervisorAutoreviewTool } : {}),
+      ...(supervisorLoopExitTool ? { supervisor_loop_exit: supervisorLoopExitTool } : {}),
+    } : undefined,
+    event: async ({ event }: { event: { type: string; properties?: any } }) => {
+      debug("event received:", event.type)
+      if (event.type === "session.error") {
+        const props = (event as any).properties
+        const sessionId = props?.sessionID
+        const error = props?.error
+        if (sessionId && error?.name === "MessageAbortedError") {
+          recentlyAbortedSessions.set(sessionId, Date.now())
+          debug("Session aborted (Esc), cooldown started:", sessionId.slice(0, 8))
+        }
+      }
+
+      if (event.type === "session.idle") {
+        debug("session.idle received")
+        const sessionId = (event as any).properties?.sessionID
+        if (!sessionId || typeof sessionId !== "string") return
+
+        const abortTime = recentlyAbortedSessions.get(sessionId)
+        if (abortTime) {
+          const elapsed = Date.now() - abortTime
+          if (elapsed < ABORT_COOLDOWN) return
+          recentlyAbortedSessions.delete(sessionId)
+        }
+
+        // Issue #109: Brief delay before running supervisor to let session.error
+        // arrive first (handles race where session.idle fires before session.error
+        // when user presses ESC). After the delay, re-check the abort map.
+        await new Promise(resolve => setTimeout(resolve, ABORT_RACE_DELAY))
+        const postDelayAbortTime = recentlyAbortedSessions.get(sessionId)
+        if (postDelayAbortTime) {
+          debug("Session aborted during race delay, skipping supervisor:", sessionId.slice(0, 8))
+          return
+        }
+
+        try {
+          await runSupervisor(sessionId)
+        } catch (e: any) {
+          debug("runSupervisor error:", e?.message || e)
+          reportError(e, { plugin: "supervisor-3", op: "run-supervisor" })
+        }
+      }
+    }
+  }
+}
+
+export default SupervisorPlugin

@@ -1,0 +1,8 @@
+.gc-stamp (13b)
+debug.log (8032b)
+goals/
+  ses_0263b40d9ffey4BgTSWuv0hYZr.json (204b)
+ses_0263b40d9ffey4BgTSWuv0hYZr_attempts.json (87b)
+sessions/
+  ses_0263b40d9ffey4BgTSWuv0hYZr/
+    state.json (472b)

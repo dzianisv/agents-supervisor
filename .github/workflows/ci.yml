@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Install pinned real OpenCode binary
+        run: |
+          npm install --global opencode-ai@1.18.32
+          test "$(opencode --version)" = "1.18.32"
+      - name: Unit tests (E2E excluded)
+        run: npm test
+      - name: Claude Code hook e2e (fake judge, no creds)
+        run: node test/e2e-cc.mjs
+      - name: Mandatory native Pi E2E (local fixture provider, no credentials)
+        run: npm run test:pi
+      - name: Mandatory isolated OpenCode server E2E (sequential, no skips)
+        env:
+          SUPERVISOR_E2E_ALLOW_SKIP: '0'
+        run: npm run test:e2e
+      - name: Judge eval (skips without ANTHROPIC creds)
+        run: node evals/judge-eval.mjs
+      - name: OpenCode plugin syntax check
+        run: |
+          node --experimental-strip-types --check opencode/supervisor.ts
+          node --experimental-strip-types --check opencode/supervisor-impl.ts
+      - name: Pi extension syntax check
+        run: |
+          for file in pi/*.ts; do
+            node --experimental-strip-types --check "$file"
+          done
+      - name: Privacy guard — no mined data committed
+        run: |
+          # Convention: evals/<name>.example.jsonl is a small, committed, synthetic
+          # fixture (e.g. evals/cases.example.jsonl, evals/verbosity-cases.example.jsonl).
+          # Anything else matching .dataset/transcripts/*.jsonl is private mined data
+          # and must never be tracked in git.
+          ALLOW='^evals/[A-Za-z0-9_-]+\.example\.jsonl$'
+          if git ls-files | grep -E '\.dataset|transcripts|\.jsonl$' | grep -v -E "$ALLOW"; then
+            echo "ERROR: private data tracked in git"; exit 1
+          fi
+          for f in $(git ls-files | grep -E "$ALLOW"); do
+            if [ "$(wc -c < "$f")" -gt 51200 ]; then
+              echo "ERROR: $f exceeds 50KB — synthetic cases only, mined data is never committed"; exit 1
+            fi
+          done
+          echo "OK: no private data tracked"

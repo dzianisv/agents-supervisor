@@ -1,0 +1,641 @@
+[
+  {
+    "id": 1,
+    "title": "Judge input is the plain conversation chain",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 1",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "both judge-facing prompts were actually sent to the model",
+        "pass": true,
+        "detail": "reflection=6 judge=6"
+      },
+      {
+        "name": "the session really did make tool calls (otherwise the check is vacuous)",
+        "pass": true,
+        "detail": "found 3 tool parts: [\"bash\",\"bash\",\"bash\"]"
+      },
+      {
+        "name": "tool OUTPUT sentinels are present in the real transcript",
+        "pass": true,
+        "detail": "only 3/3 sentinels found in the transcript"
+      },
+      {
+        "name": "[reflection/self-assessment] has an extractable conversation section",
+        "pass": true,
+        "detail": "# Reflection Prompt\n\nYou are evaluating an agent's work against workflow requirements.\nRead the conversation below and determine whether the task is complete.\n\n## Delivered Media Is Proof\nThe supervisor resolves media the agent delivered and may attach it directly to this message: images and single "
+      },
+      {
+        "name": "[reflection/self-assessment] contains `user:` turns",
+        "pass": true,
+        "detail": "## Conversation\nThis is the conversation between the user and the agent, oldest first.\n\n- Judge ONLY whether the LAST user request was satisfied by the agent's reply to it.\n- Earlier turns are context"
+      },
+      {
+        "name": "[reflection/self-assessment] contains `assistant:` turns",
+        "pass": true,
+        "detail": "## Conversation\nThis is the conversation between the user and the agent, oldest first.\n\n- Judge ONLY whether the LAST user request was satisfied by the agent's reply to it.\n- Earlier turns are context"
+      },
+      {
+        "name": "[reflection/self-assessment] carries user text LIVEVAL_USER_ALPHA",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[reflection/self-assessment] carries assistant reply LIVEVAL_REPLY_ALPHA",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[reflection/self-assessment] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_ALPHA_9f21",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[reflection/self-assessment] carries user text LIVEVAL_USER_BRAVO",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[reflection/self-assessment] carries assistant reply LIVEVAL_REPLY_BRAVO",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[reflection/self-assessment] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_BRAVO_7c04",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[reflection/self-assessment] carries user text LIVEVAL_USER_CHARLIE",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[reflection/self-assessment] carries assistant reply LIVEVAL_REPLY_CHARLIE",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[reflection/self-assessment] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_CHARLIE_2b88",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[reflection/self-assessment] conversation section does NOT name the `bash` tool",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[reflection/self-assessment] conversation section has NO tool-call/tool-result labels",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[reflection/self-assessment] does NOT contain a `[1]`/`[2]` numbered demand blob",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[reflection/self-assessment] does NOT contain a tool-command log section",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[reflection/self-assessment] turn order is oldest → newest",
+        "pass": true,
+        "detail": "conversation chain is out of order"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] has an extractable conversation section",
+        "pass": true,
+        "detail": "ANALYZE SUPERVISOR\n\nYou are validating an agent's self-assessment against workflow requirements.\n\n## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for re"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] contains `user:` turns",
+        "pass": true,
+        "detail": "## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for "
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] contains `assistant:` turns",
+        "pass": true,
+        "detail": "## Conversation\nThis is the conversation between the user and the agent, oldest first. Judge ONLY whether the LAST user request was satisfied by the agent's reply to it. Earlier turns are context for "
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries user text LIVEVAL_USER_ALPHA",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries assistant reply LIVEVAL_REPLY_ALPHA",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_ALPHA_9f21",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries user text LIVEVAL_USER_BRAVO",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries assistant reply LIVEVAL_REPLY_BRAVO",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_BRAVO_7c04",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries user text LIVEVAL_USER_CHARLIE",
+        "pass": true,
+        "detail": "missing user text"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] carries assistant reply LIVEVAL_REPLY_CHARLIE",
+        "pass": true,
+        "detail": "missing assistant reply"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] does NOT contain tool-output sentinel LIVEVAL_TOOLOUT_CHARLIE_2b88",
+        "pass": true,
+        "detail": "TOOL OUTPUT LEAKED INTO THE PROMPT"
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] conversation section does NOT name the `bash` tool",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] conversation section has NO tool-call/tool-result labels",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] does NOT contain a `[1]`/`[2]` numbered demand blob",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] does NOT contain a tool-command log section",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "[ANALYZE SUPERVISOR (2nd stage)] turn order is oldest → newest",
+        "pass": true,
+        "detail": "conversation chain is out of order"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s1-prompt-reflection.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s1-prompt-analyze.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s1-transcript.json",
+      "prompts captured: reflection/self-assessment (11271 chars); ANALYZE SUPERVISOR (2nd stage) (10542 chars)",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s1-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s1-model-calls.json"
+    ],
+    "ms": 23527,
+    "error": null
+  },
+  {
+    "id": 2,
+    "title": "Subagent gate",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 2",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "child session carries parentID from the live server",
+        "pass": true,
+        "detail": "{\"id\":\"ses_02640d126ffexDwm4sMwEZDWhZ\",\"slug\":\"crisp-rocket\",\"projectID\":\"global\",\"directory\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s2-q9o9hC\",\"path\":\"private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s2-q9o9hC\",\"parentID\":\"ses_"
+      },
+      {
+        "name": "root session omits parentID",
+        "pass": true,
+        "detail": "{\"id\":\"ses_02640d138ffeg5r77ii7tunt4Y\",\"slug\":\"curious-harbor\",\"projectID\":\"global\",\"directory\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s2-q9o9hC\",\"path\":\"private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s2-q9o9hC\",\"cost\":0,\"toke"
+      },
+      {
+        "name": "plugin logged: skipping delegated subagent session <child>",
+        "pass": true,
+        "detail": "eived: session.status\n[2026-08-07T01:03:34.306Z] [Supervisor] status-directive hook fired for ses_0264\n[2026-08-07T01:03:34.307Z] [Supervisor] status directive injected into system prompt for ses_0264\n[2026-08-07T01:03:34.326Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:03:34.327Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:03:34.328Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:03:34.329Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:03:34.333Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:03:34.334Z] [Supervisor] event received: message.updated\n[2026-08-07T01:03:34.338Z] [Supervisor] event received: message.updated\n[2026-08-07T01:03:34.338Z] [Supervisor] event received: session.status\n[2026-08-07T01:03:34.340Z] [Supervisor] event received: session.status\n[2026-08-07T01:03:34.340Z] [Supervisor] event received: session.idle\n[2026-08-07T01:03:34.340Z] [Supervisor] session.idle received\n[2026-08-07T01:03:34.342Z] [Supervisor] event received: session.updated\n[2026-08-07T01:03:34.343Z] [Supervisor] event received: session.diff\n[2026-08-07T01:03:34.344Z] [Supervisor] event received: message.updated\n[2026-08-07T01:03:35.849Z] [Supervisor] runSupervisor called for session: ses_0264\n[2026-08-07T01:03:35.856Z] [Supervisor] subagent-gate: skipping delegated subagent session ses_02640d126ffexDwm4sMwEZDWhZ (set superviseSubagents: true in ~/.config/opencode/supervisor.yaml to override)\n"
+      },
+      {
+        "name": "plugin logged: supervising root session <root>",
+        "pass": true,
+        "detail": "ervisor] event received: session.updated\n[2026-08-07T01:06:37.820Z] [Supervisor] event received: session.diff\n[2026-08-07T01:06:37.822Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:37.822Z] [Supervisor] status-directive hook fired for ses_0263\n[2026-08-07T01:06:37.829Z] [Supervisor] event received: session.updated\n[2026-08-07T01:06:37.830Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:37.831Z] [Supervisor] status-directive hook fired for ses_0263\n[2026-08-07T01:06:37.836Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:37.837Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:37.838Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:06:37.839Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:37.840Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:37.841Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:37.842Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:37.843Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:37.844Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:37.844Z] [Supervisor] event received: session.idle\n[2026-08-07T01:06:37.844Z] [Supervisor] session.idle received\n[2026-08-07T01:06:37.846Z] [Supervisor] event received: session.updated\n[2026-08-07T01:06:37.846Z] [Supervisor] event received: session.diff\n[2026-08-07T01:06:37.847Z] [Supervisor] event received: message.updated\n"
+      },
+      {
+        "name": "child was NEVER supervised",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "root was NEVER skipped as a subagent",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "a judge prompt exists for the ROOT session's task",
+        "pass": true,
+        "detail": "2 judge prompts seen"
+      },
+      {
+        "name": "NO judge prompt exists for the CHILD session's task",
+        "pass": true,
+        "detail": "the supervisor judged a delegated subagent session"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s2-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s2-model-calls.json"
+    ],
+    "ms": 192209,
+    "error": null
+  },
+  {
+    "id": 3,
+    "title": "`/supervisor off` persists (and fails loudly when it can't)",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 3",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "baseline: the supervisor DID run for this session before the toggle",
+        "pass": true,
+        "detail": "r] event received: session.updated\n[2026-08-07T01:06:47.284Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:47.284Z] [Supervisor] status-directive hook fired for ses_0263\n[2026-08-07T01:06:47.289Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:47.290Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:47.290Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:06:47.291Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:47.294Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:47.295Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:47.296Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:47.296Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:47.297Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:47.297Z] [Supervisor] event received: session.idle\n[2026-08-07T01:06:47.297Z] [Supervisor] session.idle received\n[2026-08-07T01:06:47.298Z] [Supervisor] event received: session.updated\n[2026-08-07T01:06:47.298Z] [Supervisor] event received: session.diff\n[2026-08-07T01:06:47.299Z] [Supervisor] event received: message.updated\n"
+      },
+      {
+        "name": "the tool call was made with the schema-forced filler mode (`mode:reflection, action:off`)",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "tool reported a VERIFIED disable (not a bare success string)",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c2379f001bNIN8S4N4VWoCM\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064811990,\"completed\":1786064812007},\"finish\":\"stop\",\"id\":\"msg_fd9c237d60010g9H19sWGCts6Z\",\"sessionID\":\"ses_0263de4b4ffeCxpWJW9N1INKDb\"},\"parts\":[{\"type\":\"step-start\",\"id\":\"prt_fd9c237e2001PMd65pDX94U0Ui\",\"sessionID\":\"s"
+      },
+      {
+        "name": ".supervisor/disabled exists and lists the FULL session id",
+        "pass": true,
+        "detail": "ses_0263de4b4ffeCxpWJW9N1INKDb\n"
+      },
+      {
+        "name": "plugin logged: Supervisor disabled for session <id>",
+        "pass": true,
+        "detail": "isor] event received: message.part.updated\n[2026-08-07T01:06:53.473Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:06:53.474Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:53.476Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:06:53.477Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:53.478Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:53.478Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:53.480Z] [Supervisor] event received: session.status\n[2026-08-07T01:06:53.480Z] [Supervisor] event received: session.idle\n[2026-08-07T01:06:53.480Z] [Supervisor] session.idle received\n[2026-08-07T01:06:53.481Z] [Supervisor] event received: session.updated\n[2026-08-07T01:06:53.482Z] [Supervisor] event received: session.diff\n[2026-08-07T01:06:53.483Z] [Supervisor] event received: message.updated\n[2026-08-07T01:06:53.510Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:06:53.515Z] [Supervisor] subagent-gate: supervising root session ses_0263de4b4ffeCxpWJW9N1INKDb\n[2026-08-07T01:06:53.515Z] [Supervisor] Supervisor disabled for session: ses_0263de4b4ffeCxpWJW9N1INKDb\n"
+      },
+      {
+        "name": "NO judge ran for the post-off turn",
+        "pass": true,
+        "detail": "judge prompt count went 2 → 2"
+      },
+      {
+        "name": "NO supervisor continuation was injected into the transcript after off",
+        "pass": true,
+        "detail": "found an injected continuation"
+      },
+      {
+        "name": "[unwritable-dir] the tool returns FAILED, not success",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c26731001mpOnatCyZ6l0le\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064824244,\"completed\":1786064824305},\"finish\":\"stop\",\"id\":\"msg_fd9c267b4001LLIB8OMbkHaif9\",\"sessionID\":\"ses_0263db1b3ffe5K17D1i5toQw6x\"},\"parts\":[{\"type\":\"step-start\",\"id\":\"prt_fd9c267e7001p7weGYEIf8pXUU\",\"sessionID\":\"ses_0263db1b3ffe5K17D1i5toQw6x\",\"messageID\":\"msg_fd9c267b4001LLIB8OMbkHaif9\"},{\"type\":\"text\",\"text\":\""
+      },
+      {
+        "name": "[unwritable-dir] the FAILED message does NOT claim the supervisor is off",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c26731001mpOnatCyZ6l0le\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064824244,\"completed\":1786064824305},\"finish\":\"stop\",\"id\":\"msg_fd9c267b4001LLIB8OMbkHaif9\",\"sessionID\":\"ses_0263db1b3ffe5K17D1i5toQw6x\"},\"parts\":[{\"type\":\"step-start\",\"id\":\"prt_fd9c267e7001p7weGYEIf8pXUU\",\"sessionID\":\"ses_0263db1b3ffe5K17D1i5toQw6x\",\"messageID\":\"msg_fd9c267b4001LLIB8OMbkHaif9\"},{\"type\":\"text\",\"text\":\""
+      },
+      {
+        "name": "[readonly-file] the tool returns FAILED, not success",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c27d45001NURXi1j0LAiUV3\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064829837,\"completed\":1786064829870},\"finish\":\"stop\",\"id\":\"msg_fd9c27d8d001wKTOR3h6s11pdk\",\"sessionID\":\"ses_0263d9800ffeuDGBvR6G23zF8D\"},\"parts\":[{\"type\":\"step-start\",\"id\":\"prt_fd9c27da6001VBw5BDNknTnvyg\",\"sessionID\":\"ses_0263d9800ffeuDGBvR6G23zF8D\",\"messageID\":\"msg_fd9c27d8d001wKTOR3h6s11pdk\"},{\"type\":\"text\",\"text\":\""
+      },
+      {
+        "name": "[readonly-file] the FAILED message does NOT claim the supervisor is off",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c27d45001NURXi1j0LAiUV3\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s3-kv0n10\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064829837,\"completed\":1786064829870},\"finish\":\"stop\",\"id\":\"msg_fd9c27d8d001wKTOR3h6s11pdk\",\"sessionID\":\"ses_0263d9800ffeuDGBvR6G23zF8D\"},\"parts\":[{\"type\":\"step-start\",\"id\":\"prt_fd9c27da6001VBw5BDNknTnvyg\",\"sessionID\":\"ses_0263d9800ffeuDGBvR6G23zF8D\",\"messageID\":\"msg_fd9c27d8d001wKTOR3h6s11pdk\"},{\"type\":\"text\",\"text\":\""
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s3-off-response.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s3-unwritable-unwritable-dir.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s3-unwritable-readonly-file.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s3-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s3-model-calls.json"
+    ],
+    "ms": 30171,
+    "error": null
+  },
+  {
+    "id": 4,
+    "title": "Wrong-session off: A off must not disable B",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 4",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "A and B share an 8-char id prefix (so a truncated id could not tell them apart)",
+        "pass": true,
+        "detail": "ses_0263d573 vs ses_0263d570"
+      },
+      {
+        "name": "baseline: A was supervised",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "baseline: B was supervised",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "A's off reported verified success",
+        "pass": true,
+        "detail": "{\"info\":{\"parentID\":\"msg_fd9c2e5aa001YYWTobGukNlLJI\",\"role\":\"assistant\",\"mode\":\"build\",\"agent\":\"build\",\"path\":{\"cwd\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s4-2mpPf3\",\"root\":\"/\"},\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}},\"modelID\":\"fixture-model\",\"providerID\":\"test-fixture\",\"time\":{\"created\":1786064856647,\"complete"
+      },
+      {
+        "name": ".supervisor/disabled lists A's FULL id",
+        "pass": true,
+        "detail": "ses_0263d5735ffe0gganbRQlfoTvg\n"
+      },
+      {
+        "name": ".supervisor/disabled does NOT list B's id",
+        "pass": true,
+        "detail": "ses_0263d5735ffe0gganbRQlfoTvg\n"
+      },
+      {
+        "name": "session B (untouched) WAS still judged after A was turned off",
+        "pass": true,
+        "detail": "judge prompts: 4 → 6"
+      },
+      {
+        "name": "session A (turned off) was NOT judged",
+        "pass": true,
+        "detail": "session A was supervised even though it was explicitly disabled"
+      },
+      {
+        "name": "plugin logged the disabled skip with A's FULL id (not an ambiguous 8-char prefix)",
+        "pass": true,
+        "detail": "8-07T01:07:47.033Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:07:47.034Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:07:47.035Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:07:47.036Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:07:47.037Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:07:47.038Z] [Supervisor] event received: message.updated\n[2026-08-07T01:07:47.040Z] [Supervisor] event received: session.status\n[2026-08-07T01:07:47.040Z] [Supervisor] event received: message.updated\n[2026-08-07T01:07:47.041Z] [Supervisor] event received: session.idle\n[2026-08-07T01:07:47.041Z] [Supervisor] session.idle received\n[2026-08-07T01:07:47.041Z] [Supervisor] event received: session.status\n[2026-08-07T01:07:47.047Z] [Supervisor] event received: session.updated\n[2026-08-07T01:07:47.047Z] [Supervisor] event received: session.diff\n[2026-08-07T01:07:47.048Z] [Supervisor] event received: message.updated\n[2026-08-07T01:07:48.544Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:07:48.555Z] [Supervisor] subagent-gate: supervising root session ses_0263d5709ffeZgznCqC5Tu0cOP\n"
+      }
+    ],
+    "evidence": [
+      "session A = ses_0263d5735ffe0gganbRQlfoTvg",
+      "session B = ses_0263d5709ffeZgznCqC5Tu0cOP",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s4-disabled-file.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s4-judge-prompt-tasks.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s4-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s4-model-calls.json"
+    ],
+    "ms": 39005,
+    "error": null
+  },
+  {
+    "id": 5,
+    "title": "Goal retirement",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 5",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "explicit set-goal wrote the durable PROJECT goal file",
+        "pass": true,
+        "detail": "the retry backoff is capped at 30s and covered by a unit test"
+      },
+      {
+        "name": "while active, the goal condition IS injected into the judge prompt",
+        "pass": true,
+        "detail": "judge prompts: 2 → 3"
+      },
+      {
+        "name": "plugin logged the retirement",
+        "pass": true,
+        "detail": "t received: message.updated\n[2026-08-07T01:08:13.746Z] [Supervisor] event received: session.status\n[2026-08-07T01:08:13.747Z] [Supervisor] event received: session.status\n[2026-08-07T01:08:13.747Z] [Supervisor] session.idle received\n[2026-08-07T01:08:13.747Z] [Supervisor] event received: session.idle\n[2026-08-07T01:08:13.749Z] [Supervisor] event received: session.updated\n[2026-08-07T01:08:13.749Z] [Supervisor] event received: session.diff\n[2026-08-07T01:08:13.750Z] [Supervisor] event received: message.updated\n[2026-08-07T01:08:15.250Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:08:15.723Z] [Supervisor] event received: session.deleted\n[2026-08-07T01:08:15.724Z] [Supervisor] Supervisor analysis completed\n[2026-08-07T01:08:15.725Z] [Supervisor] Goal achieved, retired project goal: {\"removed\":[\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md\"],\"skipped\":[],\"logged\":true}\n[2026-08-07T01:08:15.729Z] [Supervisor] Wrote verdict signal for session: ses_0263cb859ffexlyTtYaGKQGDJR\n[2026-08-07T01:08:15.730Z] [Supervisor] Task complete but status checkpoint missing: no roadmap in reply and status.md missing\n[2026-08-07T01:08:15.735Z] [Supervisor] event received: message.updated\n[2026-08-07T01:08:15.738Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:08:15.741Z] [Supervisor] event received: session.updated\n[2026-08-07T01:08:15.743Z] [Supervisor] event received: session.status\n"
+      },
+      {
+        "name": "the PROJECT goal file was DELETED",
+        "pass": true,
+        "detail": "/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md still exists"
+      },
+      {
+        "name": ".supervisor/goal-achieved.log records the achievement",
+        "pass": true,
+        "detail": "{\"ts\":\"2026-08-07T01:08:15.725Z\",\"pid\":4315,\"condition\":\"the retry backoff is capped at 30s and covered by a unit test\",\"sessionId\":\"ses_0263cb859ffexlyTtYaGKQGDJR\",\"source\":\"opencode:session-goal-achieved\",\"reason\":\"goal met\",\"removed\":[\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md\"],\"skipped\":[]}\n"
+      },
+      {
+        "name": "the achievement record names the session",
+        "pass": true,
+        "detail": "{\"ts\":\"2026-08-07T01:08:15.725Z\",\"pid\":4315,\"condition\":\"the retry backoff is capped at 30s and covered by a unit test\",\"sessionId\":\"ses_0263cb859ffexlyTtYaGKQGDJR\",\"source\":\"opencode:session-goal-achieved\",\"reason\":\"goal met\",\"removed\":[\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md\"],\"skipped\":[]}\n"
+      },
+      {
+        "name": "a judge prompt was produced for the post-retirement turn",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "post-retirement judge prompt contains NO injected goal condition",
+        "pass": true,
+        "detail": "retired goal text is still being injected outside the conversation"
+      },
+      {
+        "name": "post-retirement judge prompt contains NO GOAL requirement section",
+        "pass": true,
+        "detail": "GOAL section survived retirement"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s5-goal-achieved.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s5-post-retirement-judge-prompt.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s5-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s5-model-calls.json"
+    ],
+    "ms": 33089,
+    "error": null
+  },
+  {
+    "id": 6,
+    "title": "Non-actionable turn gate",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 6",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "plugin logged \"Skipping reflection —\" for the `tldr` turn",
+        "pass": true,
+        "detail": "Supervisor] event received: message.part.updated\n[2026-08-07T01:08:41.257Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:08:41.258Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:08:41.267Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:08:41.268Z] [Supervisor] event received: message.updated\n[2026-08-07T01:08:41.269Z] [Supervisor] event received: message.updated\n[2026-08-07T01:08:41.270Z] [Supervisor] event received: session.status\n[2026-08-07T01:08:41.271Z] [Supervisor] event received: session.status\n[2026-08-07T01:08:41.275Z] [Supervisor] event received: message.updated\n[2026-08-07T01:08:41.273Z] [Supervisor] event received: session.diff\n[2026-08-07T01:08:41.271Z] [Supervisor] session.idle received\n[2026-08-07T01:08:41.273Z] [Supervisor] event received: session.updated\n[2026-08-07T01:08:41.271Z] [Supervisor] event received: session.idle\n[2026-08-07T01:08:42.173Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:08:42.184Z] [Supervisor] subagent-gate: supervising root session ses_0263c3eb2ffeOVXHAvpqqpBwTN\n[2026-08-07T01:08:42.203Z] [Supervisor] Skipping reflection — non-actionable:summary for ses_0263\n"
+      },
+      {
+        "name": "NO judge call was made for the `tldr` turn",
+        "pass": true,
+        "detail": "judge prompt count 2 → 2"
+      },
+      {
+        "name": "a real work request DID run the judge",
+        "pass": true,
+        "detail": "judge prompt count now 4"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s6-skip-log.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s6-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s6-model-calls.json"
+    ],
+    "ms": 27764,
+    "error": null
+  },
+  {
+    "id": 7,
+    "title": "Status directive reaches the model exactly once",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 7",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "this turn produced MORE THAN ONE model call (the multi-call shape)",
+        "pass": true,
+        "detail": "3 call(s) attributable to this turn"
+      },
+      {
+        "name": "the status directive reached the model for this turn",
+        "pass": true,
+        "detail": "3/3 calls carried the marker"
+      },
+      {
+        "name": "no model call ever received the directive more than ONCE",
+        "pass": true,
+        "detail": "max copies in a single system prompt: 1"
+      },
+      {
+        "name": "every model call for this turn carried it exactly once",
+        "pass": true,
+        "detail": "1,1,1"
+      },
+      {
+        "name": "the directive body (ROADMAP block + status.md instruction) is present",
+        "pass": true,
+        "detail": "You are a title generator. You output ONLY a thread title. Nothing else.\n\n<task>\nGenerate a brief title that would help the user find this conversation later.\n\nFollow all rules in <rules>\nUse the <exa"
+      },
+      {
+        "name": "the transform hook fired MORE THAN ONCE for this single user turn",
+        "pass": true,
+        "detail": "fired=3 — a once-per-turn hook could not duplicate anything"
+      },
+      {
+        "name": "the hook fired at least once per model call of this turn",
+        "pass": true,
+        "detail": "fired=3 turnCalls=3"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s7-hook-counts.json",
+      "status-directive hook: fired=3, appended=3, model calls for the turn=3",
+      "NOT PROVEN LIVE on this build: every hook fire got a fresh system array, so the idempotency guard never had to suppress a duplicate. Its suppression path is covered only by test/status-directive.test.mjs.",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s7-system-prompt-sample.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s7-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s7-model-calls.json"
+    ],
+    "ms": 11864,
+    "error": null
+  },
+  {
+    "id": 8,
+    "title": "Empty verdict stand-down",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 8",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "plugin logged a stand-down",
+        "pass": true,
+        "detail": "26-08-07T01:09:13.212Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.212Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:09:13.224Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.227Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.237Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:13.238Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:13.239Z] [Supervisor] event received: session.status\n[2026-08-07T01:09:13.246Z] [Supervisor] event received: session.status\n[2026-08-07T01:09:13.246Z] [Supervisor] event received: session.idle\n[2026-08-07T01:09:13.246Z] [Supervisor] session.idle received\n[2026-08-07T01:09:13.248Z] [Supervisor] event received: session.updated\n[2026-08-07T01:09:13.248Z] [Supervisor] event received: session.diff\n[2026-08-07T01:09:13.249Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:14.757Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:09:15.090Z] [Supervisor] event received: session.deleted\n[2026-08-07T01:09:15.092Z] [Supervisor] Supervisor analysis completed\n[2026-08-07T01:09:15.097Z] [Supervisor] Wrote verdict signal for session: ses_0263bb4a5ffeXxVxVxPB5IOWdx\n[2026-08-07T01:09:15.098Z] [Supervisor] Supervisor standing down, no injection: verdict had no actionable content (empty missing, empty next_actions, blank feedback)\n[2026-08-07T01:09:15.102Z] [Supervisor] event received: tui.toast.show\n"
+      },
+      {
+        "name": "the stand-down reason names the actionless verdict",
+        "pass": true,
+        "detail": "Supervisor standing down, no injection: verdict had no actionable content (empty missing, empty next_actions, blank feedback)"
+      },
+      {
+        "name": "plugin did NOT log 'Supervisor pushed continuation'",
+        "pass": true,
+        "detail": "26-08-07T01:09:13.212Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.212Z] [Supervisor] event received: message.part.delta\n[2026-08-07T01:09:13.224Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.227Z] [Supervisor] event received: message.part.updated\n[2026-08-07T01:09:13.237Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:13.238Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:13.239Z] [Supervisor] event received: session.status\n[2026-08-07T01:09:13.246Z] [Supervisor] event received: session.status\n[2026-08-07T01:09:13.246Z] [Supervisor] event received: session.idle\n[2026-08-07T01:09:13.246Z] [Supervisor] session.idle received\n[2026-08-07T01:09:13.248Z] [Supervisor] event received: session.updated\n[2026-08-07T01:09:13.248Z] [Supervisor] event received: session.diff\n[2026-08-07T01:09:13.249Z] [Supervisor] event received: message.updated\n[2026-08-07T01:09:14.757Z] [Supervisor] runSupervisor called for session: ses_0263\n[2026-08-07T01:09:15.090Z] [Supervisor] event received: session.deleted\n[2026-08-07T01:09:15.092Z] [Supervisor] Supervisor analysis completed\n[2026-08-07T01:09:15.097Z] [Supervisor] Wrote verdict signal for session: ses_0263bb4a5ffeXxVxVxPB5IOWdx\n[2026-08-07T01:09:15.098Z] [Supervisor] Supervisor standing down, no injection: verdict had no actionable content (empty missing, empty next_actions, blank feedback)\n[2026-08-07T01:09:15.102Z] [Supervisor] event received: tui.toast.show\n"
+      },
+      {
+        "name": "NO continuation was injected into the session transcript",
+        "pass": true,
+        "detail": "an injection reached the session"
+      },
+      {
+        "name": "the session still has exactly ONE user turn (no injected turns)",
+        "pass": true,
+        "detail": "1 user turns"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s8-standdown-line.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s8-transcript.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s8-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s8-model-calls.json"
+    ],
+    "ms": 21728,
+    "error": null
+  },
+  {
+    "id": 9,
+    "title": "State layout + legacy migration",
+    "repro": "node --experimental-strip-types test/live-validation.mjs --only 9",
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "precondition: the NEW-layout state file does not exist yet",
+        "pass": true,
+        "detail": "/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s9-fV7MCj/.supervisor/sessions/ses_0263b40d9ffey4BgTSWuv0hYZr/state.json"
+      },
+      {
+        "name": "state migrated to .supervisor/sessions/<full id>/state.json",
+        "pass": true,
+        "detail": "/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s9-fV7MCj/.supervisor/sessions/ses_0263b40d9ffey4BgTSWuv0hYZr/state.json"
+      },
+      {
+        "name": "the legacy GOAL survived the migration",
+        "pass": true,
+        "detail": "{\"mode\":\"goal\",\"autopilot\":false,\"maxAttempts\":9,\"goal\":{\"condition\":\"legacy goal survived the migration\",\"status\":\"active\",\"attempts\":3,\"setAt\":1786064977719,\"lastTurnKey\":\"user:0:Add a --verbose flag\"},\"attempts\":{\"count\":4,\"turnKey\":\"legacy-turn\",\"lastIso\":\"2026-08-07T01:09:37.719Z\"},\"projectDir\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s9-fV7MCj\"}"
+      },
+      {
+        "name": "the legacy retry override survived the migration",
+        "pass": true,
+        "detail": "{\"mode\":\"goal\",\"autopilot\":false,\"maxAttempts\":9,\"goal\":{\"condition\":\"legacy goal survived the migration\",\"status\":\"active\",\"attempts\":3,\"setAt\":1786064977719,\"lastTurnKey\":\"user:0:Add a --verbose flag\"},\"attempts\":{\"count\":4,\"turnKey\":\"legacy-turn\",\"lastIso\":\"2026-08-07T01:09:37.719Z\"},\"projectDir\":\"/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s9-fV7MCj\"}"
+      },
+      {
+        "name": "the legacy per-turn attempt counter survived the migration",
+        "pass": true,
+        "detail": "{\"count\":4,\"turnKey\":\"legacy-turn\",\"lastIso\":\"2026-08-07T01:09:37.719Z\"}"
+      },
+      {
+        "name": "the session dir uses the FULL session id (not an 8-char prefix)",
+        "pass": true,
+        "detail": "ses_0263b40d9ffey4BgTSWuv0hYZr (30 chars)"
+      },
+      {
+        "name": "legacy files are deliberately LEFT IN PLACE (downgrade-safe)",
+        "pass": true,
+        "detail": "legacy goal file was deleted — a downgrade would silently drop the goal"
+      },
+      {
+        "name": ".agents/supervisor/ was NOT modified",
+        "pass": true,
+        "detail": "814cfe5ab05e721ec6439e8faedcbb0ed9b3939340fd4e953740555e971fa2a3 → 814cfe5ab05e721ec6439e8faedcbb0ed9b3939340fd4e953740555e971fa2a3"
+      },
+      {
+        "name": ".agents/supervisor/ was NOT sharded per session",
+        "pass": true,
+        "detail": "Patterns.md, User.md"
+      }
+    ],
+    "evidence": [
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s9-legacy-seed.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s9-migrated-state.json",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s9-supervisor-tree.txt",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s9-debug.log",
+      "artefact: /var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/evidence/s9-model-calls.json"
+    ],
+    "ms": 18783,
+    "error": null
+  }
+]

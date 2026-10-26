@@ -1,0 +1,1165 @@
+╭─── Claude Code v2.1.221 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                  Welcome back Den!                 │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Fixed worktree-isolate… │
+│    Opus 5 · Claude Max · dzianisvv@gmail.com's     │ Fixed PreToolUse auto-… │
+│    Organization                                    │ Fixed `/usage-credits`… │
+│           ~/workspace/agents-supervisor            │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ /clear                                                                        
+
+❯ review session.txt and continue working on a task                             
+
+  Searched for 8 patterns, read 6 files, listed 3 directories, ran 7 shell commands (ctrl+o to expand)
+
+⏺ Now implementing. Starting with core/goal.mjs:
+
+⏺ Update(core/goal.mjs)
+  ⎿  Added 10 lines, removed 8 lines
+      16  import crypto from 'node:crypto';
+      17  
+      18  export const DEFAULT_MAX_ATTEMPTS = 16;
+      19 -export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 60 * 1000;    
+      20 -// Solofounder drives toward a $1M ARR condition across the lif
+         -e of the                                                       
+      21 -// project, not a single 30-minute session — the deadline is a 
+         -safety                                                         
+      22 -// backstop, not a realistic ceiling. 30 days is effectively un
+         -bounded for a                                                  
+      23 -// human-turn-gated loop (see setSolofounder / the per-turn att
+         -empts reset in                                                 
+      24 -// bin/supervisor-on-stop.mjs for the actual budget control).  
+      25 -export const DEFAULT_SOLOFOUNDER_DURATION_MS = 30 * 24 * 60 * 6
+         -0 * 1000;                                                      
+      26 -export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'go
+         -al', 'reflection', 'solofounder']);                            
+      19 +// The deadline is a safety backstop against a goal outliving t
+         +he session that                                                
+      20 +// set it — NOT the budget control. The budget control is the p
+         +er-turn attempt                                                
+      21 +// cap (see the per-turn attempts reset in bin/supervisor-on-st
+         +op.mjs): the                                                   
+      22 +// loop can only ever run HARD_CAP injections before it hands c
+         +ontrol back to                                                 
+      23 +// the human, so a short wall-clock ceiling adds nothing but a 
+         +silent death for                                               
+      24 +// any goal a human is still actively working on. It used to be
+         + 30 minutes,                                                   
+      25 +// which killed long-running goals mid-drive with no verdict an
+         +d no message.                                                  
+      26 +// 30 days is effectively unbounded for a human-turn-gated loop
+         +.                                                              
+      27 +export const DEFAULT_MAX_GOAL_DURATION_MS = 30 * 24 * 60 * 60 *
+         + 1000;                                                         
+      28 +export const SUPERVISOR_MODES = Object.freeze(['autopilot', 'go
+         +al', 'reflection']);                                           
+      29  export const DEFAULT_SUPERVISOR_MODE = 'reflection';
+      30  // Shared cap on a goal condition's length. Single source of tr
+          uth for BOTH
+      31  // runtime surfaces: parseSupervisorCommand (CC CLI) and execut
+          eSupervisorGoal
+
+⏺ Update(core/goal.mjs)
+  ⎿  Added 8 lines, removed 5 lines
+      74      if (lower === 'set-goal' || lower === 'goal') return parseS
+          upervisorCommand('set-goal', tail);
+      75      if (lower === 'retry') return parseSupervisorCommand('retry
+          ', tail);
+      76      if (lower === 'autoreview') return parseSupervisorCommand('
+          autoreview', tail);
+      77 -    if (lower === 'solofounder') return parseSupervisorCommand(
+         -'solofounder', tail);                                          
+      77 +    if (lower === 'solofounder') return parseSupervisorCommand(
+         +'set-goal', tail);                                             
+      78      return { kind: 'supervisor-status' };
+      79    }
+      80 -  if (name === 'solofounder') {                                
+      81 -    return { kind: 'solofounder-on', condition: trimmed.slice(0
+         -, GOAL_CONDITION_MAX_LEN) };                                   
+      82 -  }                                                            
+      83 -  if (name === 'set-goal' || name === 'goal') {                
+      80 +  // `solofounder` used to be its own supervisor mode with its 
+         +own state file,                                                
+      81 +  // its own deadline and its own continuation template. Everyt
+         +hing that made                                                 
+      82 +  // it different is now goal mode's default behavior (per-turn
+         + budget reset,                                                 
+      83 +  // long deadline, condition injected into the judge), so the 
+         +name survives                                                  
+      84 +  // only as an alias that arms a plain goal. The CEO playbook 
+         +lives in                                                       
+      85 +  // skills/solofounder/SKILL.md, which is where prompt-level g
+         +uidance belongs.                                               
+      86 +  if (name === 'set-goal' || name === 'goal' || name === 'solof
+         +ounder') {                                                     
+      87      if (trimmed === '') return { kind: 'goal-status' };
+      88      if (GOAL_CLEAR_ALIASES.has(trimmed.toLowerCase())) return {
+           kind: 'goal-clear' };
+      89      return { kind: 'goal-set', condition: trimmed.slice(0, GOAL
+          _CONDITION_MAX_LEN) };
+
+⏺ Update(core/goal.mjs)
+  ⎿  Added 4 lines, removed 1 line
+      176      state.goal = {
+      177        condition, status: 'active', attempts: 0,
+      178        tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
+      179 -      deadline: now + maxDurationMs, lastReason: '',          
+      179 +      // lastTurnKey: fingerprint of the human turn the attemp
+          +ts count belongs                                              
+      180 +      // to. null until the first stop observes one — see the 
+          +per-turn reset in                                             
+      181 +      // bin/supervisor-on-stop.mjs.                          
+      182 +      deadline: now + maxDurationMs, lastReason: '', lastTurnK
+          +ey: null,                                                     
+      183      };
+      184      state.mode = 'goal';
+      185      state.autopilot = false;
+
+⏺ Update(core/goal.mjs)
+  ⎿  Added 3 lines, removed 4 lines
+      199      const state = goalStore.load(cwd, sessionId);
+      200      state.mode = mode;
+      201      state.autopilot = mode === 'autopilot';
+      202 -    // 'goal' and 'solofounder' both run their condition throu
+          -gh the same                                                   
+      203 -    // goal-loop primitives (state.goal) — only switching to a
+          - mode that                                                    
+      204 -    // doesn't use a goal at all should delete it.            
+      205 -    if (mode !== 'goal' && mode !== 'solofounder') delete stat
+          -e.goal;                                                       
+      202 +    // Only 'goal' runs a condition through the goal-loop prim
+          +itives                                                        
+      203 +    // (state.goal); switching to any other mode drops it.    
+      204 +    if (mode !== 'goal') delete state.goal;                   
+      205      goalStore.save(cwd, sessionId, state);
+      206      return state;
+      207    },
+
+⏺ Update(core/goal.mjs)
+  ⎿  Removed 20 lines
+      208    setAutopilot(cwd, sessionId, enabled) {
+      209      return goalStore.setMode(cwd, sessionId, enabled ? 'autopi
+           lot' : DEFAULT_SUPERVISOR_MODE);
+      210    },
+      211 -  /**                                                         
+      212 -   * Arm solofounder mode: same goal-loop shape as setGoal, bu
+          -t mode is                                                     
+      213 -   * 'solofounder' (so setMode never deletes it) and the deadl
+          -ine defaults to                                               
+      214 -   * DEFAULT_SOLOFOUNDER_DURATION_MS (30 days), NOT the 30-min
+          -ute                                                           
+      215 -   * DEFAULT_MAX_GOAL_DURATION_MS a bare setGoal() call would 
+          -apply.                                                        
+      216 -   */                                                         
+      217 -  setSolofounder(cwd, sessionId, condition, opts = {}) {      
+      218 -    const state = goalStore.load(cwd, sessionId);             
+      219 -    const now = opts.now ?? Date.now();                       
+      220 -    const maxDurationMs = opts.maxDurationMs ?? DEFAULT_SOLOFO
+          -UNDER_DURATION_MS;                                            
+      221 -    state.goal = {                                            
+      222 -      condition, status: 'active', attempts: 0,               
+      223 -      tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now, 
+      224 -      deadline: now + maxDurationMs, lastReason: '', lastTurnK
+          -ey: null,                                                     
+      225 -    };                                                        
+      226 -    state.mode = 'solofounder';                               
+      227 -    state.autopilot = false;                                  
+      228 -    goalStore.save(cwd, sessionId, state);                    
+      229 -    return state;                                             
+      230 -  },                                                          
+      211    setRetry(cwd, sessionId, n) {
+      212      const state = goalStore.load(cwd, sessionId);
+      213      state.maxAttempts = n;
+
+⏺ Now remove the solofounder.md storage block:
+
+⏺ Update(core/goal.mjs)
+  ⎿  Removed 73 lines
+      581    }
+      582    return out;
+      583  }
+      584 -                                                              
+      585 -// --- solofounder-mode goal (.agents/supervisor/solofounder.m
+          -d) -------------                                              
+      586 -//                                                            
+      587 -// Same "current pointer" shape as Goal.md (writeProjectGoal a
+          -bove), but its                                                
+      588 -// own file so a solofounder drive never collides with — or ge
+          -ts silently                                                   
+      589 -// overwritten by — a plain project-level /supervisor:set-goal
+          - condition.                                                   
+      590 -// The condition string is expected to already bake in the res
+          -olved                                                         
+      591 -// revenue-read command (see skills/solofounder's "Set the $1M
+          - ARR done-bar"                                                
+      592 -// step) — this module only owns durable storage + parsing, no
+          -t resolving it.                                               
+      593 -                                                              
+      594 -function solofounderGoalPath(cwd) {                           
+      595 -  return path.join(projectGoalDir(cwd), 'solofounder.md');    
+      596 -}                                                             
+      597 -                                                              
+      598 -/**                                                           
+      599 - * Persist the solofounder $1M ARR condition to .agents/superv
+          -isor/solofounder.md.                                          
+      600 - * Atomic temp+rename, same durability contract as writeProjec
+          -tGoal. The file                                               
+      601 - * carries a `## Goal Condition` section (parsed back by extra
+          -ctGoalCondition)                                              
+      602 - * plus a `## Workstream State` section reserved for the CEO l
+          -oop's own                                                     
+      603 - * running notes (current lever, doer results, cooldowns) — th
+          -is function                                                   
+      604 - * only ever (re)writes the Goal Condition; it never touches w
+          -orkstream notes                                               
+      605 - * a running drive may have appended, other than resetting the
+          -m on a fresh                                                  
+      606 - * `solofounder` CLI invocation (matches the "re-arming = fres
+          -h drive"                                                      
+      607 - * semantics of setSolofounder).                              
+      608 - * Best-effort: never throws.                                 
+      609 - */                                                           
+      610 -export function writeSolofounderGoal(cwd, condition) {        
+      611 -  const trimmed = (condition ?? '').slice(0, GOAL_CONDITION_MA
+          -X_LEN);                                                       
+      612 -  const dir = projectGoalDir(cwd);                            
+      613 -  try {                                                       
+      614 -    fs.mkdirSync(dir, { recursive: true });                   
+      615 -  } catch {                                                   
+      616 -    return; // can't even make the dir — give up, best effort 
+      617 -  }                                                           
+      618 -  const content = `# Solo Founder Goal — $1M ARR              
+      619 -                                                              
+      620 -<!-- Managed by \`node bin/supervisor.mjs solofounder "<produc
+          -t/context>"\`. The                                            
+      621 -condition below should bake in the resolved revenue-read comma
+          -nd (see                                                       
+      622 -skills/solofounder). Re-running the CLI overwrites the Goal Co
+          -ndition section                                               
+      623 -below and resets Workstream State — do not hand-edit Goal Cond
+          -ition from                                                    
+      624 -another tool or a re-arm will silently clobber it. -->        
+      625 -                                                              
+      626 -## Goal Condition                                             
+      627 -                                                              
+      628 -${trimmed}                                                    
+      629 -                                                              
+      630 -## Workstream State                                           
+      631 -                                                              
+      632 -<!-- CEO-loop notes: current highest-leverage workstream, doer
+          - results,                                                     
+      633 -cooldowns, next lever. Free-form; updated by the drive as it r
+          -uns. -->                                                      
+      634 -`;                                                            
+      635 -  try {                                                       
+      636 -    const tmp = path.join(dir, `solofounder.${process.pid}.${p
+          -rocess.hrtime.bigint()}.tmp`);                                
+      637 -    fs.writeFileSync(tmp, content, 'utf8');                   
+      638 -    fs.renameSync(tmp, solofounderGoalPath(cwd));             
+      639 -  } catch {                                                   
+      640 -    /* best effort */                                         
+      641 -  }                                                           
+      642 -}                                                             
+      643 -                                                              
+      644 -/**                                                           
+      645 - * Read back the $1M ARR condition from .agents/supervisor/sol
+          -ofounder.md.                                                  
+      646 - * Returns '' if the file is missing/unreadable. Shares extrac
+          -tGoalCondition's                                              
+      647 - * parsing (HTML-comment stripping, `## Goal Condition` sectio
+          -n preference)                                                 
+      648 - * with the plain project-goal file.                          
+      649 - */                                                           
+      650 -export function readSolofounderGoal(cwd) {                    
+      651 -  try {                                                       
+      652 -    return extractGoalCondition(fs.readFileSync(solofounderGoa
+          -lPath(cwd), 'utf8'));                                         
+      653 -  } catch {                                                   
+      654 -    return '';                                                
+      655 -  }                                                           
+      656 -}                                                             
+
+⏺ Now the Stop hook:
+
+⏺ Update(bin/supervisor-on-stop.mjs)
+  ⎿  Added 10 lines, removed 8 lines
+      782      if (goalState.goal && goalState.goal.status === 'active') 
+           {
+      783        goal = goalState.goal;
+      784        effectiveMax = resolveMaxAttempts({ sessionOverride: goa
+           lState.maxAttempts });
+      785 -      // Solofounder's attempt budget is per-human-turn, not c
+          -umulative for                                                 
+      786 -      // the whole session (unlike plain 'goal' mode): once tu
+          -rnKey moves —                                                 
+      787 -      // a new real user message arrived — the previous turn's
+          - escalation no                                                
+      788 -      // longer applies, so goal.attempts resets to 0 instead 
+          -of marching                                                   
+      789 -      // toward decideGoalTransition's exhausted cap forever. 
+          -lastTurnKey is                                                
+      790 -      // only null on the very first stop after arming (setSol
+          -ofounder), so                                                 
+      791 -      // that first observation just stamps it without a spuri
+          -ous reset.                                                    
+      792 -      if (mode === 'solofounder' && turnKey != null && goal.la
+          -stTurnKey !== turnKey) {                                      
+      785 +      // A goal's attempt budget is per-human-turn, not cumula
+          +tive for the                                                  
+      786 +      // whole session: once turnKey moves — a new real user m
+          +essage arrived —                                              
+      787 +      // the previous turn's escalation no longer applies, so 
+          +goal.attempts                                                 
+      788 +      // resets to 0 instead of marching toward decideGoalTran
+          +sition's                                                      
+      789 +      // exhausted cap forever. Without this, a goal set early
+          + in a session                                                 
+      790 +      // died permanently ~16 stops later with no verdict and 
+          +no way to tell                                                
+      791 +      // why the supervisor had gone quiet. lastTurnKey is onl
+          +y null on the                                                 
+      792 +      // very first stop after setGoal, so that first observat
+          +ion just stamps                                               
+      793 +      // it without a spurious reset.                         
+      794 +      if (turnKey != null && goal.lastTurnKey !== turnKey) {  
+      795          const shouldReset = goal.lastTurnKey != null;
+      796          goal = { ...goal, lastTurnKey: turnKey, ...(shouldRese
+           t ? { attempts: 0 } : {}) };
+      797          goalState = { ...goalState, goal };
+
+⏺ Update(bin/supervisor-on-stop.mjs)  ⎿  Added 18 lines, removed 23 lines
+      824    // readProjectGoalCondition for the shared precedence rule).
+      825    let projectGoalSection = '';
+      826    const effectiveMode = resolveSupervisorMode(goalState);
+      827 -  if (effectiveMode !== 'goal' && effectiveMode !== 'solofound
+          -er' && !goal) {                                               
+      827 +  if (effectiveMode !== 'goal' && !goal) {                    
+      828      const cond = readProjectGoalCondition(cwd);
+      829      if (cond) projectGoalSection = buildGoalRequirementSection
+           (cond);
+      830    }
+      831  
+      832 -  // Solofounder: the judge must actually see the $1M ARR cond
+          -ition + evidence                                              
+      833 -  // rule as a MANDATORY completion requirement (unlike plain 
+          -'goal' mode,                                                  
+      834 -  // which only surfaces goal.condition in the continuation fe
+          -edback text, not                                              
+      835 -  // the judge prompt itself) — source it from solofounder.md,
+          - falling back to                                              
+      836 -  // the shared Goal.md/goal.md pointer if a drive was armed b
+          -efore that file                                               
+      837 -  // existed.                                                 
+      838 -  let solofounderGoalSection = '';                            
+      839 -  if (mode === 'solofounder') {                               
+      840 -    const cond = readSolofounderGoal(cwd) || readProjectGoalCo
+          -ndition(cwd);                                                 
+      841 -    if (cond) solofounderGoalSection = buildGoalRequirementSec
+          -tion(cond);                                                   
+      842 -  }                                                           
+      832 +  // The judge must actually SEE the goal condition + evidence
+          + rule as a                                                    
+      833 +  // MANDATORY completion requirement. It previously only reac
+          +hed the                                                       
+      834 +  // continuation feedback text, never the judge prompt — so t
+          +he judge decided                                              
+      835 +  // "complete" against generic workflow gates while the goal 
+          +loop then used                                                
+      836 +  // that verdict to decide the goal was met. (OpenCode always
+          + injected it —                                                
+      837 +  // see supervisor-impl.ts's goalSection — so this was a CC-o
+          +nly gap.)                                                     
+      838 +  const sessionGoalSection = goal ? buildGoalRequirementSectio
+          +n(goal.condition) : '';                                       
+      839  
+      840    const attempts = readAttempts(session_id, cwd, turnKey);
+      841    if (attempts >= effectiveMax) {
+      846 -    // Solofounder's per-turn budget hitting its cap is NOT pe
+          -rmanent                                                       
+      847 -    // exhaustion — the file-based `attempts` counter above al
+          -ready resets on                                               
+      848 -    // the next turnKey (a new human message), so leave goal.s
+          -tatus 'active'                                                
+      849 -    // and just stand down for the rest of THIS turn. Marking 
+          -it 'exhausted'                                                
+      850 -    // here would permanently disable the drive: the goal-acti
+          -ve branch above                                               
+      851 -    // (where lastTurnKey/attempts get reset) never re-fires o
+          -nce status                                                    
+      852 -    // leaves 'active', so a solofounder goal that hit this pe
+          -r-turn cap once                                               
+      853 -    // would never resume on a later turn.                    
+      854 -    if (goal && mode !== 'solofounder') {                     
+      855 -      try { goalStore.save(cwd, session_id, { ...goalState, go
+          -al: { ...goal, status: 'exhausted' } }); } catch { /* */ }    
+      856 -    }                                                         
+      842 +    // Hitting the per-turn budget is NOT permanent exhaustion
+          + — the                                                        
+      843 +    // file-based `attempts` counter above already resets on t
+          +he next turnKey                                               
+      844 +    // (a new human message), so leave goal.status 'active' an
+          +d just stand                                                  
+      845 +    // down for the rest of THIS turn. Marking it 'exhausted' 
+          +here would                                                    
+      846 +    // permanently disable the goal: the goal-active branch ab
+          +ove (where                                                    
+      847 +    // lastTurnKey/attempts get reset) never re-fires once sta
+          +tus leaves                                                    
+      848 +    // 'active', so a goal that hit the cap once would never r
+          +esume on a                                                    
+      849 +    // later turn. Real exhaustion is the deadline, applied in
+          + the goal loop                                                
+      850 +    // below.                                                 
+      851 +    //                                                        
+      852      // Disable autopilot on budget exhaustion so the next stop
+            is clean.
+      853      if (mode === 'autopilot') {
+      854        try { goalStore.setAutopilot(cwd, session_id, false); } 
+           catch { /* */ }
+
+⏺ Update(bin/supervisor-on-stop.mjs)
+  ⎿  Added 1 line, removed 3 lines
+      923      lastAssistantText: ctx.final_assistant_text,
+      924      attemptCount: attempts,
+      925      maxAttempts: effectiveMax,
+      926 -    goalSection: mode === 'solofounder'                       
+      927 -      ? (solofounderGoalSection || (goal ? buildGoalRequiremen
+          -tSection(goal.condition) : undefined))                        
+      928 -      : ((projectGoalSection && !goal) ? projectGoalSection : 
+          -undefined),                                                   
+      926 +    goalSection: sessionGoalSection || projectGoalSection || u
+          +ndefined,                                                     
+      927    });
+      928  
+      929    // 6.5. Resolve delivered media so the tool-less judge can S
+           EE it. Images are
+
+⏺ Now the goal-loop branch:
+
+⏺ Update(bin/supervisor-on-stop.mjs)
+  ⎿  Added 18 lines, removed 14 lines
+      1020      if (t.action === 'achieved') {
+      1021        try { goalStore.save(cwd, session_id, { ...goalState, g
+            oal: t.goal }); } catch { /* */ }
+      1022        verdictRecord.goal = 'achieved';
+      1023 -      if (mode === 'solofounder') {                          
+      1024 -        verdictRecord.message = `$1M ARR condition met: "${go
+           -al.condition}". ${analysis.reason || ''}`.trim();            
+      1025 -      }                                                      
+      1023 +      verdictRecord.message = `Goal condition met: "${goal.co
+           +ndition}". ${analysis.reason || ''}`.trim();                 
+      1024        writeVerdict(session_id, verdictRecord, cwd);
+      1027 -      debug({ msg: mode === 'solofounder' ? 'solofounder_achi
+           -eved' : 'goal_achieved', session_id, message: verdictRecord.m
+           -essage }, cwd);                                              
+      1025 +      debug({ msg: 'goal_achieved', session_id, message: verd
+           +ictRecord.message }, cwd);                                   
+      1026        process.exit(0);
+      1027      }
+      1028      if (t.action === 'exhausted') {
+      1031 -      try { goalStore.save(cwd, session_id, { ...goalState, g
+           -oal: t.goal }); } catch { /* */ }                            
+      1032 -      verdictRecord.goal = 'exhausted';                      
+      1029 +      // Two different things reach this branch, and only one
+           + of them is a                                                
+      1030 +      // real end-of-goal. The deadline is: it means the goal
+           + outlived the                                                
+      1031 +      // window it was set for. The attempts cap is not — att
+           +empts reset on                                               
+      1032 +      // the next human turn (see the per-turn reset above), 
+           +so persisting                                                
+      1033 +      // 'exhausted' here would kill a goal the human is stil
+           +l driving. Stand                                             
+      1034 +      // down for the rest of THIS turn instead and leave it 
+           +active.                                                      
+      1035 +      const deadlineHit = Date.now() >= goal.deadline;       
+      1036 +      if (deadlineHit) {                                     
+      1037 +        try { goalStore.save(cwd, session_id, { ...goalState,
+           + goal: t.goal }); } catch { /* */ }                          
+      1038 +        verdictRecord.goal = 'exhausted';                    
+      1039 +      } else {                                               
+      1040 +        verdictRecord.goal = 'turn_budget_spent';            
+      1041 +      }                                                      
+      1042        writeVerdict(session_id, verdictRecord, cwd);
+      1034 -      debug({ msg: 'goal_exhausted', session_id }, cwd);     
+      1043 +      debug({ msg: deadlineHit ? 'goal_exhausted' : 'goal_tur
+           +n_budget_spent', session_id }, cwd);                         
+      1044        process.exit(0);
+      1045      }
+      1046      // continue — but never override a genuine human-only blo
+            ck.
+      1047      if (!analysis.requiresHumanAction) {
+      1039 -      // Solofounder gets a CEO directive (pick a lever, spaw
+           -n doers, evaluate,                                           
+      1040 -      // integrate) instead of the generic Missing/Next-Actio
+           -ns feedback plain                                            
+      1041 -      // 'goal' mode uses — same escalation slot, different f
+           -raming.                                                      
+      1042 -      const msg = mode === 'solofounder'                     
+      1043 -        ? buildCeoDirective({ goalCondition: goal.condition, 
+           -analysis, attempt: nextAttempt, effectiveMax })              
+      1044 -        : `Goal not yet met: "${goal.condition}". ${buildAnal
+           -ysisFeedback()}`;                                            
+      1048 +      const msg = `Goal not yet met: "${goal.condition}". ${b
+           +uildAnalysisFeedback()}`;                                    
+      1049        writeAttemptCounter(session_id, nextAttempt, cwd, turnK
+            ey);
+      1050        try { goalStore.save(cwd, session_id, { ...goalState, g
+            oal: t.goal }); } catch { /* */ }
+      1051        verdictRecord.injected = true;
+      1052        verdictRecord.goal = 'continue';
+      1049 -      verdictRecord.feedback_reason = mode === 'solofounder' 
+           -? 'ceo_directive_continue' : 'goal_continue';                
+      1053 +      verdictRecord.feedback_reason = 'goal_continue';       
+      1054        writeVerdict(session_id, verdictRecord, cwd);
+      1055        process.stdout.write(JSON.stringify({ decision: 'block'
+            , reason: msg }));
+      1056        debug({ msg: 'goal_continue_inject', session_id, attemp
+            t: nextAttempt, severity: analysis.severity, mode }, cwd);
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(bin/supervisor-on-stop.mjs)
+  ⎿  Added 2 lines, removed 2 lines
+      31    hasCodeChangeEvidence, isPlanMode, evaluateSelfAssessment,
+      32  } from '../core/evaluation.mjs';
+      33  import { parseSelfAssessmentJson } from '../core/assessment.mjs
+          ';
+      34 -import { buildEscalatingFeedback, buildCeoDirective } from '../
+         -core/feedback.mjs';                                            
+      35 -import { goalStore, resolveMaxAttempts, decideGoalTransition, r
+         -esolveSupervisorMode, buildGoalRequirementSection, readProjectG
+         -oalCondition, readSolofounderGoal } from '../core/goal.mjs';   
+      34 +import { buildEscalatingFeedback } from '../core/feedback.mjs';
+      35 +import { goalStore, resolveMaxAttempts, decideGoalTransition, r
+         +esolveSupervisorMode, buildGoalRequirementSection, readProjectG
+         +oalCondition } from '../core/goal.mjs';                        
+      36  import { buildReflectionPrompt } from '../core/reflection-promp
+          t.mjs';
+      37  
+      38  // Plugin's own shipped .agents/supervisor dir — fallback defau
+          lts when a
+
+⏺ Now bin/supervisor.mjs and core/feedback.mjs:
+
+⏺ Update(bin/supervisor.mjs)
+  ⎿  Removed 18 lines
+      223      break;
+      224    }
+      225  
+      226 -  // ── solofounder-on ───────────────────────────────────────
+          -─────────────────                                             
+      227 -  case 'solofounder-on': {                                    
+      228 -    if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); 
+          -}                                                             
+      229 -    const condition = cmd.condition || '';                    
+      230 -    // Deliberately NOT calling clearGoalIfActive: solofounder
+          --on sets a new                                                
+      231 -    // session goal itself (setSolofounder below), it never de
+          -letes one.                                                    
+      232 -    writeSolofounderGoal(cwd, condition);                     
+      233 -    goalStore.setSolofounder(cwd, sid, condition);            
+      234 -    const budget = resolveMaxAttempts({ sessionOverride: goalS
+          -tore.load(cwd, sid).maxAttempts });                           
+      235 -    console.log(                                              
+      236 -      `mode: solofounder\n` +                                 
+      237 -      `Solo-founder drive armed for session ${sid.slice(0, 8)}
+          -… — target: $1,000,000 ARR.\n` +                              
+      238 -      `Condition: "${condition}"\n` +                         
+      239 -      `Saved to .agents/supervisor/solofounder.md. The judge r
+          -uns on every stop and keeps driving the CEO loop until the ARR
+          - bar is demonstrably met; the ${budget}-attempt budget resets 
+          -every human turn instead of exhausting permanently, and the dr
+          -ive has no practical time limit.`                             
+      240 -    );                                                        
+      241 -    break;                                                    
+      242 -  }                                                           
+      243 -                                                              
+      226    // ── autopilot-off ────────────────────────────────────────
+           ─────────────────
+      227    case 'autopilot-off': {
+      228      if (!sid) { console.log(NO_SESSION_MSG); process.exit(0); 
+           }
+
+⏺ Update(bin/supervisor.mjs)
+  ⎿  Removed 1 line
+      22    resolveMaxAttempts,
+      23    resolveSupervisorMode,
+      24    writeProjectGoal,
+      25 -  writeSolofounderGoal,                                        
+      25    readProjectGoalCondition,
+      26  } from '../core/goal.mjs';
+      27  
+
+⏺ Update(bin/supervisor.mjs)
+  ⎿  Added 2 lines, removed 1 line
+      128      const budget = resolveMaxAttempts({ sessionOverride: goalS
+           tore.load(cwd, sid).maxAttempts });
+      129      console.log(
+      130        `${GOAL_LABEL} set for session ${sid.slice(0, 8)}…: "${c
+           md.condition}".\n` +
+      131 -      `The supervisor will keep pushing the agent until this i
+          -s demonstrably met or the retry budget (${budget}) runs out.\n
+          -` +                                                           
+      131 +      `The judge sees this as a mandatory completion requireme
+          +nt on every stop and keeps pushing until it is demonstrably me
+          +t.\n` +                                                       
+      132 +      `Budget: ${budget} attempts per human turn — it resets e
+          +ach time you speak, so the goal is never permanently exhausted
+          + mid-session.\n` +                                            
+      133        `Also saved to .agents/supervisor/Goal.md for reflection
+            mode.`
+      134      );
+      135      break;
+
+⏺ Update(bin/supervisor.mjs)
+  ⎿  Added 1 line, removed 1 line
+      296      const given = process.argv[2] ?? '(none)';
+      297      console.log(
+      298        `Unknown supervisor command: ${given}.\n` +
+      299 -      `Valid commands: status, on, off, goal, retry, autopilot
+          -, reflection, solofounder, mode.`                             
+      299 +      `Valid commands: status, on, off, set-goal, retry, autop
+          +ilot, reflection, mode.`                                      
+      300      );
+      301      process.exit(1);
+      302    }
+
+⏺ Update(core/feedback.mjs)
+  ⎿  Removed 45 lines
+       73  
+       74  ${closing}`
+       75  }
+       76 -                                                              
+       77 -/**                                                           
+       78 - * Solofounder-mode continuation message — same escalation SLO
+          -T as                                                          
+       79 - * buildEscalatingFeedback's calm template, but framed as a CE
+          -O directive                                                   
+       80 - * instead of generic "Missing/Next Actions" feedback: restate
+          - the $1M ARR                                                  
+       81 - * bar, then instruct the agent to run the CEO loop (pick the 
+          -highest-leverage                                              
+       82 - * workstream, spawn parallel doers, evaluate on a rubric, int
+          -egrate) rather                                                
+       83 - * than just "address these issues". MUST start with FEEDBACK_
+          -MARKER — the                                                  
+       84 - * Stop hook's computeTurnKey fingerprints the last user messa
+          -ge NOT                                                        
+       85 - * containing that marker, so any injected text lacking the ex
+          -act prefix                                                    
+       86 - * corrupts the per-turn attempt counter.                     
+       87 - * @param {object} opts                                       
+       88 - * @param {string} opts.goalCondition — the $1M ARR condition 
+          -text                                                          
+       89 - * @param {import('./evaluation.mjs').SupervisorAnalysis} [opt
+          -s.analysis]                                                   
+       90 - * @param {number} [opts.attempt]                             
+       91 - * @param {number} [opts.effectiveMax]                        
+       92 - * @returns {string}                                          
+       93 - */                                                           
+       94 -export function buildCeoDirective({ goalCondition, analysis, a
+          -ttempt, effectiveMax }) {                                     
+       95 -  const safeAnalysis = analysis ?? {}                         
+       96 -  const missingItems = (Array.isArray(safeAnalysis.missing) ? 
+          -safeAnalysis.missing : []).map(rewriteIfDestructive)          
+       97 -  const nextActionItems = (Array.isArray(safeAnalysis.nextActi
+          -ons) ? safeAnalysis.nextActions : []).map(rewriteIfDestructive
+          -)                                                             
+       98 -  const reason = safeAnalysis.reason || ''                    
+       99 -  const missing = missingItems.length                         
+      100 -    ? `\n### Missing\n${missingItems.map((m) => `- ${m}`).join
+          -('\n')}`                                                      
+      101 -    : ''                                                      
+      102 -  const nextActions = nextActionItems.length                  
+      103 -    ? `\n### Next Actions\n${nextActionItems.map((a) => `- ${a
+          -}`).join('\n')}`                                              
+      104 -    : ''                                                      
+      105 -  const attemptSuffix = attempt !== undefined && effectiveMax 
+          -!== undefined ? ` (attempt ${attempt}/${effectiveMax})` : ''  
+      106 -                                                              
+      107 -  return `${FEEDBACK_MARKER} CEO Directive${attemptSuffix}    
+      108 -                                                              
+      109 -The $1M ARR bar is not yet met: "${goalCondition}"            
+      110 -${reason ? `\n${reason}` : ''}                                
+      111 -${missing}${nextActions}                                      
+      112 -                                                              
+      113 -Run the CEO loop now — you are the operator, not an assistant 
+          -waiting for a task:                                           
+      114 -1. Pick the ONE highest-leverage unblocked workstream (enginee
+          -ring / product / growth / content) toward the ARR bar.        
+      115 -2. Spawn parallel doer subagents on narrow, named scopes — nev
+          -er a vague "audit the repo".                                  
+      116 -3. Evaluate each doer's output against a rubric: did it ship r
+          -eal, verifiable work — not a stub, not narration.             
+      117 -4. Integrate what passes, record workstream state, and rotate 
+          -to the next lever.                                            
+      118 -                                                              
+      119 -Never nudge a destructive or wasteful action (force-push, hard
+          - reset, history rewrite, branch deletion, rm -rf, unapproved s
+          -pend) — flag those to the user instead of doing them.`        
+      120 -}                                                             
+
+⏺ Now the OpenCode side — same per-turn reset so both runtimes agree:
+
+⏺ Update(opencode/supervisor-impl.ts)
+  ⎿  Added 8 lines
+      159    startedAt: number
+      160    deadline: number
+      161    lastReason: string
+      162 +  /**                                                         
+      163 +   * Fingerprint of the human turn `attempts` belongs to (the 
+          +last relevant                                                 
+      164 +   * user message id here; a transcript-derived turn key on th
+          +e Claude Code                                                 
+      165 +   * side). The attempt budget is per-turn, not cumulative for
+          + the session —                                                
+      166 +   * see the reset in the session.idle handler. null until the
+          + first idle pass                                              
+      167 +   * observes one.                                            
+      168 +   */                                                         
+      169 +  lastTurnKey?: string | null                                 
+      170  }
+      171  
+      172  export type SupervisorMode = "autopilot" | "goal" | "reflectio
+           n"
+
+⏺ Update(opencode/supervisor-impl.ts)
+  ⎿  Added 1 line
+      230        startedAt: now,
+      231        deadline: now + maxDurationMs,
+      232        lastReason: "",
+      233 +      lastTurnKey: null,                                      
+      234      }
+      235      state.mode = "goal"
+      236      state.autopilot = false
+
+⏺ Update(opencode/supervisor-impl.ts)
+  ⎿  Added 15 lines, removed 1 line
+      1854          // rubric with a mandatory completion requirement and
+             drives the goal loop.
+      1855          const sup = await supervisorStore.load(directory, ses
+            sionId)
+      1856          const mode = resolveSupervisorMode(sup) as Supervisor
+            Mode
+      1857 -        const goal = mode === "goal" && sup.goal && sup.goal.
+           -status === "active" ? sup.goal : null                        
+      1857 +        let goal = mode === "goal" && sup.goal && sup.goal.st
+           +atus === "active" ? sup.goal : null                          
+      1858 +        // A goal's attempt budget is per-human-turn, not cum
+           +ulative for the                                              
+      1859 +        // whole session: once the human speaks again the pre
+           +vious turn's                                                 
+      1860 +        // escalation no longer applies, so goal.attempts res
+           +ets instead of                                               
+      1861 +        // marching toward decideGoalTransition's exhausted c
+           +ap forever (which                                            
+      1862 +        // killed the goal permanently, mid-session, with no 
+           +verdict).                                                    
+      1863 +        // lastTurnKey is only null on the very first pass af
+           +ter setGoal, so                                              
+      1864 +        // that first observation just stamps it without a sp
+           +urious reset.                                                
+      1865 +        // Mirrors the identical reset in bin/supervisor-on-s
+           +top.mjs.                                                     
+      1866 +        if (goal && goal.lastTurnKey !== lastUserMsgId) {    
+      1867 +          const shouldReset = goal.lastTurnKey != null       
+      1868 +          goal = { ...goal, lastTurnKey: lastUserMsgId, ...(s
+           +houldReset ? { attempts: 0 } : {}) }                         
+      1869 +          sup.goal = goal                                    
+      1870 +          try { await supervisorStore.save(directory, session
+           +Id, sup) } catch { /* best effort */ }                       
+      1871 +        }                                                    
+      1872          const effectiveMaxAttempts = resolveMaxAttempts({ ses
+            sionOverride: sup.maxAttempts, config: await loadConfiguredMa
+            xAttempts() })
+      1873  
+      1874          // ── Autopilot fast-path ───────────────────────────
+            ───────────────
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(opencode/supervisor-impl.ts)
+  ⎿  Added 14 lines, removed 3 lines
+      2108              reason: analysis.reason,
+      2109            })
+      2110            if (t.action === "exhausted") {
+      2111 -            await supervisorStore.save(directory, sessionId, 
+           -{ ...sup, mode: "reflection", autopilot: false, goal: t.goal 
+           -})                                                           
+      2111 +            // Two different things reach this branch, and on
+           +ly the deadline is                                           
+      2112 +            // a real end-of-goal — it means the goal outlive
+           +d the window it was                                          
+      2113 +            // set for. The attempts cap is per-human-turn (s
+           +ee the reset above),                                         
+      2114 +            // so persisting "exhausted" + mode:reflection th
+           +ere would kill a                                             
+      2115 +            // goal the human is still driving. Stand down fo
+           +r the rest of THIS                                           
+      2116 +            // turn instead and leave it active. Mirrors bin/
+           +supervisor-on-stop.mjs.                                      
+      2117 +            const deadlineHit = Date.now() >= goal.deadline  
+      2118 +            if (deadlineHit) {                               
+      2119 +              await supervisorStore.save(directory, sessionId
+           +, { ...sup, mode: "reflection", autopilot: false, goal: t.goa
+           +l })                                                         
+      2120 +            }                                                
+      2121              attempts.delete(attemptKey)
+      2122              lastReflectedMsgId.set(sessionId, lastUserMsgId)
+      2123              await showToast(
+      2124                client,
+      2125                directory,
+      2117 -              `Goal budget exhausted (${t.goal.attempts} atte
+           -mpts) — paused`,                                             
+      2126 +              deadlineHit                                    
+      2127 +                ? `Goal deadline reached — paused`           
+      2128 +                : `Goal budget spent for this turn (${t.goal.
+           +attempts} attempts) — resumes on your next message`,         
+      2129                "warning"
+      2130              )
+      2120 -            debug("Goal budget exhausted, pausing without con
+           -tinuation")                                                  
+      2131 +            debug(deadlineHit ? "Goal deadline reached, pausi
+           +ng" : "Goal turn budget spent, pausing until next human turn"
+           +)                                                            
+      2132              return
+      2133            }
+      2134            if (t.action === "achieved") {
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now rewriting the solofounder test file as goal-mode coverage:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Write(test/goal-per-turn.test.mjs)
+  ⎿  Wrote 219 lines to test/goal-per-turn.test.mjs
+       1 // goal-per-turn.test.mjs — the goal loop's per-turn budget cont
+       2 //
+         rvisor mode
+       4 // (its own state file, its own deadline, its own continuation t
+       5 // mode was folded into plain `goal` mode: everything that made 
+       6 // now goal mode's default, and the CEO playbook lives in the sk
+       7 // (skills/solofounder/SKILL.md) instead of the hook. What this 
+         file pins:
+       9 //   1. solofounder is NOT a supervisor mode any more.
+         ets when the
+     … +285 lines (ctrl+o to expand)
+
+  Searched for 1 pattern, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(bin/supervisor-on-stop.mjs)
+  ⎿  Added 8 lines
+      943      debug({ msg: 'media_collect_failed', err: String(e?.messag
+           e ?? e) }, cwd);
+      944    }
+      945  
+      946 +  // Test-only escape hatch (same family as SUPERVISOR_FAKE_JU
+          +DGE): dump the                                                
+      947 +  // fully-built judge prompt to a file so a test can assert w
+          +hat the judge                                                 
+      948 +  // actually sees — e.g. that an active goal reaches it as a 
+          +mandatory                                                     
+      949 +  // requirement. Never set in normal operation; best-effort, 
+          +never throws.                                                 
+      950 +  if (process.env.SUPERVISOR_DUMP_PROMPT) {                   
+      951 +    try { fs.writeFileSync(process.env.SUPERVISOR_DUMP_PROMPT,
+          + prompt, 'utf8'); } catch { /* best effort */ }               
+      952 +  }                                                           
+      953 +                                                              
+      954    const fakeJudge = process.env.SUPERVISOR_FAKE_JUDGE ?? proce
+           ss.env.REFLECTION_CC_FAKE_JUDGE;
+      955    let assessmentText;
+      956    try {
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(test/goal-per-turn.test.mjs)
+  ⎿  Added 3 lines, removed 1 line
+      130        assert.equal(out.code, 0, `call ${i + 1} should exit 0`)
+           ;
+      131        const parsed = JSON.parse(out.stdout);
+      132        assert.equal(parsed.decision, 'block', `call ${i + 1} sh
+           ould inject a continuation`);
+      133 -      assert.ok(parsed.reason.startsWith(FEEDBACK_MARKER), `ca
+          -ll ${i + 1} reason must start with FEEDBACK_MARKER`);         
+      133 +      // The marker must be present (computeTurnKey skips any 
+          +user message                                                  
+      134 +      // containing it — an injection without it corrupts the 
+          +per-turn counter).                                            
+      135 +      assert.ok(parsed.reason.includes(FEEDBACK_MARKER), `call
+          + ${i + 1} reason must carry FEEDBACK_MARKER`);                
+      136        assert.match(parsed.reason, /Goal not yet met/, `call ${
+           i + 1} must restate the goal`);
+      137      }
+      138      const afterCap = loadGoalState(d, sid);
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now the full suite:
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(test/goal-integration.test.mjs)
+  ⎿  Added 48 lines, removed 6 lines
+      253      )
+      254    })
+      255  
+      256 -  test("goal loop exhausts after maxAttempts", async () => {  
+      256 +  // The attempts cap is a PER-HUMAN-TURN stand-down, not the 
+          +end of the goal.                                              
+      257 +  // (It used to permanently exhaust the goal and revert to re
+          +flection — which                                              
+      258 +  // silently killed goals mid-session with no verdict. That b
+          +ehavior now                                                   
+      259 +  // belongs to the deadline alone; see the next test.)       
+      260 +  test("goal loop stands down for the turn at maxAttempts but 
+          +stays active", async () => {                                  
+      261      const messages = makeMessages()
+      262      const { client, getActiveSessionPrompts } = createMockClie
+           nt(messages)
+      263  
+      260 -    // Write goal state with attempts already at the default m
+          -ax (16)                                                       
+      264 +    // Write goal state with attempts already at the default m
+          +ax (16) and a                                                 
+      265 +    // lastTurnKey that matches the current turn, so the per-t
+          +urn reset does                                                
+      266 +    // not fire and the cap is genuinely reached.             
+      267      writeFileSync(
+      268        join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json
+           `),
+      269        JSON.stringify({
+     ...
+      276            tokenBaseline: 0,
+      277            startedAt: Date.now() - 10000,
+      278            deadline: Date.now() + 3600000,
+      273 -          lastReason: ""                                      
+      279 +          lastReason: "",                                     
+      280 +          lastTurnKey: LAST_USER_MSG_ID                       
+      281          }
+      282        })
+      283      )
+     ...
+      290      // Wait for async processing
+      291      await new Promise(r => setTimeout(r, 5000))
+      292  
+      286 -    // Read state file — should be exhausted                  
+      293      const statePath = join(tmpDir, ".supervisor", "goals", `${
+           SESSION_ID}.json`)
+      294      const state = JSON.parse(readFileSync(statePath, "utf-8"))
+      295  
+      290 -    assert.equal(state.goal.status, "exhausted", `Goal should 
+          -be exhausted, got: ${state.goal.status}`)                     
+      291 -    assert.equal(state.mode, "reflection", `Mode should revert
+          - to reflection, got: ${state.mode}`)                          
+      296 +    assert.equal(state.goal.status, "active", `Goal must stay 
+          +active at the per-turn cap, got: ${state.goal.status}`)       
+      297 +    assert.equal(state.mode, "goal", `Mode must stay goal, got
+          +: ${state.mode}`)                                             
+      298  
+      299      // No continuation should have been injected to the active
+            session
+      300      const activePrompts = getActiveSessionPrompts()
+      301 +    assert.equal(activePrompts.length, 0, `No prompt should be
+          + sent to active session once the turn budget is spent, got ${a
+          +ctivePrompts.length}`)                                        
+      302 +  })                                                          
+      303 +                                                              
+      304 +  test("goal loop exhausts for real once the deadline passes",
+          + async () => {                                                
+      305 +    const messages = makeMessages()                           
+      306 +    const { client, getActiveSessionPrompts } = createMockClie
+          +nt(messages)                                                  
+      307 +                                                              
+      308 +    writeFileSync(                                            
+      309 +      join(tmpDir, ".supervisor", "goals", `${SESSION_ID}.json
+          +`),                                                           
+      310 +      JSON.stringify({                                        
+      311 +        mode: "goal",                                         
+      312 +        autopilot: false,                                     
+      313 +        goal: {                                               
+      314 +          condition: "all tests pass",                        
+      315 +          status: "active",                                   
+      316 +          attempts: 0,                                        
+      317 +          tokenBaseline: 0,                                   
+      318 +          startedAt: Date.now() - 10000,                      
+      319 +          deadline: Date.now() - 1,                           
+      320 +          lastReason: "",                                     
+      321 +          lastTurnKey: LAST_USER_MSG_ID                       
+      322 +        }                                                     
+      323 +      })                                                      
+      324 +    )                                                         
+      325 +                                                              
+      326 +    const plugin = await SupervisorPlugin({ client, directory:
+          + tmpDir })                                                    
+      327 +    await plugin.event({ event: { type: "session.idle", proper
+          +ties: { sessionID: SESSION_ID } } })                          
+      328 +    await new Promise(r => setTimeout(r, 5000))               
+      329 +                                                              
+      330 +    const statePath = join(tmpDir, ".supervisor", "goals", `${
+          +SESSION_ID}.json`)                                            
+      331 +    const state = JSON.parse(readFileSync(statePath, "utf-8"))
+      332 +                                                              
+      333 +    assert.equal(state.goal.status, "exhausted", `Goal should 
+          +be exhausted past its deadline, got: ${state.goal.status}`)   
+      334 +    assert.equal(state.mode, "reflection", `Mode should revert
+          + to reflection, got: ${state.mode}`)                          
+      335 +                                                              
+      336 +    const activePrompts = getActiveSessionPrompts()           
+      337      assert.equal(activePrompts.length, 0, `No prompt should be
+            sent to active session after exhaustion, got ${activePrompts.
+           length}`)
+      338    })
+      339  
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(test/goal-integration.test.mjs)
+  ⎿  Added 4 lines
+      20  // ------------------------------------------------------------
+          ---------------
+      21  
+      22  const SESSION_ID = "ses_goaltest123"
+      23 +// The last relevant user message id in makeMessages() — i.e. t
+         +he current                                                     
+      24 +// human turn's key. Goal state written by a test that wants th
+         +e per-turn                                                     
+      25 +// attempt reset NOT to fire must stamp this as goal.lastTurnKe
+         +y.                                                             
+      26 +const LAST_USER_MSG_ID = "msg_user_1"                          
+      27  const EPHEMERAL_PREFIX = "ses_judge_goal_"
+      28  let ephemeralCounter = 0
+      29  
+
+  Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(test/goal-integration.test.mjs)
+  ⎿  Added 7 lines, removed 4 lines
+      20  // ------------------------------------------------------------
+          ---------------
+      21  
+      22  const SESSION_ID = "ses_goaltest123"
+      23 -// The last relevant user message id in makeMessages() — i.e. t
+         -he current                                                     
+      24 -// human turn's key. Goal state written by a test that wants th
+         -e per-turn                                                     
+      25 -// attempt reset NOT to fire must stamp this as goal.lastTurnKe
+         -y.                                                             
+      26 -const LAST_USER_MSG_ID = "msg_user_1"                          
+      23 +// The turn key of makeMessages()'s last real user message — wh
+         +at                                                             
+      24 +// getLastRelevantUserMessageId() returns for it. The fixture c
+         +arries no                                                      
+      25 +// top-level `id`, so getMessageSignature falls back to        
+      26 +// `${role}:${info.time.start ?? 0}:${first 20 chars of text}`.
+         + Goal state                                                    
+      27 +// written by a test that wants the per-turn attempt reset NOT 
+         +to fire must                                                   
+      28 +// stamp this as goal.lastTurnKey.                             
+      29 +const LAST_USER_MSG_ID = "user:0:Fix the bug in auth."         
+      30  const EPHEMERAL_PREFIX = "ses_judge_goal_"
+      31  let ephemeralCounter = 0
+      32  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now checking whether the OpenCode E2E failure predates my changes:
+
+  Searched for 1 pattern, read 1 file, ran 4 shell commands (ctrl+o to expand)
+⏺ Update(README.md)
+  ⎿  Added 1 line, removed 1 line
+      129  | Mode | Command | Behavior |
+      130  |---|---|---|
+      131  | `reflection` | `/supervisor:reflection` | Default. Runs the 
+           normal completion judge on idle. |
+      132 -| `goal` | `/supervisor:set-goal <condition>` | Adds a mandato
+          -ry completion condition and keeps pushing until it is met or t
+          -he retry budget runs out. |                                   
+      132 +| `goal` | `/supervisor:set-goal <condition>` | Adds a mandato
+          +ry completion condition and keeps pushing until it is met. The
+          + retry budget bounds one human turn, then resets when you spea
+          +k again. |                                                    
+      133  | `autopilot` | `/supervisor:autopilot` | Skips the judge and 
+           continues on every idle until `AUTOPILOT_EXIT` is called or bu
+           dget exhaustion. |
+      134  
+      135  The effective default mode is `reflection`.
+
+⏺ Update(README.md)
+  ⎿  Added 15 lines, removed 3 lines
+      137  ## Goal mode (both runtimes)
+      138  
+      139  Beyond catching premature stops, you can point the supervisor 
+           at a **goal** it must
+      140 -demonstrably meet before it lets the agent stop — it keeps re-
+          -prompting (up to a                                            
+      141 -retry budget) until the goal's met or the budget runs out.    
+      140 +demonstrably meet before it lets the agent stop — it keeps re-
+          +prompting until the                                           
+      141 +goal's met.                                                   
+      142  
+      143  ```
+      144  /supervisor:set-goal all tests in test/auth pass and the PR is
+            open with green CI
+      145 -/supervisor:retry 24           # set this session's retry budg
+          -et (1–100, default 16)                                        
+      145 +/supervisor:retry 24           # set this turn's retry budget 
+          +(1–100, default 16)                                           
+      146  ```
+      147  
+      148 +**The retry budget is per human turn, not per session.** It bo
+          +unds how many times                                           
+      149 +the supervisor may re-prompt inside one unbroken turn; the mom
+          +ent you send another                                          
+      150 +message, the budget resets and the goal keeps driving. Spendin
+          +g the budget stands                                           
+      151 +the supervisor down for the rest of that turn and hands contro
+          +l back to you — it                                            
+      152 +does not end the goal. Only two things end a goal: the judge c
+          +onfirming the                                                 
+      153 +condition is met, or the 30-day deadline backstop (see        
+      154 +`DEFAULT_MAX_GOAL_DURATION_MS`). Clear one early with `/superv
+          +isor:set-goal clear`.                                         
+      155 +                                                              
+      156 +This used to be a separate `solofounder` mode. It isn't any mo
+          +re — those semantics                                          
+      157 +are goal mode's default, and `solofounder` survives only as a 
+          +skill                                                         
+      158 +(`skills/solofounder/`) that arms a goal with a revenue done-b
+          +ar.                                                           
+      159 +                                                              
+      160  The command is deliberately named `/supervisor:set-goal` on **
+           both** runtimes,
+      161  never `/supervisor:goal` — Claude Code ships its own native `/
+           goal` command and
+      162  this plugin must not shadow or be confused with it, and one na
+           me across runtimes
+
+⏺ Update(README.md)
+  ⎿  Added 2 lines, removed 2 lines
+      173  sessions — see "Project goals (`Goal.md`)" below.
+      174  
+      175  The goal is injected into the judge as a **mandatory completio
+           n requirement** — the
+      176 -agent is not allowed to stop until the goal is met (or the bud
+          -get exhausts). While a                                        
+      177 -goal is active the retry budget rises to 16 (vs 3 normally). S
+          -tate is per-session at                                        
+      176 +agent is not allowed to stop until the goal is met. While a go
+          +al is active the retry                                        
+      177 +budget rises to 16 (vs 3 normally). State is per-session at   
+      178  `.supervisor/goals/<sessionId>.json` (mode 0600); budget is sp
+           ent only when a
+      179  continuation actually fires.
+      180  
+
+  Read 2 files, ran 1 shell command (ctrl+o to expand)
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Crunched for 23m 58s

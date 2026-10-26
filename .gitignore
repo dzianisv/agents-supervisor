@@ -1,0 +1,35 @@
+# Mined data + learned state — PRIVATE, never commit
+.dataset/
+.tasks/
+.supervisor/
+.plainspeak/
+*.jsonl
+!evals/cases.example.jsonl
+!evals/verbosity-cases.example.jsonl
+/tmp/
+stop-candidates/
+session-digests/
+
+# HuggingFace / tokens / secrets
+.hf_token
+.env
+.env.*
+*.secret
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.log
+
+# a worktree symlinks this in; `node_modules/` does not match a symlink
+node_modules

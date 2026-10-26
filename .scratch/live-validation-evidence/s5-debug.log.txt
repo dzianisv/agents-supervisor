@@ -1,0 +1,450 @@
+[2026-08-07T01:08:01.583Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:01.700Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:01.709Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:02.588Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:02.599Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:02.616Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:02.621Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:02.757Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:02.757Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:02.762Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:02.820Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:02.822Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:02.879Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:03.300Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.301Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.301Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.301Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.302Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.302Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.303Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.303Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.303Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.304Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.304Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.304Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.621Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.622Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.622Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.622Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.622Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.622Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.623Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.625Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.627Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.628Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.629Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.631Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.659Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.660Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.659Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.660Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.660Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.663Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.663Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.664Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.664Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.664Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.665Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.666Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.666Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.915Z] [Supervisor] event received: catalog.updated
+[2026-08-07T01:08:03.916Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.916Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.918Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.919Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.920Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.931Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.932Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.932Z] [Supervisor] event received: plugin.added
+[2026-08-07T01:08:03.933Z] [Supervisor] event received: reference.updated
+[2026-08-07T01:08:03.981Z] [Supervisor] event received: integration.updated
+[2026-08-07T01:08:04.127Z] [Supervisor] event received: catalog.updated
+[2026-08-07T01:08:04.165Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:04.170Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:04.171Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:04.197Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:04.199Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:04.200Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:04.201Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:04.212Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:04.215Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:04.220Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:04.221Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:04.223Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:04.223Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:04.223Z] [Supervisor] session.idle received
+[2026-08-07T01:08:04.226Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:04.226Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:04.228Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.732Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:05.747Z] [Supervisor] subagent-gate: supervising root session ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:05.767Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:05.768Z] [Supervisor] Requesting supervisor self-assessment (source: default )
+[2026-08-07T01:08:05.787Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:05.796Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:05.799Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.802Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:05.806Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:05.808Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:05.810Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.818Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:05.818Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:05.821Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.822Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:05.833Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:05.836Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:05.837Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:05.851Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:05.854Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:05.854Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:05.856Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:05.861Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:05.862Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.864Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:05.864Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:05.865Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:05.865Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:05.865Z] [Supervisor] session.idle received
+[2026-08-07T01:08:05.867Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:05.867Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:05.869Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:07.368Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:07.863Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:07.868Z] [Supervisor] Self-assessment received
+[2026-08-07T01:08:07.885Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:07.896Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:07.898Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:07.902Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:07.904Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:07.905Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:07.906Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:08.091Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:08.092Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:08.115Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:08.130Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:08.195Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:08.275Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:08.319Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:08.333Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:08.340Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:08.342Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:08.346Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:08.348Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:08.367Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:08.369Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:08.370Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:08.371Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:08.371Z] [Supervisor] session.idle received
+[2026-08-07T01:08:08.371Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:08.373Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:08.374Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:08.383Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:09.894Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:10.011Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:10.012Z] [Supervisor] Supervisor analysis completed
+[2026-08-07T01:08:10.013Z] [Supervisor] Wrote verdict signal for session: ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:10.013Z] [Supervisor] Task complete but status checkpoint missing: no roadmap in reply and status.md missing
+[2026-08-07T01:08:10.023Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.026Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.030Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.032Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.034Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.067Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.067Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.069Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.071Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:10.072Z] [Supervisor] Supervisor injected status checkpoint correction for ses_0263cb859ffexlyTtYaGKQGDJR:user:0:Cap the retry backof
+[2026-08-07T01:08:10.080Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.081Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:10.081Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:10.089Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.093Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.094Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:10.098Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.099Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.100Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.101Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.101Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.104Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.105Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.105Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.104Z] [Supervisor] session.idle received
+[2026-08-07T01:08:10.104Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:10.107Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.506Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.507Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.510Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.513Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.514Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.517Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.518Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.517Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.535Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.537Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:10.538Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:10.550Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.555Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.563Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.578Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.581Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.581Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.586Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.587Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.588Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.591Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.591Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.595Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.600Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.601Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:10.601Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:10.626Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.627Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.628Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:10.633Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.634Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.635Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.639Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.639Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.640Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:10.640Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.640Z] [Supervisor] session.idle received
+[2026-08-07T01:08:10.642Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.643Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.642Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.651Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.651Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.653Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.655Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.657Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.663Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.664Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.671Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.678Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.679Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:10.679Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:10.689Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.691Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.691Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:10.692Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.696Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:10.697Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.704Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:10.704Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.707Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:10.707Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:10.707Z] [Supervisor] session.idle received
+[2026-08-07T01:08:10.709Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:10.709Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:10.712Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.612Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:11.620Z] [Supervisor] subagent-gate: supervising root session ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:11.630Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:11.630Z] [Supervisor] Requesting supervisor self-assessment (source: goal )
+[2026-08-07T01:08:11.635Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:11.639Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:11.642Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.644Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:11.645Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:11.646Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:11.658Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.666Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:11.666Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:11.668Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.669Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:11.674Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:11.680Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:11.681Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:11.685Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:11.686Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:11.687Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:11.687Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:11.689Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:11.689Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.690Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:11.691Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:11.695Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:11.695Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:11.695Z] [Supervisor] session.idle received
+[2026-08-07T01:08:11.697Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:11.697Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:11.698Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:12.141Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:12.210Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:13.197Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:13.678Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:13.679Z] [Supervisor] Self-assessment received
+[2026-08-07T01:08:13.684Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:13.688Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:13.692Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:13.693Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:13.696Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:13.700Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:13.703Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:13.711Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:13.712Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:13.714Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:13.716Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:13.729Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:13.732Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:13.733Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:13.739Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:13.741Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:13.741Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:13.742Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:13.743Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:13.743Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:13.745Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:13.746Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:13.747Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:13.747Z] [Supervisor] session.idle received
+[2026-08-07T01:08:13.747Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:13.749Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:13.749Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:13.750Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.250Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:15.723Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:15.724Z] [Supervisor] Supervisor analysis completed
+[2026-08-07T01:08:15.725Z] [Supervisor] Goal achieved, retired project goal: {"removed":["/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s5-kzTj92/.agents/supervisor/Goal.md"],"skipped":[],"logged":true}
+[2026-08-07T01:08:15.729Z] [Supervisor] Wrote verdict signal for session: ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:15.730Z] [Supervisor] Task complete but status checkpoint missing: no roadmap in reply and status.md missing
+[2026-08-07T01:08:15.735Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.738Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.741Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:15.743Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.745Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.748Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:15.749Z] [Supervisor] Supervisor injected status checkpoint correction for ses_0263cb859ffexlyTtYaGKQGDJR:user:0:Backoff is now cappe
+[2026-08-07T01:08:15.751Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:15.751Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:15.753Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.756Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.758Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.760Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:15.766Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.767Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:15.768Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:15.800Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.801Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.801Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:15.802Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.804Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.806Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.811Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.812Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.816Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.822Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:15.822Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:15.825Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.861Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.866Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:15.867Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:15.880Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.887Z] [Supervisor] session.idle received
+[2026-08-07T01:08:15.887Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:15.887Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.886Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:15.885Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.884Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:15.884Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.883Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.882Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:15.881Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:15.888Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:15.888Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:15.898Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.436Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:17.448Z] [Supervisor] subagent-gate: supervising root session ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:17.457Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:17.457Z] [Supervisor] Requesting supervisor self-assessment (source: default )
+[2026-08-07T01:08:17.465Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:17.473Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:17.475Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.478Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:17.481Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:17.484Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:17.489Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.498Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:17.498Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:17.500Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.502Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:17.529Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:17.553Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:17.555Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:17.566Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:17.567Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:17.568Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:17.572Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:17.581Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:17.583Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.588Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:17.589Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:17.591Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:17.591Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:17.591Z] [Supervisor] session.idle received
+[2026-08-07T01:08:17.598Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:17.598Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:17.604Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.092Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:19.510Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:19.514Z] [Supervisor] Self-assessment received
+[2026-08-07T01:08:19.549Z] [Supervisor] event received: session.created
+[2026-08-07T01:08:19.558Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:19.560Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:19.559Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.563Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:19.565Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:19.567Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.571Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:19.572Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:19.575Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.579Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:19.596Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:19.606Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:19.610Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:19.627Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:19.629Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:19.628Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:19.630Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:19.632Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:19.635Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.638Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:19.638Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:19.639Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:19.639Z] [Supervisor] session.idle received
+[2026-08-07T01:08:19.639Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:19.640Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:19.649Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:19.653Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.143Z] [Supervisor] runSupervisor called for session: ses_0263
+[2026-08-07T01:08:21.592Z] [Supervisor] event received: session.deleted
+[2026-08-07T01:08:21.593Z] [Supervisor] Supervisor analysis completed
+[2026-08-07T01:08:21.594Z] [Supervisor] Wrote verdict signal for session: ses_0263cb859ffexlyTtYaGKQGDJR
+[2026-08-07T01:08:21.594Z] [Supervisor] Task complete but status checkpoint missing: no roadmap in reply and status.md missing
+[2026-08-07T01:08:21.599Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.600Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:21.602Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:21.603Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:21.605Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.609Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:21.609Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:21.611Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.612Z] [Supervisor] event received: tui.toast.show
+[2026-08-07T01:08:21.613Z] [Supervisor] Supervisor injected status checkpoint correction for ses_0263cb859ffexlyTtYaGKQGDJR:user:0:Now also document th
+[2026-08-07T01:08:21.616Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:21.618Z] [Supervisor] status-directive hook fired for ses_0263
+[2026-08-07T01:08:21.618Z] [Supervisor] status directive injected into system prompt for ses_0263
+[2026-08-07T01:08:21.631Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:21.634Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:21.635Z] [Supervisor] event received: message.part.delta
+[2026-08-07T01:08:21.661Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:21.678Z] [Supervisor] event received: message.part.updated
+[2026-08-07T01:08:21.682Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.684Z] [Supervisor] event received: message.updated
+[2026-08-07T01:08:21.684Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:21.686Z] [Supervisor] event received: session.status
+[2026-08-07T01:08:21.686Z] [Supervisor] event received: session.idle
+[2026-08-07T01:08:21.686Z] [Supervisor] session.idle received
+[2026-08-07T01:08:21.687Z] [Supervisor] event received: session.updated
+[2026-08-07T01:08:21.688Z] [Supervisor] event received: session.diff
+[2026-08-07T01:08:21.689Z] [Supervisor] event received: message.updated

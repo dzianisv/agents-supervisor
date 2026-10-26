@@ -1,0 +1,18 @@
+{
+  "mode": "goal",
+  "autopilot": false,
+  "maxAttempts": 9,
+  "goal": {
+    "condition": "legacy goal survived the migration",
+    "status": "active",
+    "attempts": 3,
+    "setAt": 1786064977719,
+    "lastTurnKey": "user:0:Add a --verbose flag"
+  },
+  "attempts": {
+    "count": 4,
+    "turnKey": "legacy-turn",
+    "lastIso": "2026-08-07T01:09:37.719Z"
+  },
+  "projectDir": "/private/var/folders/gq/0rs975rd2b9bj2h6zkymwx6r0000gn/T/opencode/live-val/proj-s9-fV7MCj"
+}

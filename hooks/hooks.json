@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/supervisor-on-stop.mjs",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/plainspeak-on-stop.mjs",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

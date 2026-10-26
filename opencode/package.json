@@ -1,0 +1,14 @@
+{
+  "name": "opencode-supervisor",
+  "version": "0.4.0",
+  "description": "OpenCode goal supervisor — declares scoped acceptance criteria and verifies completion evidence on idle. Tools: supervisor, supervisor_goal, supervisor_retry, supervisor_loop_exit, set_supervisor, supervisor_train.",
+  "type": "module",
+  "main": "supervisor.ts",
+  "exports": { ".": "./supervisor.ts" },
+  "license": "MIT",
+  "author": "dzianisv",
+  "repository": { "type": "git", "url": "https://github.com/dzianisv/agents-supervisor" },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}
