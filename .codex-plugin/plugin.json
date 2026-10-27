@@ -1,0 +1,13 @@
+{
+  "name": "supervisor",
+  "version": "0.3.1",
+  "description": "A lifecycle-hook adapter for the opt-in agents-supervisor Codex progress observer.",
+  "author": {
+    "name": "dzianisv",
+    "url": "https://github.com/dzianisv"
+  },
+  "repository": "https://github.com/dzianisv/agents-supervisor",
+  "license": "MIT",
+  "skills": "./codex-skills/",
+  "hooks": "./hooks/codex-hooks.json"
+}

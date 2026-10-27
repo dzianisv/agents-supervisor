@@ -184,7 +184,10 @@ export async function startLiveServer(opts = {}) {
 
   const { port, release } = await reserveFreePort()
   const baseUrl = `http://127.0.0.1:${port}`
-  const childEnv = { ...process.env, HOME: isolatedHome, SUPERVISOR_DEBUG: "1" }
+  // The fixture provider and model are fully declared in the project config.
+  // Disable models.dev refresh in this isolated test server so offline CI does
+  // not hang plugin/project initialization while fetching an unrelated catalog.
+  const childEnv = { ...process.env, HOME: isolatedHome, SUPERVISOR_DEBUG: "1", OPENCODE_DISABLE_MODELS_FETCH: "1" }
   for (const key of AMBIENT_PROVIDER_ENV_VARS) delete childEnv[key]
   for (const key of AMBIENT_SERVER_ENV_VARS) delete childEnv[key]
 

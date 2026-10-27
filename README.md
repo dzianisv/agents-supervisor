@@ -1,12 +1,16 @@
 # agents-supervisor
 
-A dataset-backed **supervisor** for coding agents. It watches for the agent
-stopping **prematurely** — asking permission for work it could just do, listing
-"next steps" then halting, or stalling mid-task — and re-prompts it to finish.
-Always-on, low-risk (it approves legitimate stops and waits), and it learns from
-your own sessions.
+A supervisor for coding agents. Claude Code and OpenCode can review completion
+and continue unfinished work. The Codex observer quietly reviews recent tool
+activity every ten calls by default and offers a correction when it finds a
+concrete issue.
+The Codex observer is opt-in for each project.
 
 > Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
+
+Codex's observer is a separate, informational integration. It does not block
+or rewrite tool calls, or force another turn. See [Codex setup](docs/codex.md)
+for its macOS installation, trust, and privacy details.
 
 ## Quick Start
 
@@ -55,16 +59,43 @@ Then inside an OpenCode session:
 /supervisor set-goal <condition>   # stop only when condition is met
 ```
 
-Works on two runtimes from one shared core:
+### Codex (macOS)
 
-| Runtime | Mechanism | Colon commands | Additional |
+The Codex observer uses native local hooks and is off until you enable it in a
+project. It needs Node.js 18 or newer, a local Codex runtime, and an
+authenticated Codex CLI. The ChatGPT desktop CLI is auto-detected at its
+standard macOS path; otherwise put `codex` on `PATH` or set `CODEX_BINARY`.
+Clone this repository, then run the installer from its root:
+
+```sh
+git clone --branch codex/codex-progress-observer https://github.com/dzianisv/agents-supervisor
+cd agents-supervisor
+node bin/install-codex.mjs --project "/absolute/path/to/your/project"
+```
+
+The Codex observer is on its feature branch until that branch is merged.
+
+Open the interactive Codex CLI for the project, review and trust this plugin's
+commands with `/hooks`, then restart ChatGPT desktop and start a new local chat:
+
+```sh
+"/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex" --no-alt-screen --cd "/absolute/path/to/your/project"
+```
+
+The observer reviews every ten completed tool calls by default. See
+[Codex setup](docs/codex.md) for cleanup and limitations.
+
+Runtime integrations:
+
+| Runtime | Mechanism | User controls | Additional |
 |---|---|---|---|
 | **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
+| **Codex** | Native local hooks | `.supervisor/codex.json` enables the observer for a project | Informational feedback every ten tool calls; no slash commands |
 
-The classification taxonomy (6 categories + mined anti-patterns) and its feedback
-templates live in a single source of truth, [`core/patterns.json`](core/patterns.json),
-so both runtimes — and the trainer — share one brain.
+Claude Code and OpenCode share the classification taxonomy and feedback
+templates in [`core/patterns.json`](core/patterns.json). The Codex observer uses
+a separate, evidence-based review prompt.
 
 ## Commands
 
