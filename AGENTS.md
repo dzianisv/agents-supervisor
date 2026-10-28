@@ -1,6 +1,8 @@
 # agents-supervisor — Agent Instructions
 
-opencode supervisor plugin — reflection, goal-tracking, autopilot for opencode sessions
+Agent supervisor integrations for Claude Code, OpenCode, and Codex. Claude
+Code and OpenCode provide reflection, goal-tracking, and autopilot. Codex has a
+separate, opt-in background progress observer.
 
 ## Constraints
 
@@ -36,6 +38,9 @@ export PATH="$HOME/.opencode/bin:$PATH" && node --experimental-strip-types test/
 # Claude Code E2E test
 node test/e2e-cc.mjs
 
+# Codex native hooks E2E (isolated Codex home and local API fixture)
+npm run test:e2e:codex
+
 # Eval suite
 node evals/judge-eval.mjs
 ```
@@ -58,6 +63,9 @@ of a green exit code.
 ## Structure
 
 - Plugin: `opencode/supervisor.ts` → `opencode/supervisor-impl.ts`
+- Codex adapter: `bin/codex-supervisor-hook.mjs` + `bin/codex-supervisor-review.mjs`
+- Codex observer state: `core/codex-observer.mjs` (shared session storage in `core/session-store.mjs`)
+- Codex setup: `docs/codex.md`; native hook E2E: `test/e2e-codex.test.mjs`
 - Core logic: `core/*.mjs` (shared between opencode plugin and other consumers)
 - Tests: `test/*.test.mjs`
 - Module system: ESM (`"type": "module"`)

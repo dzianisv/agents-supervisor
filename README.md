@@ -2,9 +2,8 @@
 
 A supervisor for coding agents. Claude Code and OpenCode can review completion
 and continue unfinished work. The Codex observer quietly reviews recent tool
-activity every ten calls by default and offers a correction when it finds a
-concrete issue.
-The Codex observer is opt-in for each project.
+activity every ten completed tool calls by default and offers a correction when
+it finds a concrete issue. The Codex observer is opt-in for each project.
 
 > Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
 
@@ -82,8 +81,17 @@ commands with `/hooks`, then restart ChatGPT desktop and start a new local chat:
 "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex" --no-alt-screen --cd "/absolute/path/to/your/project"
 ```
 
-The observer reviews every ten completed tool calls by default. See
+The observer reviews every ten completed tool calls in the current turn by
+default. See
 [Codex setup](docs/codex.md) for cleanup and limitations.
+
+For each review, the hook starts a separate, short-lived Codex CLI process and
+explicitly selects `gpt-6-luna`. It sends that process a bounded snapshot of the
+current request, relevant `AGENTS.md` instructions, and recent tool activity.
+The process returns either no finding or a targeted correction. Codex delivers
+that correction as informational context at a later safe point. The active
+session keeps its selected model, and the observer does not restrict
+delegation, including nested delegation.
 
 Runtime integrations:
 
@@ -91,7 +99,7 @@ Runtime integrations:
 |---|---|---|---|
 | **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
-| **Codex** | Native local hooks | `.supervisor/codex.json` enables the observer for a project | Informational feedback every ten tool calls; no slash commands |
+| **Codex** | Native local hooks | `.supervisor/codex.json` enables the observer for a project | Informational feedback every ten completed tool calls by default; no slash commands |
 
 Claude Code and OpenCode share the classification taxonomy and feedback
 templates in [`core/patterns.json`](core/patterns.json). The Codex observer uses

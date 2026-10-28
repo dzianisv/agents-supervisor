@@ -51,12 +51,18 @@ hooks; use the installer above.
 The hook files are local to the machine. Installing them does not turn on the
 observer in other projects. To enable another project, run the installer with
 that project's path. To disable it for one project, set `observer.enabled` to
-`false` in `.supervisor/codex.json`. To remove the global hooks, remove only
-the entries whose command points to
-`<Codex home>/local-plugins/agents-supervisor/bin/codex-supervisor-hook.mjs`
-from `<Codex home>/hooks.json`, then remove the
-`<Codex home>/local-plugins/agents-supervisor` directory. The Codex home is
-`$CODEX_HOME` when set, or `~/.codex` by default. Keep unrelated hook entries.
+`false` in `.supervisor/codex.json`. To uninstall the machine-wide hooks and
+runtime and disable the project named on the command line, run from the cloned
+repository:
+
+```sh
+node bin/install-codex.mjs --uninstall --project "/absolute/path/to/your/project"
+```
+
+Uninstall removes only this plugin's hook entries and runtime; other hooks are
+kept. If you enabled other projects too, their `.supervisor/codex.json` settings
+remain enabled, but they will have no observer runtime until you install it
+again. The project's recorded review state is kept.
 
 ## What it sees and when it runs
 
@@ -71,23 +77,25 @@ The observer is off unless `.supervisor/codex.json` explicitly enables it:
 }
 ```
 
-`everyToolCalls` accepts an integer from 1 to 100 and defaults to 10. A
-top-level `"enabled": false` in the same file disables the observer as an
-emergency override. Hook events and bounded review state stay under the
-project's `.supervisor/sessions/` directory. The recent requests, instruction
-text, tool inputs, and tool results in each review are sent to the bundled
-reviewer through the active Codex login.
+`everyToolCalls` accepts an integer from 1 to 100 and defaults to 10. The count
+starts over with each new human turn. A top-level `"enabled": false` in the
+same file disables the observer as an emergency override. Hook events and
+bounded review state stay under the project's `.supervisor/sessions/`
+directory. The recent requests, instruction text, tool inputs, and tool results
+in each review are sent to the bundled reviewer through the active Codex login;
+those contents are part of the model request.
 
 It records each human request and completed tool call in per-session state.
-Every configured number of completed tool calls in a session (10 by default),
-it starts one background review.
-Only one review runs at a time per session. The reviewer receives recent human
-requests, applicable `AGENTS.md` text, recent tool inputs and results, visible
-delegation activity, and the latest assistant reply when available. This is a
-bounded recent-history snapshot, not the full conversation. The hook may finish
-after more tool calls; Codex can deliver its informational feedback at a later
-safe model request. If the session has gone idle, the feedback waits for later
-activity.
+After each configured number of completed calls in the current turn (10 by
+default), it starts a background review. One review is scheduled at a time for
+that turn; a result from an earlier turn is discarded. The reviewer receives
+recent human requests, applicable `AGENTS.md` text, recent tool inputs and
+results, delegation activity present in those events, and the latest assistant
+reply when available. This is a bounded recent-history snapshot, not the full
+conversation or a live view of the repository. The hook may finish after more
+tool calls; Codex can deliver its informational feedback at a later safe model
+request. If the session has gone idle, feedback waits for later activity and
+does not wake the session.
 
 ```mermaid
 flowchart LR
@@ -98,13 +106,22 @@ flowchart LR
   F --> N[Next safe model request]
 ```
 
+The review runs in a separate, short-lived Codex CLI process. It explicitly
+uses `gpt-6-luna`; your active session keeps its own selected model. The review
+process gets the bounded snapshot described above, runs with a read-only
+sandbox, and has shell, hooks, plugins, and delegation disabled. It returns a
+structured finding; it does not inspect or change project files itself. Only a
+concrete finding becomes informational context for the active session.
+
 Delegation is allowed, including nested delegation. The observer does not infer
 root or child status from a model name or session id, and it does not require
-every task to be delegated. It suggests delegation only when the observed work
-and assigned scope support that suggestion.
+every task to be delegated. It may suggest delegation when observed work and
+assigned scope support that suggestion, but it does not block or rewrite a
+delegation call.
 
-The bundled reviewer runs `codex exec --ephemeral` with an isolated temporary
-home, read-only sandbox, and shell, hooks, plugins, and delegation disabled.
+The bundled reviewer runs `codex exec --ephemeral --model gpt-6-luna` with an
+isolated temporary home, read-only sandbox, and shell, hooks, plugins, and
+delegation disabled.
 On macOS it uses the Codex CLI bundled with ChatGPT desktop when available; it
 otherwise uses `codex` on `PATH`. Set `CODEX_BINARY` to select another Codex
 executable. The active Codex login is reused when available. Review context is
