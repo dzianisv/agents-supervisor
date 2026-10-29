@@ -39,6 +39,10 @@ test('installer safely merges, copies only runtime files, backs up, and is idemp
     assert.equal(fs.statSync(result.hookBackup).mode & 0o777, 0o600);
     assert.equal(fs.existsSync(path.join(home, 'local-plugins/agents-supervisor/bin/install-codex.mjs')), false);
     assert.equal(fs.existsSync(path.join(home, 'local-plugins/agents-supervisor/bin/codex-supervisor-hook.mjs')), true);
+    for (const file of ['bin/supervisor.mjs', 'core/codex-goal.mjs', 'core/goal.mjs', 'core/loop-exit.mjs', 'core/feedback.mjs', 'core/evaluation.mjs', 'core/status-directive.mjs']) {
+      assert.equal(fs.existsSync(path.join(home, 'local-plugins/agents-supervisor', file)), true, `${file} must be installed`);
+    }
+    assert.equal(hooks.hooks.Stop[1].hooks[0].timeout, 120);
     install(project, home);
     assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.length, 2);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

@@ -1,15 +1,18 @@
 # agents-supervisor
 
 A supervisor for coding agents. Claude Code and OpenCode can review completion
-and continue unfinished work. The Codex observer quietly reviews recent tool
-activity every ten completed tool calls by default and offers a correction when
-it finds a concrete issue. The Codex observer is opt-in for each project.
+and continue unfinished work. Codex has an opt-in goal mode that infers a
+falsifiable goal, checks it on `Stop`, and can continue the turn until the goal
+is met. Its separate observer quietly reviews recent tool activity every ten
+completed tool calls by default. Both Codex features are opt-in per project.
 
 > Successor to the (now archived) [dzianisv/opencode-plugins](https://github.com/dzianisv/opencode-plugins) reflection plugin.
 
-Codex's observer is a separate, informational integration. It does not block
-or rewrite tool calls, or force another turn. See [Codex setup](docs/codex.md)
-for its macOS installation, trust, and privacy details.
+Codex's observer is informational: it does not block tool calls or force a
+turn. Codex goal mode is separate and deliberately stronger: an active goal can
+block `Stop` with a concrete correction, so the agent continues. See
+[Codex setup](docs/codex.md) for installation, goal configuration, trust, and
+privacy details.
 
 ## Quick Start
 
@@ -82,8 +85,23 @@ commands with `/hooks`, then restart ChatGPT desktop and start a new local chat:
 ```
 
 The observer reviews every ten completed tool calls in the current turn by
-default. See
-[Codex setup](docs/codex.md) for cleanup and limitations.
+default. Goal mode is off until `.supervisor/codex.json` enables it:
+
+```json
+{
+  "observer": { "enabled": true, "everyToolCalls": 10 },
+  "goal": { "enabled": true, "infer": true, "judgeOnStop": true }
+}
+```
+
+With `goal.enabled`, the first completed tool call in a turn derives one
+falsifiable completion condition if the session and project have no goal. On
+`Stop`, a separate reviewer checks that condition against the assistant's reply
+and recent tool evidence. An incomplete verdict returns `{"decision":"block","reason":...}` with a
+concrete correction, so Codex keeps working. A complete verdict
+clears an inferred goal, or retires a project `Goal.md`; `SUPERVISOR_LOOP_EXIT:
+completed` stops without judging, and `: stuck` pauses the goal. See
+[Codex setup](docs/codex.md) for recovery and limitations.
 
 For each review, the hook starts a separate, short-lived Codex CLI process and
 explicitly selects `gpt-6-luna`. It sends that process a bounded snapshot of the
@@ -99,7 +117,7 @@ Runtime integrations:
 |---|---|---|---|
 | **Claude Code** | `Stop` hook (`bin/supervisor-on-stop.mjs`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | — |
 | **OpenCode** | `session.idle` event (`opencode/supervisor.ts`) | `/supervisor:status`, `/supervisor:on`, `/supervisor:off`, `/supervisor:set-goal`, `/supervisor:retry`, `/supervisor:train`, `/supervisor:autopilot`, `/supervisor:reflection` | bare `/supervisor <subcommand>` dispatcher |
-| **Codex** | Native local hooks | `.supervisor/codex.json` enables the observer for a project | Informational feedback every ten completed tool calls by default; no slash commands |
+| **Codex** | Native local hooks | `.supervisor/codex.json` enables the observer and/or goal mode for a project | Informational feedback every ten completed tool calls; opt-in goal inference, `Stop` judge, and bounded continuation; no slash commands |
 
 Claude Code and OpenCode share the classification taxonomy and feedback
 templates in [`core/patterns.json`](core/patterns.json). The Codex observer uses

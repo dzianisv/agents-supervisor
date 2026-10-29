@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { normalizeGoalDerivation, validateGoalVerdict } from '../core/codex-goal.mjs'
 
 const MAX_STDIN = 1024 * 1024
 const MAX_OUTPUT = 64 * 1024
@@ -25,6 +26,34 @@ const OUTPUT_SCHEMA = {
     correction: { type: 'string' },
     evidence: { type: 'string' },
   },
+}
+
+const GOAL_DERIVE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['goal', 'falsifiable', 'rationale'],
+  properties: {
+    goal: { type: 'string' },
+    falsifiable: { type: 'boolean' },
+    rationale: { type: 'string' },
+  },
+}
+
+const GOAL_REVIEW_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['complete', 'reason', 'correction', 'evidence'],
+  properties: {
+    complete: { type: 'boolean' },
+    reason: { type: 'string' },
+    correction: { type: 'string' },
+    evidence: { type: 'string' },
+  },
+}
+
+const OUTPUT_SCHEMAS = {
+  'goal-derive': GOAL_DERIVE_SCHEMA,
+  'goal-review': GOAL_REVIEW_SCHEMA,
 }
 
 function readStdin() {
@@ -58,6 +87,11 @@ function boundedValue(value, limit = 12_000) {
 }
 
 export function reviewPrompt(event) {
+  if (event.kind === 'goal-derive' || event.kind === 'goal-review') {
+    const prompt = boundedString(event.goal_prompt, 60_000)
+    if (!prompt.trim()) throw new Error('goal review input missing goal_prompt')
+    return prompt
+  }
   const payload = {
     event: boundedString(event.event, 200),
     observed_turn_id: boundedString(event.observed_turn_id, 200),
@@ -166,6 +200,8 @@ process.on('SIGTERM', () => {
 })
 
 export async function runReviewer(event, options = {}) {
+  const kind = event?.kind === 'goal-derive' || event?.kind === 'goal-review' ? event.kind : null
+  const schema = kind ? OUTPUT_SCHEMAS[kind] : OUTPUT_SCHEMA
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-supervisor-review-'))
   try {
     fs.chmodSync(tempRoot, 0o700)
@@ -173,7 +209,7 @@ export async function runReviewer(event, options = {}) {
     fs.mkdirSync(workdir, { mode: 0o700 })
     const outputFile = path.join(tempRoot, 'last-message.json')
     const schemaFile = path.join(tempRoot, 'output-schema.json')
-    fs.writeFileSync(schemaFile, JSON.stringify(OUTPUT_SCHEMA), { mode: 0o600 })
+    fs.writeFileSync(schemaFile, JSON.stringify(schema), { mode: 0o600 })
     const codexHome = codexHomeFor(tempRoot)
     const executable = codexExecutable(options)
     const model = REVIEW_MODEL
@@ -244,7 +280,18 @@ export async function runReviewer(event, options = {}) {
     if (result.status !== 0) throw new Error(`Codex reviewer exited with status ${result.status ?? result.signal ?? 'unknown'}`)
     if (fs.statSync(outputFile).size > MAX_OUTPUT) throw new Error(`Codex reviewer output exceeds ${MAX_OUTPUT} bytes`)
     const output = fs.readFileSync(outputFile, 'utf8')
-    return validateVerdict(JSON.parse(output))
+    const parsed = JSON.parse(output)
+    if (kind === 'goal-derive') {
+      const derived = normalizeGoalDerivation(parsed)
+      if (!derived) throw new Error('Codex reviewer returned a non-falsifiable or malformed goal derivation')
+      return { goal: derived.condition, falsifiable: true, rationale: derived.rationale }
+    }
+    if (kind === 'goal-review') {
+      const verdict = validateGoalVerdict(parsed)
+      if (!verdict) throw new Error('Codex reviewer returned a malformed goal verdict')
+      return verdict
+    }
+    return validateVerdict(parsed)
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }

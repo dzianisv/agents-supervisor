@@ -555,8 +555,10 @@ export const goalStore = {
     const now = opts.now ?? Date.now();
     const maxDurationMs = opts.maxDurationMs ?? DEFAULT_MAX_GOAL_DURATION_MS;
     return sessionStore.mutate(cwd, sessionId, (state) => {
+      if (opts.onlyIfAbsent && state.goal) return state;
       state.goal = {
         condition, status: 'active', attempts: 0,
+        source: opts.source ?? 'user',
         tokenBaseline: opts.tokenBaseline ?? 0, startedAt: now,
         // lastTurnKey: fingerprint of the human turn the attempts count belongs
         // to. null until the first stop observes one — see the per-turn reset in

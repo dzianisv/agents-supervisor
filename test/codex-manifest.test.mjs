@@ -21,6 +21,7 @@ test('Codex manifest selects its own hook file and plugin-root command', () => {
   assert.equal(events.PostToolUse[0].hooks[0].timeout, 120)
   assert.equal(events.UserPromptSubmit.length, 1)
   assert.equal(events.Stop.length, 1)
+  assert.equal(events.Stop[0].hooks[0].timeout, 120)
   assert.equal('PreToolUse' in events, false)
 
   for (const groups of Object.values(events)) {

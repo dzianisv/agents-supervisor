@@ -72,6 +72,55 @@ test('reviewer invokes an isolated read-only Luna CLI with schema and bounded ev
   }
 })
 
+test('reviewer uses the goal-derivation schema and forwards only the goal prompt', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-test-'))
+  const record = path.join(dir, 'record.json')
+  const executable = fixtureExecutable(dir)
+  const oldRecord = process.env.CODEX_FIXTURE_RECORD
+  const oldVerdict = process.env.CODEX_FIXTURE_VERDICT
+  process.env.CODEX_FIXTURE_RECORD = record
+  process.env.CODEX_FIXTURE_VERDICT = JSON.stringify({ goal: 'All tests in test/ pass.', falsifiable: true, rationale: 'A command proves it.' })
+  try {
+    const verdict = await runReviewer({ kind: 'goal-derive', goal_prompt: 'DERIVE THIS GOAL' }, { executable, timeoutMs: 5000 })
+    assert.deepEqual(verdict, { goal: 'All tests in test/ pass.', falsifiable: true, rationale: 'A command proves it.' })
+    const invocation = JSON.parse(fs.readFileSync(record, 'utf8'))
+    assert.deepEqual(invocation.schema.required, ['goal', 'falsifiable', 'rationale'])
+    assert.equal(invocation.input.includes('DERIVE THIS GOAL'), true)
+    assert.equal(invocation.input.includes('recent_tools'), false)
+  } finally {
+    if (oldRecord === undefined) delete process.env.CODEX_FIXTURE_RECORD
+    else process.env.CODEX_FIXTURE_RECORD = oldRecord
+    if (oldVerdict === undefined) delete process.env.CODEX_FIXTURE_VERDICT
+    else process.env.CODEX_FIXTURE_VERDICT = oldVerdict
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('reviewer uses the goal-review schema and rejects a complete verdict without evidence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-test-'))
+  const record = path.join(dir, 'record.json')
+  const executable = fixtureExecutable(dir)
+  const oldRecord = process.env.CODEX_FIXTURE_RECORD
+  const oldVerdict = process.env.CODEX_FIXTURE_VERDICT
+  process.env.CODEX_FIXTURE_RECORD = record
+  try {
+    process.env.CODEX_FIXTURE_VERDICT = JSON.stringify({ complete: false, reason: 'Tests were not run.', correction: 'Run npm test.', evidence: '' })
+    const verdict = await runReviewer({ kind: 'goal-review', goal_prompt: 'REVIEW THIS GOAL' }, { executable, timeoutMs: 5000 })
+    assert.deepEqual(verdict, { complete: false, reason: 'Tests were not run.', correction: 'Run npm test.', evidence: '' })
+    const invocation = JSON.parse(fs.readFileSync(record, 'utf8'))
+    assert.deepEqual(invocation.schema.required, ['complete', 'reason', 'correction', 'evidence'])
+
+    process.env.CODEX_FIXTURE_VERDICT = JSON.stringify({ complete: true, reason: 'Done.', correction: '', evidence: '' })
+    await assert.rejects(runReviewer({ kind: 'goal-review', goal_prompt: 'REVIEW THIS GOAL' }, { executable, timeoutMs: 5000 }), /malformed goal verdict/)
+  } finally {
+    if (oldRecord === undefined) delete process.env.CODEX_FIXTURE_RECORD
+    else process.env.CODEX_FIXTURE_RECORD = oldRecord
+    if (oldVerdict === undefined) delete process.env.CODEX_FIXTURE_VERDICT
+    else process.env.CODEX_FIXTURE_VERDICT = oldVerdict
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('reviewer accepts only the structured verdict and normalizes non-violation correction', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-test-'))
   const oldRecord = process.env.CODEX_FIXTURE_RECORD

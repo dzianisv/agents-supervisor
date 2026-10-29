@@ -271,3 +271,172 @@ process.exit(result.status ?? 1);
   assert.equal(requests[0].model, 'gpt-6.1-sol');
   assert.equal(requests[9].model, 'gpt-6.1-sol');
 });
+
+test('embedded Codex goal mode blocks Stop until the reviewer sees completion', { timeout: 60_000 }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-codex-goal-e2e-'));
+  const home = path.join(root, 'codex-home');
+  const project = path.join(root, 'project');
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(project, { recursive: true });
+  const reviewerLog = path.join(root, 'reviewer-inputs.jsonl');
+  const decisions = path.join(root, 'hook-results.jsonl');
+  const hookScript = path.join(root, 'hook.mjs');
+  const reviewerScript = path.join(root, 'reviewer.mjs');
+  fs.writeFileSync(reviewerScript, `
+import fs from 'node:fs';
+let raw = '';
+for await (const chunk of process.stdin) raw += chunk;
+const input = JSON.parse(raw || '{}');
+const prior = fs.existsSync(${JSON.stringify(reviewerLog)})
+  ? fs.readFileSync(${JSON.stringify(reviewerLog)}, 'utf8').trim().split('\\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
+fs.appendFileSync(${JSON.stringify(reviewerLog)}, JSON.stringify({kind: input.kind, at: Date.now()}) + '\\n');
+if (input.kind === 'goal-derive') {
+  process.stdout.write(JSON.stringify({goal: 'The requested change is implemented and verified.', falsifiable: true, rationale: 'The user asked for a small change and verification.'}));
+} else if (input.kind === 'goal-review') {
+  const reviews = prior.filter((entry) => entry.kind === 'goal-review').length;
+  const verdict = reviews === 0
+    ? {complete: false, reason: 'Verification is missing.', correction: 'Add the missing verification step.', evidence: ''}
+    : {complete: true, reason: 'The change is implemented and verified.', correction: '', evidence: 'The final reply states the change is implemented and verified.'};
+  process.stdout.write(JSON.stringify(verdict));
+}
+`);
+  fs.writeFileSync(hookScript, `
+import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+let raw = '';
+for await (const chunk of process.stdin) raw += chunk;
+const event = JSON.parse(raw || '{}');
+const result = spawnSync(process.execPath, [${JSON.stringify(path.join(REPO, 'bin/codex-supervisor-hook.mjs'))}], { input: raw, encoding: 'utf8' });
+fs.appendFileSync(${JSON.stringify(decisions)}, JSON.stringify({event: event.hook_event_name, output: result.stdout || '', status: result.status}) + '\\n');
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`);
+  fs.mkdirSync(path.join(project, '.supervisor'), { recursive: true });
+  fs.writeFileSync(path.join(project, '.supervisor', 'codex.json'), JSON.stringify({
+    goal: { enabled: true, infer: true, judgeOnStop: true, maxAttempts: 3 },
+    reviewerCommand: [process.execPath, reviewerScript],
+    reviewerTimeoutMs: 10_000,
+  }));
+
+  let requestCount = 0;
+  const requests = [];
+  const fixture = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      if (req.url !== '/v1/responses') {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      requestCount += 1;
+      requests.push(JSON.parse(body || '{}'));
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      if (requestCount === 2) {
+        await waitFor(() => fs.existsSync(reviewerLog) && fs.readFileSync(reviewerLog, 'utf8').includes('"kind":"goal-derive"'), 10_000, 'goal derivation');
+      }
+      const text = requestCount === 1 ? null : requestCount === 2
+        ? 'The change is implemented but not verified.'
+        : 'The change is implemented and verified.';
+      const response = text
+        ? {
+            id: `resp-goal-${requestCount}`, object: 'response', status: 'completed', model: 'gpt-6.1-sol',
+            output: [{ id: `msg-goal-${requestCount}`, type: 'message', role: 'assistant', content: [{type: 'output_text', text}] }],
+          }
+        : {
+            id: `resp-goal-${requestCount}`, object: 'response', status: 'completed', model: 'gpt-6.1-sol',
+            output: [{ id: 'fc-goal-1', type: 'function_call', call_id: 'call-goal-1', name: 'exec_command', arguments: JSON.stringify({cmd: 'printf goal-e2e > .codex-goal-e2e.txt', yield_time_ms: 3000}) }],
+          };
+      if (!text) {
+        const call = response.output[0];
+        res.end([
+          { type: 'response.created', response: { id: response.id, object: 'response', status: 'in_progress', model: response.model, output: [] } },
+          { type: 'response.output_item.added', output_index: 0, item: { id: call.id, type: call.type, call_id: call.call_id, name: call.name, arguments: '' } },
+          { type: 'response.function_call_arguments.delta', item_id: call.id, output_index: 0, delta: call.arguments },
+          { type: 'response.function_call_arguments.done', item_id: call.id, output_index: 0, arguments: call.arguments },
+          { type: 'response.output_item.done', output_index: 0, item: call },
+          { type: 'response.completed', response },
+        ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n');
+      } else {
+        const item = response.output[0];
+        res.end([
+          { type: 'response.created', response: { id: response.id, object: 'response', status: 'in_progress', model: response.model, output: [] } },
+          { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+          { type: 'response.content_part.added', item_id: item.id, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+          { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: text },
+          { type: 'response.output_text.done', item_id: item.id, output_index: 0, content_index: 0, text },
+          { type: 'response.content_part.done', item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] },
+          { type: 'response.output_item.done', output_index: 0, item },
+          { type: 'response.completed', response },
+        ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n');
+      }
+    });
+  });
+  await new Promise((resolve, reject) => fixture.listen(0, '127.0.0.1', (error) => error ? reject(error) : resolve()));
+  const port = fixture.address().port;
+  t.after(async () => {
+    fixture.closeAllConnections?.();
+    await new Promise((resolve) => fixture.close(() => resolve()));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  fs.writeFileSync(path.join(home, 'config.toml'), [
+    'model = "gpt-6.1-sol"',
+    'model_provider = "fixture"',
+    'suppress_unstable_features_warning = true',
+    'approval_policy = "never"',
+    'features.responses_websockets = false',
+    '',
+    '[model_providers.fixture]',
+    'name = "Local E2E fixture"',
+    `base_url = "http://127.0.0.1:${port}/v1"`,
+    'wire_api = "responses"',
+    'requires_openai_auth = false',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(home, 'hooks.json'), JSON.stringify({ hooks: {
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: `${process.execPath} ${hookScript}`, timeout: 10 }] }],
+    PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `${process.execPath} ${hookScript}`, timeout: 30, async: true }] }],
+    Stop: [{ hooks: [{ type: 'command', command: `${process.execPath} ${hookScript}`, timeout: 30 }] }],
+  } }, null, 2));
+
+  const child = startCodex([
+    'exec', '--skip-git-repo-check', '--dangerously-bypass-hook-trust',
+    '--sandbox', 'workspace-write', '--cd', project, '--json',
+    'Make a small change and verify it.',
+  ], {
+    cwd: project,
+    env: { ...process.env, CODEX_HOME: home, OPENAI_API_KEY: '', OPENAI_BASE_URL: '', CODEX_API_KEY: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    try {
+      await waitFor(() => fs.existsSync(decisions)
+        && fs.readFileSync(decisions, 'utf8').trim().split('\n').filter((line) => line.includes('"event":"Stop"')).length >= 2,
+      30_000, 'goal Stop hook block and completion');
+    } catch (error) {
+      const observed = fs.existsSync(decisions) ? fs.readFileSync(decisions, 'utf8') : '<no decisions>';
+      throw new Error(`${error.message}; decisions=${observed}; requests=${requestCount}; reviewer=${fs.existsSync(reviewerLog) ? fs.readFileSync(reviewerLog, 'utf8') : '<none>'}\ncodex stdout=${child.stdout}\ncodex stderr=${child.stderr}`);
+    }
+  } finally {
+    child.child.kill('SIGTERM');
+    await Promise.race([child.done, new Promise((resolve) => setTimeout(resolve, 1_500))]);
+    if (child.child.exitCode === null) {
+      child.child.kill('SIGKILL');
+      await Promise.race([child.done, new Promise((resolve) => setTimeout(resolve, 1_000))]);
+    }
+  }
+
+  const records = fs.readFileSync(decisions, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const stops = records.filter((record) => record.event === 'Stop');
+  assert.equal(JSON.parse(stops[0].output).decision, 'block', `first Stop must block; stops=${JSON.stringify(stops)}`);
+  assert.match(JSON.parse(stops[0].output).reason, /Add the missing verification step\./);
+  assert.notEqual(JSON.parse(stops[1].output).decision, 'block', 'completed goal must not block');
+  assert.ok(requests.length >= 3, 'the blocked turn must produce a continuation request');
+  assert.match(JSON.stringify(requests[2].input), /Add the missing verification step\./, 'correction must reach the continuation');
+  assert.ok(fs.existsSync(path.join(project, '.supervisor', 'goal-achieved.log')), 'achievement must be recorded');
+  assert.match(fs.readFileSync(path.join(project, '.supervisor', 'goal-achieved.log'), 'utf8'), /The requested change is implemented and verified\./);
+  const reviewerKinds = fs.readFileSync(reviewerLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line).kind);
+  assert.deepEqual(reviewerKinds, ['goal-derive', 'goal-review', 'goal-review']);
+});

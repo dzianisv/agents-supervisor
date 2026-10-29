@@ -10,7 +10,7 @@
       }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "node \"${PLUGIN_ROOT}/bin/codex-supervisor-hook.mjs\"", "timeout": 10 }] }
+      { "hooks": [{ "type": "command", "command": "node \"${PLUGIN_ROOT}/bin/codex-supervisor-hook.mjs\"", "timeout": 120 }] }
     ]
   }
 }

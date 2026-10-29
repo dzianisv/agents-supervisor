@@ -1,7 +1,7 @@
 {
   "name": "supervisor",
   "version": "0.3.1",
-  "description": "A lifecycle-hook adapter for the opt-in agents-supervisor Codex progress observer.",
+  "description": "A lifecycle-hook adapter for the opt-in agents-supervisor Codex observer and goal mode.",
   "author": {
     "name": "dzianisv",
     "url": "https://github.com/dzianisv"

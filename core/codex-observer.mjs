@@ -67,6 +67,7 @@ function ensureTurn(state, { turnId, turnStartedAt, userRequest, now }) {
     observer.lease = null;
     observer.feedbackHashes = [];
     observer.latestAssistant = null;
+    observer.goalDerivation = null;
   } else if (typeof userRequest === 'string' && userRequest.trim()) {
     const history = Array.isArray(observer.requestHistory) ? observer.requestHistory : [];
     const latest = history[history.length - 1];
@@ -96,6 +97,58 @@ export function recordCodexObserverPrompt({ cwd, sessionId, turnId, turnStartedA
     return state;
   });
   return result;
+}
+
+/**
+ * Claim the one goal-derivation attempt allowed for this turn. The claim is
+ * persisted before the reviewer starts so delayed/duplicate PostToolUse hooks
+ * cannot launch the same derivation twice.
+ *
+ * @returns {{claimed:boolean, reason?:string, token?:string, status?:string}}
+ */
+export function claimCodexGoalDerivation({ cwd, sessionId, turnId, now = Date.now() }) {
+  if (!cwd || !sessionId || !turnId) throw new TypeError('cwd, sessionId, and turnId are required');
+  let result = { claimed: false, reason: 'no-observer' };
+  sessionStore.mutate(cwd, sessionId, (state) => {
+    const observer = state.codexObserver;
+    if (!observer || observer.turnId !== turnId) {
+      result = { claimed: false, reason: 'turn-mismatch' };
+      return state;
+    }
+    const current = observer.goalDerivation;
+    if (current && current.turnId === turnId) {
+      result = { claimed: false, reason: 'already-claimed', status: current.status };
+      return state;
+    }
+    const token = randomUUID();
+    observer.goalDerivation = { turnId, token, status: 'pending', at: now };
+    result = { claimed: true, token };
+    return state;
+  });
+  return result;
+}
+
+/** Finish a goal-derivation claim, only if this caller still owns it. */
+export function finishCodexGoalDerivation({ cwd, sessionId, turnId, token, status, condition, error, now = Date.now() }) {
+  if (!cwd || !sessionId || !turnId || !token) throw new TypeError('cwd, sessionId, turnId, and token are required');
+  if (status !== 'done' && status !== 'failed') throw new TypeError('status must be done or failed');
+  let finished = false;
+  sessionStore.mutate(cwd, sessionId, (state) => {
+    const observer = state.codexObserver;
+    const current = observer?.goalDerivation;
+    if (!observer || observer.turnId !== turnId || current?.turnId !== turnId || current.token !== token) return state;
+    observer.goalDerivation = {
+      turnId,
+      token,
+      status,
+      at: now,
+      ...(typeof condition === 'string' && condition ? { condition: text(condition, REQUEST_TEXT_LIMIT) } : {}),
+      ...(typeof error === 'string' && error ? { error: text(error, 1_000) } : {}),
+    };
+    finished = true;
+    return state;
+  });
+  return finished;
 }
 
 /** Keep the latest assistant reply available as bounded focus context. */

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Install the Codex progress observer hooks for one project. */
+/** Install the Codex supervisor hooks (observer and optional goal mode) for one project. */
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -9,8 +9,15 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RUNTIME_FILES = [
   ['bin/codex-supervisor-hook.mjs', 'bin/codex-supervisor-hook.mjs'],
   ['bin/codex-supervisor-review.mjs', 'bin/codex-supervisor-review.mjs'],
+  ['bin/supervisor.mjs', 'bin/supervisor.mjs'],
   ['core/codex-observer.mjs', 'core/codex-observer.mjs'],
+  ['core/codex-goal.mjs', 'core/codex-goal.mjs'],
+  ['core/goal.mjs', 'core/goal.mjs'],
   ['core/session-store.mjs', 'core/session-store.mjs'],
+  ['core/loop-exit.mjs', 'core/loop-exit.mjs'],
+  ['core/feedback.mjs', 'core/feedback.mjs'],
+  ['core/evaluation.mjs', 'core/evaluation.mjs'],
+  ['core/status-directive.mjs', 'core/status-directive.mjs'],
 ];
 
 function usage() {
@@ -114,7 +121,7 @@ function hookDefinitions(pluginRoot) {
   return {
     UserPromptSubmit: [entry(10)],
     PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command, timeout: 120, async: true }] }],
-    Stop: [entry(10)],
+    Stop: [entry(120)],
   };
 }
 
@@ -234,7 +241,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const args = parseArgs(process.argv.slice(2));
     const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
     const result = args.uninstall ? uninstall(args.project, codexHome) : install(args.project, codexHome);
-    process.stdout.write(`${args.uninstall ? 'Removed' : 'Installed'} Codex observer runtime at ${result.pluginRoot}\nUpdated hooks in ${result.hooksFile}\nUpdated project setting in ${result.projectConfigFile}\n`);
+    process.stdout.write(`${args.uninstall ? 'Removed' : 'Installed'} Codex supervisor runtime at ${result.pluginRoot}\nUpdated hooks in ${result.hooksFile}\nUpdated project setting in ${result.projectConfigFile}\n`);
     if (result.hookBackup) process.stdout.write(`Backup: ${result.hookBackup}\n`);
     if (result.projectBackup) process.stdout.write(`Backup: ${result.projectBackup}\n`);
     process.stdout.write('Review and trust the hook definitions in Codex with /hooks.\n');
