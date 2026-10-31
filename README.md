@@ -8,6 +8,15 @@ proposed tool actions against the original request before they execute.
 **No active session or project goal means no completion judge and no completion
 continuation.** Plainspeak is a separate, independently gated style feature.
 
+
+## OpenCode v2
+
+v2 loads `server.ts` at the repo root. It registers a `supervisor_goal` tool (set, show or clear the
+goal), injects the goal into every model call, and after each finished execution asks a cheap model
+whether the goal is met. `CONTINUE` prompts the agent with the next step; `DONE` retires the goal.
+Attempts are capped by `SUPERVISOR_MAX_ATTEMPTS` (default 8). The v1 tools (`supervisor`,
+`supervisor_retry`, `supervisor_autoreview`) are not registered on v2.
+
 ## Install
 
 ### Claude Code
