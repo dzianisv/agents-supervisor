@@ -254,8 +254,8 @@ export function startFixtureLlmServer(opts = {}) {
         finishWithText(JSON.stringify({
           goal: "Invalid login input is rejected and valid input signs in",
           falsifiable: true,
-          acceptance_criteria: "Invalid login input is rejected; valid login input signs in.",
-          verification: "Run login validation tests and inspect both invalid-input rejection and valid-input success.",
+          acceptance_criteria: "1. Invalid login input is rejected. 2. Valid login input signs in.",
+          verification: "Run npm test -- login and inspect exit code 0; invalid input is rejected and valid input signs in.",
           rationale: "Checkable by running the test suite and inspecting its exit code.",
         }))
         return

@@ -83,7 +83,7 @@ export { isBlockedJudgeModel, parseModelSpec, getGitHubCopilotModelForRouting, g
 export {
   buildEscalatingFeedback, isActionlessVerdict, hasFeedbackBody, retireProjectGoal,
   getLastSessionModelSpec, isPlanMode, buildSelfAssessmentPrompt, buildJudgePrompt,
-  DEFAULT_RUBRIC, parseRubric, buildTaskContext,
+  DEFAULT_RUBRIC, parseRubric, buildTaskContext, JUDGE_FREE_FALLBACK,
 }
 export { getLastSessionCwd, resolveSessionDirectory }
 export { extractLastAssistantText, currentUserTask, buildConversationChain, findLastRelevantUserIndex }
@@ -634,7 +634,10 @@ const ABORT_RACE_DELAY = 1_500 // ms to wait for session.error to arrive before 
 const SUPERVISOR_CONFIG_PATH = join(homedir(), ".config", "opencode", "supervisor.yaml")
 // Last-resort fallback when no model is configured. Uses a free opencode model
 // to avoid silently routing judge sessions to OpenAI (which requires a paid API key).
-const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4-flash-free"
+// Must be a model ID the installed opencode actually serves: a stale ID makes
+// promptAsync fail server-side, waitForResponse spin for 120s, and the
+// supervisor stand down with no verdict (observed 2026-10-29).
+const JUDGE_FREE_FALLBACK = "opencode/deepseek-v4.1-flash-free"
 const SESSION_SCOPED_TOOLS = new Set(["supervisor", "supervisor_goal", "supervisor_retry", "supervisor_loop_exit", "set_supervisor"])
 
 export function trackSessionScopedToolSession(

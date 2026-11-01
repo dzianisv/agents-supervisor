@@ -31,12 +31,19 @@ jobs:
         env:
           SUPERVISOR_E2E_ALLOW_SKIP: '0'
         run: npm run test:e2e
+      - name: Install pinned real OpenCode v2 binary
+        run: |
+          npm install --global @opencode/cli@2.2.5
+          test "$(opencode --version)" = "opencode v2.2.5"
+      - name: Mandatory isolated OpenCode v2 E2E (sequential, no skips)
+        run: npm run test:e2e:v2
       - name: Judge eval (skips without ANTHROPIC creds)
         run: node evals/judge-eval.mjs
       - name: OpenCode plugin syntax check
         run: |
           node --experimental-strip-types --check opencode/supervisor.ts
           node --experimental-strip-types --check opencode/supervisor-impl.ts
+          node --check opencode/v2/index.mjs
       - name: Pi extension syntax check
         run: |
           for file in pi/*.ts; do

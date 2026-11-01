@@ -25,15 +25,26 @@ supervisor@agents-supervisor`.
 
 ### OpenCode
 
-Add to `~/.config/opencode/opencode.json`:
+OpenCode 1.x uses the legacy plugin entrypoint. Add to `~/.config/opencode/opencode.json`:
 
 ```json
 { "plugin": ["github:dzianisv/agents-supervisor/opencode/supervisor.ts"] }
 ```
 
 For a local clone use `file:///absolute/path/to/agents-supervisor/opencode/supervisor.ts`.
-Restart OpenCode to load the plugin. Remove that entry to disable the plugin.
-The real-server CI gate uses OpenCode **1.18.32**.
+OpenCode 1.x support is tested with **1.18.32**.
+
+OpenCode 2 uses its Promise plugin API and a separate adapter. Add the v2 package path to `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["github:dzianisv/agents-supervisor#main::path:opencode/v2"],
+}
+```
+
+For a local clone, use `"plugins": ["/absolute/path/to/agents-supervisor/opencode/v2"]`.
+OpenCode v2 support is tested with **2.2.5**. Restart OpenCode after changing the plugin entry; remove it to disable the plugin.
 
 ### Pi (native extension)
 

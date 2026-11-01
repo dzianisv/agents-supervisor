@@ -209,7 +209,12 @@ describe("opencode supervisor plugin E2E", { skip: SKIP && "opencode binary not 
     assert.equal(body.healthy, true)
   })
 
-  test("supervisor commands are registered via /command endpoint", { timeout: 30_000 }, async () => {
+  test("supervisor commands are registered via /command endpoint", { timeout: 180_000 }, async () => {
+    // The first project-scoped request activates the real plugin manager on
+    // OpenCode 1.18.x. Warm it with a session so this command-list assertion
+    // measures registration, not cold project initialization.
+    const warmup = await fetch(`${baseUrl}/session`, { method: "POST" })
+    assert.equal(warmup.status, 200)
     const res = await fetch(`${baseUrl}/command`)
     assert.equal(res.status, 200)
     const text = await res.text()
@@ -912,6 +917,17 @@ describe("per-turn attempt budget", { skip: SKIP && "opencode binary not in PATH
     // end the turn ourselves with `/supervisor off` (the disabled gate, which
     // plain-returns on every subsequent idle) rather than waiting forever.
     if (waitTarget != null) await waitForInjectionCount(baseUrl, session.id, waitTarget, { fromIndex: startIndex, stallMs: waitStallMs })
+    else if (complete === ACTIONLESS) {
+      assert.ok(await waitForDebug(server, "verdict had no actionable content", 120_000), "actionless verdict must be processed before counting zero injections")
+    } else {
+      const expected = complete === Infinity ? Number(budget) : Math.min(Number(budget), complete)
+      if (expected > 0) {
+        await waitForInjectionCount(baseUrl, session.id, expected, {
+          fromIndex: startIndex,
+          stallMs: 120_000,
+        })
+      }
+    }
     if (stopAfterTarget) await sendMessage(baseUrl, session.id, "/supervisor off", 120_000, { model })
     const injections = await settleInjections(baseUrl, session.id, {
       fromIndex: startIndex,

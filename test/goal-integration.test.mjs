@@ -220,7 +220,7 @@ describe("integration: supervisor goal loop", () => {
     const { client } = createMockClient(makeMessages())
     const originalMessages = client.session.messages
     client.session.messages = async args => args.path.id === SESSION_ID ? originalMessages(args) : {
-      data: [{ info: { role: "assistant", time: { completed: Date.now() } }, parts: [{ type: "text", text: JSON.stringify({ goal: "Inferred objective", falsifiable: true, acceptance_criteria: "Inferred checks pass", verification: "Run inferred checks" }) }] }],
+      data: [{ info: { role: "assistant", time: { completed: Date.now() } }, parts: [{ type: "text", text: JSON.stringify({ goal: "The inferred auth test passes", falsifiable: true, acceptance_criteria: "The auth test passes", verification: "Run npm test -- auth and inspect exit code 0" }) }] }],
     }
     client.session.promptAsync = async () => { writeProjectGoal(tmpDir, "New user project objective"); return {} }
     const plugin = await SupervisorPlugin({ client, directory: tmpDir })

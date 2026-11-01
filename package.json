@@ -12,6 +12,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test --test-force-exit \"test/!(e2e-*).test.mjs\"",
     "test:e2e": "node --experimental-strip-types --test test/e2e-opencode.test.mjs",
+    "test:e2e:v2": "node --experimental-strip-types --test test/e2e-opencode-v2.test.mjs",
     "test:all": "npm run test && npm run test:e2e",
     "test:cc": "node test/e2e-cc.mjs",
     "test:pi": "node --experimental-strip-types test/e2e-pi.mjs",

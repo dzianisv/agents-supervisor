@@ -890,6 +890,43 @@ export function writeDerivedProjectGoal(cwd, condition) {
 
 export const GOAL_DERIVATION_MIN_LEN = 12;
 
+// A derived contract is only useful if the judge can falsify it. The old
+// parser checked length and injection only, so {"goal":"Improve the goal
+// inference","acceptance_criteria":"done","verification":"check"} passed as a
+// valid contract. These heuristics reject generic-only text and vague verbs
+// that name no observable outcome. They are deliberately conservative: a
+// concrete command/path/URL/result anchor always wins.
+const GENERIC_CONTRACT_ONLY = /^(?:done|complete|completed|finished|works?|working|fixed|success(?:ful)?|all good|ok(?:ay)?|check|verify|tested|pass(?:es)?|green|n\/a|tbd)[.!]?$/i;
+const GENERIC_CRITERIA_ONLY = /^(?:all\s+)?(?:requested\s+|required\s+|necessary\s+)?(?:checks?|tests?|criteria|requirements?)\s+(?:pass|passes|are met|is met|complete|completed)$/i;
+const VAGUE_GOAL_START = /^(?:improve|enhance|optimize|make|ensure|handle|support|work on|investigate|look into|fix|update|refactor|review|check|verify|complete|finish)\b/i;
+const CONCRETE_ANCHOR_PATTERNS = [
+  /`[^`]+`/,
+  /\b(?:npm|pnpm|yarn|npx|node|python3?|pytest|go|cargo|curl|gh|git|ssh|docker|kubectl|make|vitest|jest|playwright|bun|deno)\b/i,
+  /https?:\/\/\S+/i,
+  /\b[\w./-]+\.(?:mjs|cjs|js|jsx|ts|tsx|json|md|py|go|rs|sh|ya?ml|toml|sql|css|html)\b/i,
+  /\b(?:HTTP\s*)?[1-5]\d{2}\b/i,
+  /\bexit(?:\s+code)?\s*\d+\b/i,
+  /\b\d+(?:\.\d+)?\s*(?:ms|s|%|tests?|issues?|files?|rows?|items?)\b/i,
+];
+const OBSERVABLE_RESULT = /\b(?:returns?|pass(?:es)?|fails?|exits?|writes?|creates?|deletes?|renders?|prints?|outputs?|matches?|contains?|shows?|opens?|closes?|lists?|reports?|updates?|sets?|removes?|adds?|starts?|stops?|sends?|receives?|installs?|redirects?|displays?|signs? in|logs? in|lands? on|exists?)\b/i;
+
+function hasConcreteAnchor(text) {
+  return CONCRETE_ANCHOR_PATTERNS.some((re) => re.test(text));
+}
+
+function hasObservableResult(text) {
+  return OBSERVABLE_RESULT.test(text);
+}
+
+function looksVagueContract(text, { criteria = false } = {}) {
+  const trimmed = (text ?? '').toString().trim();
+  if (!trimmed) return true;
+  if (GENERIC_CONTRACT_ONLY.test(trimmed)) return true;
+  if (criteria && GENERIC_CRITERIA_ONLY.test(trimmed)) return true;
+  if (VAGUE_GOAL_START.test(trimmed) && !hasConcreteAnchor(trimmed) && !hasObservableResult(trimmed)) return true;
+  return false;
+}
+
 const INJECTION_ARTIFACT_PATTERNS = [
   /ignore (all |any |the )?(previous|prior|above|earlier) instructions/i,
   /disregard (all |any |the )?(previous|prior|above|earlier)/i,
@@ -1012,25 +1049,34 @@ ${agentsBlock}
 
 Return JSON only, no prose:
 {
-  "goal": "a single concise, objectively checkable sentence, e.g. 'Invalid login input is rejected and valid input signs in'",
+  "goal": "a single concise, objectively checkable sentence, e.g. 'Invalid login input returns HTTP 400 and valid input signs in'",
   "falsifiable": true or false,
-  "acceptance_criteria": "the observable end states, every one required for completion",
-  "verification": "specific commands or observations and the results that would prove the criteria",
+  "acceptance_criteria": "a numbered list of observable end states, every one required for completion",
+  "verification": "the exact commands, file paths, URLs or observations AND the expected results that prove the criteria",
   "rationale": "one sentence explaining why this is falsifiable"
 }
 
+BAD (rejected): {"goal":"Improve the supervisor goal inference","acceptance_criteria":"done","verification":"check"}
+GOOD: {"goal":"Vague derived contracts are rejected and concrete contracts are accepted","acceptance_criteria":"1. parseDerivedGoalResponse returns null for acceptance_criteria 'done'. 2. It returns a contract for a criterion naming a command and expected result.","verification":"Run node --test test/goal-derivation.test.mjs; both assertions pass.","rationale":"The parser result is directly observable in the test run."}
+
 Rules:
-- "goal" MUST be concrete and falsifiable — checkable by running a command,
-  reading a file, or observing a concrete artifact (tests passing, a PR
-  merged, a specific behavior working). Do NOT write a vague aspiration
-  ("improve the code", "make it better").
+- "goal" MUST name an observable outcome. Do NOT write a vague aspiration
+  ("improve the code", "make it better", "handle this", "ensure quality") or
+  a verb with no checkable result.
+- "acceptance_criteria" MUST be a numbered list. Each item must name a
+  concrete behavior, artifact, command, path, URL, status code or measurable
+  result. Never use "done", "works", "all requested checks pass", or a
+  restatement of the goal.
+- "verification" MUST name at least one exact command, file path, URL or
+  observation AND the expected result. Never use "check", "verify", "run
+  tests" or "inspect" without naming what and the expected result.
 - Infer only work the user actually requested. A plain question, greeting,
   one-shot answer, supervisor control command, cancelled task or synthetic
   continuation is not a new goal. An agent's promise cannot expand the user's scope.
 - Define acceptance criteria and verification BEFORE treating an objective as a goal.
   Do not invent permission or a requirement to open a PR, merge or deploy.
-- If no unfinished multi-step task has a concrete, falsifiable outcome, set
-  "falsifiable": false and leave "goal" empty — do NOT invent one.
+- If you cannot name a concrete command/path/URL/observation and its expected
+  result, set "falsifiable": false and leave "goal" empty — do NOT invent one.
 - Keep "goal" under 400 characters and each contract field under 4000.`;
 }
 
@@ -1059,10 +1105,16 @@ export function parseDerivedGoalResponse(text) {
   if (condition.length < GOAL_DERIVATION_MIN_LEN) return null;
   if (condition.length > GOAL_CONDITION_MAX_LEN) return null;
   if (containsInjectionArtifact(condition)) return null;
+  if (looksVagueContract(condition)) return null;
+  if (!hasConcreteAnchor(condition) && !hasObservableResult(condition)) return null;
   const acceptanceCriteria = typeof parsed.acceptance_criteria === 'string' ? parsed.acceptance_criteria.trim() : '';
   const verification = typeof parsed.verification === 'string' ? parsed.verification.trim() : '';
   if (!acceptanceCriteria || !verification) return null;
   if ([acceptanceCriteria, verification].some((text) => text.length > GOAL_CONDITION_MAX_LEN || containsInjectionArtifact(text))) return null;
+  if (looksVagueContract(acceptanceCriteria, { criteria: true })) return null;
+  if (!hasConcreteAnchor(acceptanceCriteria) && !hasObservableResult(acceptanceCriteria)) return null;
+  if (looksVagueContract(verification)) return null;
+  if (!hasConcreteAnchor(verification)) return null;
   const rationale = typeof parsed.rationale === 'string' ? parsed.rationale.trim().slice(0, 500) : '';
   return { condition, acceptanceCriteria, verification, rationale };
 }
